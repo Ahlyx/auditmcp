@@ -1,0 +1,8 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+config.toml
+config.mcp-*.toml
+.mcp.json
+

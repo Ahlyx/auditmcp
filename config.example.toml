@@ -1,0 +1,15 @@
+# NOTE: [target].command is currently unused by `auditmcp run` — the real
+# target command comes from the CLI trailing args instead, e.g.:
+#   auditmcp run --config config.toml -- python test-fixtures/fake_server.py
+# It's kept here (and required by the schema) for forward compatibility with
+# a future `auditmcp run --config config.toml` mode that reads it from here.
+[target]
+command = ["python", "test-fixtures/fake_server.py"]
+
+[logging]
+db_path = "./auditmcp.db"
+default_tier = "minimal"
+
+[logging.tool_overrides]
+# delete_file = "full"
+# list_directory = "minimal"
