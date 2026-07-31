@@ -1,0 +1,83 @@
+# Secrets-detection patterns for auditmcp, in the spirit of Gitleaks' rule
+# format. This file is bundled into the binary at compile time (see
+# `include_str!` in src/secrets.rs) so detection works with zero setup, but
+# the format is plain, user-editable TOML — a user can maintain their own
+# copy and point auditmcp at it (config wiring for that lands alongside the
+# rest of Phase 2's secrets-detection integration).
+#
+# Fields:
+#   name                    unique identifier, shows up in redaction markers
+#                           and `anomaly_reasons`-style output
+#   regex                   Rust `regex` crate syntax (no lookaround support)
+#   severity                "low" | "medium" | "high"
+#   requires_entropy_check  if true, a regex match must ALSO pass Shannon
+#                           entropy scoring (see src/secrets.rs) before it
+#                           fires — this is the false-positive double-check
+#                           for patterns that are inherently loose
+#   key_name_hints          optional list of substrings checked against the
+#                           enclosing JSON object key (case-insensitive
+#                           `contains`); if a pattern with entropy checking
+#                           set defines hints, key-name proximity is
+#                           REQUIRED (not just informative) for it to fire —
+#                           entropy alone never fires this class of pattern
+
+[[pattern]]
+name = "aws_access_key_id"
+regex = "AKIA[0-9A-Z]{16}"
+severity = "high"
+requires_entropy_check = false
+
+[[pattern]]
+name = "openai_api_key"
+regex = "sk-[A-Za-z0-9_-]{20,}"
+severity = "high"
+requires_entropy_check = false
+
+[[pattern]]
+name = "github_token"
+regex = "gh[pousr]_[A-Za-z0-9]{36}"
+severity = "high"
+requires_entropy_check = false
+
+[[pattern]]
+name = "slack_token"
+regex = "xox[baprs]-[A-Za-z0-9-]{10,48}"
+severity = "high"
+requires_entropy_check = false
+
+[[pattern]]
+name = "google_api_key"
+regex = "AIza[0-9A-Za-z_-]{35}"
+severity = "high"
+requires_entropy_check = false
+
+[[pattern]]
+name = "stripe_secret_key"
+regex = "sk_live_[0-9a-zA-Z]{24,}"
+severity = "high"
+requires_entropy_check = false
+
+[[pattern]]
+name = "jwt"
+regex = "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+severity = "medium"
+requires_entropy_check = false
+
+[[pattern]]
+name = "bearer_token"
+regex = "(?i)bearer\\s+[A-Za-z0-9\\-\\._~+/]{20,}"
+severity = "medium"
+requires_entropy_check = false
+
+[[pattern]]
+name = "pem_private_key"
+regex = "-----BEGIN (RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"
+severity = "high"
+requires_entropy_check = false
+
+[[pattern]]
+name = "generic_high_entropy_near_keyword"
+regex = "[A-Za-z0-9_/+=.-]{20,256}"
+severity = "medium"
+requires_entropy_check = true
+key_name_hints = ["key", "token", "secret", "password", "passwd", "apikey", "api_key", "auth", "credential", "access_key"]

@@ -7,11 +7,25 @@
 //! schema's `tool_name TEXT NOT NULL` and this project's scope (auditing
 //! *tool calls*, per its name and threat model) don't cover generic
 //! protocol chatter.
+//!
+//! Args/result capture is deliberately two-phase: the request-side pump
+//! stores the FULL, untruncated `arguments` value (see `PendingCall`) and
+//! nothing more is decided until the matching response arrives. Only once
+//! the response is in hand do we know both (a) whether the call errored
+//! and (b) whether secrets detection fires on either side — and both of
+//! those gate the effective logging tier (see `pump_child_to_client`).
+//! Truncating at capture time, like Phase 1 did, would make that ordering
+//! impossible: you can't retroactively un-truncate a value to redact a
+//! secret that only got cut off by the earlier preview.
 
-use crate::config::Config;
+use crate::config::{Config, Tier};
 use crate::db::{self, DbHandle, ToolCallEntry};
 use crate::jsonrpc::RpcMessage;
-use std::collections::HashMap;
+use crate::secrets::{self, PatternSet, Severity};
+use crate::truncate;
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -20,19 +34,36 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-/// Phase 1 always truncates to a short preview regardless of configured
-/// tier (see `Config::tier_for_tool`, called below) — semantic,
-/// tier-aware truncation is Phase 2 work.
+/// Byte cap applied when rendering a value under the `minimal` tier.
+/// Unrelated to `standard` tier's semantic truncation (see `truncate.rs`)
+/// — this is a blunt, cheap preview for the tier that wants the smallest
+/// possible footprint, not a structure-preserving cap.
 const PREVIEW_BYTES: usize = 200;
 
-struct PendingCall {
-    tool_name: String,
-    args_preview: Option<String>,
-    bytes_in: i64,
-    started: Instant,
+pub(crate) struct PendingCall {
+    pub(crate) tool_name: String,
+    /// Full, untruncated parsed `arguments` value — see the module-level
+    /// doc comment for why this can't be truncated yet at capture time.
+    pub(crate) args: Option<Value>,
+    pub(crate) bytes_in: i64,
+    pub(crate) started: Instant,
 }
 
 type PendingMap = Arc<Mutex<HashMap<String, PendingCall>>>;
+
+/// One entry in the `redaction_flags` JSON array stored per row: which
+/// pattern fired, at what severity, plus the sha256 of the plaintext secret
+/// (never the plaintext itself) so the same secret can be correlated
+/// across rows. No `allowlisted` field here -- this array is only ever
+/// built from hits already filtered to non-allowlisted ones (see
+/// `active_hit_count`/`redaction_flags` below), so it would always read
+/// `false` and add nothing.
+#[derive(Serialize)]
+struct RedactionRecord<'a> {
+    pattern: &'a str,
+    severity: Severity,
+    sha256: &'a str,
+}
 
 pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> {
     let config = Arc::new(Config::load(config_path)?);
@@ -41,8 +72,34 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         .ok_or_else(|| anyhow::anyhow!("no target command given after `--`"))?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let server_name = program.clone();
+    let server_name = config.server_name_for(program);
     let db = db::spawn_writer(Path::new(&config.logging.db_path));
+
+    // Fail-open: a corrupt/unparseable bundled patterns file must not take
+    // the whole proxy down. Falling back to an empty pattern set (which
+    // always parses) disables secrets *detection* for the session, not
+    // logging itself — the fail-open contract is about the proxied session
+    // never being blocked, not about detection always firing.
+    let patterns = Arc::new(PatternSet::bundled().unwrap_or_else(|e| {
+        tracing::error!(
+            "failed to load bundled secrets patterns ({e}); secrets detection disabled for this session"
+        );
+        PatternSet::from_str("").expect("empty pattern set always parses")
+    }));
+
+    // Fail-open, same rationale as the patterns load above: on first run
+    // the db file won't exist yet, and a read-only open failure here must
+    // never block the proxied session. An empty set just means every
+    // detected secret is redacted (the correct default) rather than
+    // `unmask`'s allowlist entries silently never taking effect.
+    let allowlist: Arc<HashSet<String>> = Arc::new(
+        db::open_readonly(Path::new(&config.logging.db_path))
+            .and_then(|conn| db::load_allowlist(&conn))
+            .unwrap_or_else(|e| {
+                tracing::warn!("failed to load secret allowlist ({e}); starting with an empty allowlist");
+                HashSet::new()
+            }),
+    );
 
     let mut child = Command::new(program)
         .args(args)
@@ -75,6 +132,8 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         session_id,
         server_name,
         Arc::clone(&config),
+        patterns,
+        allowlist,
     ));
 
     let status = child
@@ -131,13 +190,13 @@ async fn pump_client_to_child(mut child_in: ChildStdin, pending: PendingMap) {
         if let Some(msg) = parse_rpc_message(&buf) {
             if msg.is_tool_call_request() {
                 if let (Some(id_key), Some(tool_name)) = (msg.id_key(), msg.tool_name()) {
-                    let args_preview = msg.arguments().map(|v| truncate_preview(&v.to_string()));
+                    let args = msg.arguments().cloned();
                     let mut guard = pending.lock().await;
                     guard.insert(
                         id_key,
                         PendingCall {
                             tool_name,
-                            args_preview,
+                            args,
                             bytes_in: buf.len() as i64,
                             started: Instant::now(),
                         },
@@ -158,6 +217,8 @@ async fn pump_child_to_client(
     session_id: String,
     server_name: String,
     config: Arc<Config>,
+    patterns: Arc<PatternSet>,
+    allowlist: Arc<HashSet<String>>,
 ) {
     let mut reader = BufReader::new(child_out);
     let mut stdout = tokio::io::stdout();
@@ -199,37 +260,148 @@ async fn pump_child_to_client(
             continue; // Response to something we didn't track (e.g. not a tools/call).
         };
 
-        // Phase 2 will branch on tier here for standard/full truncation
-        // strategy; Phase 1 always applies PREVIEW_BYTES regardless.
-        let _tier = config.tier_for_tool(&call.tool_name);
-
-        let duration_ms = call.started.elapsed().as_millis() as i64;
-        let status = if msg.is_error_response() { "error" } else { "success" };
-        let error_message = msg.error.as_ref().map(|e| truncate_preview(&e.to_string()));
-        let result_preview = msg.result.as_ref().map(|v| truncate_preview(&v.to_string()));
-
-        let entry = ToolCallEntry {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            session_id: session_id.clone(),
-            agent_id: None,
-            tool_name: call.tool_name,
-            server_name: Some(server_name.clone()),
-            args_json: call.args_preview,
-            result_json: result_preview,
-            status: status.to_string(),
-            error_message,
-            duration_ms: Some(duration_ms),
-            bytes_in: Some(call.bytes_in),
-            bytes_out: Some(buf.len() as i64),
-            source: None,
-            destination: None,
-            redaction_flags: None,
-            redaction_count: 0,
-            anomaly_score: None,
-            anomaly_reasons: None,
-        };
+        let configured_tier = config.tier_for_tool(&call.tool_name);
+        let entry = build_entry(
+            call,
+            &msg,
+            buf.len() as i64,
+            &session_id,
+            &server_name,
+            configured_tier,
+            &patterns,
+            &allowlist,
+        );
 
         db.log(entry);
+    }
+}
+
+/// Builds the `ToolCallEntry` for one completed tools/call from the parsed
+/// response and its pending request state: detect secrets → decide status →
+/// escalate tier → render the (already redacted) values → assemble the row.
+/// Pure data transformation, no I/O and no awaits — extracted from
+/// `pump_child_to_client` so this whole pipeline is regression-testable end
+/// to end (see `db::tests::secret_in_sentence_is_redacted_in_the_actual_stored_row`):
+/// a bug where the redacted value and the value actually persisted diverge
+/// would be invisible to unit tests that only assert on
+/// `scan_and_redact_json`'s in-memory output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_entry(
+    call: PendingCall,
+    msg: &RpcMessage,
+    bytes_out: i64,
+    session_id: &str,
+    server_name: &str,
+    configured_tier: Tier,
+    patterns: &PatternSet,
+    allowlist: &HashSet<String>,
+) -> ToolCallEntry {
+    let duration_ms = call.started.elapsed().as_millis() as i64;
+    // Covers both a JSON-RPC-level error (e.g. "method not found") and
+    // the MCP convention of a tool's own failure reported inside an
+    // otherwise-successful result via `isError: true` (e.g. a delete
+    // tool that ran but couldn't find the file) -- per the threat
+    // model, a failed destructive tool call must never be under-logged
+    // by only checking the JSON-RPC transport-level error field.
+    let is_error = msg.is_error_response() || msg.is_mcp_tool_error();
+    let status = if is_error { "error" } else { "success" };
+
+    // Secrets detection runs on the full, untruncated args/result/error
+    // values before any tier-based truncation is even decided — the
+    // decision of *how much* to truncate depends on whether detection
+    // fired, so detection must go first.
+    let mut args_value = call.args;
+    let mut result_value = msg.result.clone();
+    let mut error_value = msg.error.clone();
+
+    let mut hits = Vec::new();
+    if let Some(v) = args_value.as_mut() {
+        hits.extend(secrets::scan_and_redact_json(v, patterns, allowlist));
+    }
+    if let Some(v) = result_value.as_mut() {
+        hits.extend(secrets::scan_and_redact_json(v, patterns, allowlist));
+    }
+    if let Some(v) = error_value.as_mut() {
+        hits.extend(secrets::scan_and_redact_json(v, patterns, allowlist));
+    }
+
+    // Allowlisted hits are confirmed false positives (left unredacted
+    // by `scan_and_redact_json` itself) -- they must not count toward
+    // escalation or the stored redaction metadata, only genuine,
+    // still-redacted hits do.
+    let active_hit_count = hits.iter().filter(|h| !h.allowlisted).count();
+    let secrets_fired = active_hit_count > 0;
+
+    // Tier escalation: configured tier, forced to `full` if secrets
+    // fired anywhere in this call or the call errored. Anomalies (a
+    // leaked secret, a failing tool call) must never be hidden by
+    // truncation, regardless of what the user configured for this tool.
+    let effective_tier = if secrets_fired || is_error { Tier::Full } else { configured_tier };
+
+    // Truncation runs AFTER redaction, on the already-redacted values,
+    // so it can never slice a secret in half before detection catches
+    // it, and never re-exposes a redaction marker by cutting around it.
+    // These are the SAME `*_value` bindings `scan_and_redact_json` mutated
+    // above — no clone of the pre-redaction originals survives past this
+    // point, so what gets rendered is provably the redacted tree.
+    let args_json = args_value.map(|v| render_tier(&v, effective_tier));
+    let result_json = result_value.map(|v| render_tier(&v, effective_tier));
+    let error_message = error_value.map(|v| render_tier(&v, effective_tier));
+
+    // Structured, not a flat array of pattern names: each entry pairs
+    // the pattern (plus its severity) with the sha256 of the plaintext
+    // secret it matched, so the same leaked value can be correlated
+    // across separate tool calls/rows without ever persisting the
+    // plaintext itself. This is a data-SHAPE change to `redaction_flags`
+    // (still the same TEXT column, no migration) — `query`/`export`
+    // must parse this as `[{"pattern":..,"severity":..,"sha256":..}, ...]`,
+    // not `["pattern", ...]`.
+    let redaction_flags = if secrets_fired {
+        let records: Vec<RedactionRecord> = hits
+            .iter()
+            .filter(|h| !h.allowlisted)
+            .map(|h| RedactionRecord {
+                pattern: h.pattern_name.as_str(),
+                severity: h.severity,
+                sha256: h.secret_sha256.as_str(),
+            })
+            .collect();
+        serde_json::to_string(&records).ok()
+    } else {
+        None
+    };
+
+    ToolCallEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: session_id.to_string(),
+        agent_id: None,
+        tool_name: call.tool_name,
+        server_name: Some(server_name.to_string()),
+        args_json,
+        result_json,
+        status: status.to_string(),
+        error_message,
+        duration_ms: Some(duration_ms),
+        bytes_in: Some(call.bytes_in),
+        bytes_out: Some(bytes_out),
+        source: None,
+        destination: None,
+        redaction_flags,
+        redaction_count: active_hit_count as i64,
+        anomaly_score: None,
+        anomaly_reasons: None,
+    }
+}
+
+/// Renders a (already redacted) JSON value to its stored string form under
+/// the given effective tier. `minimal` keeps Phase 1's blunt byte-preview
+/// behavior; `standard` applies structure-preserving semantic truncation;
+/// `full` stores the value as-is.
+fn render_tier(value: &Value, tier: Tier) -> String {
+    match tier {
+        Tier::Minimal => truncate_preview(&value.to_string()),
+        Tier::Standard => truncate::truncate_json_semantic(value).to_string(),
+        Tier::Full => value.to_string(),
     }
 }
 
@@ -263,10 +435,7 @@ fn truncate_preview(s: &str) -> String {
     if s.len() <= PREVIEW_BYTES {
         return s.to_string();
     }
-    let mut end = PREVIEW_BYTES;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = truncate::snap_boundary(s, PREVIEW_BYTES);
     format!("{}... [truncated, {} bytes total]", &s[..end], s.len())
 }
 

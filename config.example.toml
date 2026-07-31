@@ -1,3 +1,23 @@
+# auditmcp example config.
+#
+# RECOMMENDED SETUP — one shared database, one config per MCP server:
+# run each MCP server behind its own `auditmcp run` instance (each with its
+# own config file), but point every config's `db_path` at the SAME database
+# file. Concurrent writers are safe: each append takes an exclusive write
+# transaction (BEGIN IMMEDIATE), so rows from all servers interleave into
+# one hash chain in arrival order, and `verify` covers the whole chain.
+#
+# A shared DB is what makes cross-server activity visible: an exfiltration
+# chain that reads sensitive data through one server and sends it out
+# through another only shows up in `query`/`verify` output if both servers
+# log to the same place. Rows are distinguished by the `server_name` column
+# (set below).
+#
+# If you specifically want isolated audit trails, giving each config its
+# own `db_path` still works — each DB gets its own independent hash chain —
+# but you lose the cross-server picture, so treat that as the opt-in
+# exception rather than the default.
+
 # NOTE: [target].command is currently unused by `auditmcp run` — the real
 # target command comes from the CLI trailing args instead, e.g.:
 #   auditmcp run --config config.toml -- python test-fixtures/fake_server.py
@@ -5,8 +25,17 @@
 # a future `auditmcp run --config config.toml` mode that reads it from here.
 [target]
 command = ["python", "test-fixtures/fake_server.py"]
+# Recorded in every row's `server_name` column. Optional — defaults to the
+# target command's program name — but set it explicitly when sharing a
+# db_path: most MCP servers launch via the same interpreter (`npx`,
+# `python`, `node`, ...), so the default would make different servers'
+# rows indistinguishable.
+server_name = "fake_server"
 
 [logging]
+# Point every server's config at the same file (see note above). Prefer an
+# absolute path when sharing, so configs run from different directories
+# still agree on which file this is.
 db_path = "./auditmcp.db"
 default_tier = "minimal"
 

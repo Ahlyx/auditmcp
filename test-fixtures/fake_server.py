@@ -38,6 +38,16 @@ TOOLS = [
         "description": "Returns a string containing a fake API key (for secrets-detection testing).",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "simulate_tool_failure",
+        "description": (
+            "Deliberately returns a normal, successful JSON-RPC response "
+            "whose result carries \"isError\": true -- the MCP convention "
+            "for a tool's own failure, as opposed to a JSON-RPC-level "
+            "error (for exercising that escalation path specifically)."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 FAKE_API_KEY = "sk-FAKE1234567890abcdefFAKEKEYFAKE00"
@@ -57,7 +67,17 @@ def handle_tool_call(params):
         path = args.get("path", "<unspecified>")
         return text_result(f"[simulated] deleted {path}")
     if name == "leak_secret":
-        return text_result(f"here is a totally real config value: api_key={FAKE_API_KEY}")
+        # The fake key sits under a field literally named "api_key" (not
+        # buried in an unlabeled sentence) so a live run exercises BOTH the
+        # specific `openai_api_key` pattern (regex match on the "sk-..."
+        # value) AND the generic heuristic pattern (fires because the key
+        # name "api_key" satisfies its hints and the value clears the
+        # entropy bar) on the exact same span -- the overlap-merge case.
+        result = text_result("Retrieved credentials for the widget service.")
+        result["api_key"] = FAKE_API_KEY
+        return result
+    if name == "simulate_tool_failure":
+        return text_result("simulated failure: target resource not found", is_error=True)
 
     return text_result(f"unknown tool: {name}", is_error=True)
 

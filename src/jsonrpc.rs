@@ -47,4 +47,18 @@ impl RpcMessage {
     pub fn is_error_response(&self) -> bool {
         self.error.is_some()
     }
+
+    /// True for the MCP convention where a tool's own failure is reported
+    /// as an ordinary JSON-RPC *success* response whose `result` carries
+    /// `"isError": true` (e.g. "file not found" from a delete tool), as
+    /// distinct from a JSON-RPC-level error (`is_error_response`, e.g.
+    /// "method not found"). Both are tool-call failures from the audit
+    /// log's point of view and must be treated the same way by callers.
+    pub fn is_mcp_tool_error(&self) -> bool {
+        self.result
+            .as_ref()
+            .and_then(|r| r.get("isError"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
 }

@@ -6,3 +6,5 @@ config.toml
 config.mcp-*.toml
 .mcp.json
 
+# Personal standing instructions (not project-specific)
+ENGINEERING-GUARDRAILS.md
