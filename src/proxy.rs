@@ -49,19 +49,32 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // unambiguous. See `session.rs` for why the scope has to exist anyway.
     let session = Arc::new(Session::new(uuid::Uuid::new_v4().to_string()));
     let server_name = config.server_name_for(program);
-    let (db, writer) = db::spawn_writer(Path::new(&config.logging.db_path));
+    // Refuses to start if the database can't be opened -- see
+    // `db::spawn_writer` for why that is not a fail-open case.
+    let (db, writer) = db::spawn_writer(Path::new(&config.logging.db_path))?;
 
-    // Fail-open: a corrupt/unparseable bundled patterns file must not take
-    // the whole proxy down. Falling back to an empty pattern set (which
-    // always parses) disables secrets *detection* for the session, not
-    // logging itself — the fail-open contract is about the proxied session
-    // never being blocked, not about detection always firing.
-    let patterns = Arc::new(PatternSet::bundled().unwrap_or_else(|e| {
-        tracing::error!(
-            "failed to load bundled secrets patterns ({e}); secrets detection disabled for this session"
-        );
-        PatternSet::from_str("").expect("empty pattern set always parses")
-    }));
+    // Also refuses to start, for a different reason: `patterns.toml` is
+    // compiled into the binary with `include_str!`, so this parse is
+    // deterministic and a test asserts it succeeds. Failing here means the
+    // binary itself is broken, not that the environment is unusual. The
+    // old behavior -- fall back to an empty pattern set and carry on --
+    // meant a build defect turned into a session that stored every secret
+    // it saw in the clear, while looking exactly like a healthy one.
+    //
+    // This stays correct only while the pattern set is compile-time. If a
+    // user-supplied `patterns_path` is ever added (the spec's
+    // "user-updatable" patterns file, deliberately not built -- see the
+    // README), a malformed user file becomes an ordinary runtime failure
+    // that fails toward under-redaction, and refusing to start would be
+    // the wrong response to someone's typo. See `db::ToolCallEntry` for
+    // what to do instead.
+    let patterns = Arc::new(PatternSet::bundled().map_err(|e| {
+        anyhow::anyhow!(
+            "bundled secrets patterns failed to load: {e}. This is a defect in \
+             this build of auditmcp, not a problem with your configuration -- \
+             refusing to start rather than proxy with secrets detection disabled."
+        )
+    })?);
 
     // Fail-open, same rationale as the patterns load above: on first run
     // the db file won't exist yet, and a read-only open failure here must

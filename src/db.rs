@@ -73,6 +73,58 @@ use sha2::{Digest, Sha256};
 /// every row logged from that point on relative to how an older build would
 /// have hashed the same data — don't reorder without a good reason, and
 /// treat it as a breaking change to the chain format if you do.
+///
+/// # Adding a field
+///
+/// Adding a field here does not just affect future rows. It retroactively
+/// invalidates every row in every existing database: `verify_chain`
+/// re-derives each row's hash by reading its columns back into this struct
+/// and re-serializing, and a plain `Option<T>` serializes as `"field":null`
+/// rather than being omitted — so a row written before the field existed
+/// canonicalizes differently on read than it did on write, and `verify`
+/// reports the entire historical log as tampered. See
+/// `tests::canonical_json_shape_is_frozen`, which fails loudly if this
+/// shape changes.
+///
+/// If a field is genuinely required, it MUST be:
+///   1. `Option<T>`,
+///   2. appended **last**, and
+///   3. annotated `#[serde(skip_serializing_if = "Option::is_none")]`,
+///
+/// so `None` is omitted entirely and pre-existing rows canonicalize to
+/// exactly the bytes they were hashed as. Only rows that populate the new
+/// field hash differently, and those are new rows by definition. It also
+/// needs the project's first schema migration — an additive, nullable,
+/// idempotent `ALTER TABLE tool_calls ADD COLUMN`, because
+/// `CREATE TABLE IF NOT EXISTS` will not add a column to a database that
+/// already exists — plus a test that opens a pre-migration database and
+/// still verifies clean.
+///
+/// ## The case this is reserved for
+///
+/// Recording that a session ran **degraded**, specifically in a way that
+/// fails toward *under*-redaction. Today there is no such state: the only
+/// degradation that would store secrets in the clear is the bundled
+/// pattern set failing to load, and that set is compiled in via
+/// `include_str!`, so the failure is a build defect rather than a runtime
+/// condition and `proxy::run` refuses to start on it instead.
+///
+/// That changes the day a user-supplied `patterns_path` config key is
+/// added (the spec's "user-updatable" patterns file, listed as not built
+/// in the README). A malformed *user* file is an ordinary operational
+/// failure — someone's typo — so refusing to start is too harsh, and
+/// running on with detection disabled is exactly the silent degradation
+/// this tool exists to catch. That is when a `degraded` field earns its
+/// migration.
+///
+/// Two things NOT to reach for when that day comes, both already
+/// considered and rejected:
+///   - **`session_id`**: prefixing it splits one logical session across two
+///     ids if the state ever changes mid-session, and Phase 3 groups on it.
+///   - **`agent_id`**: reserved for the caller's identity from
+///     `_meta.io.modelcontextprotocol/clientInfo`, which MCP 2026-07-28
+///     puts on every request and which became the *only* caller-identity
+///     signal when protocol-level sessions were removed.
 #[derive(Serialize)]
 pub struct ToolCallEntry {
     pub timestamp: String,
@@ -1060,25 +1112,39 @@ impl DbWriter {
     }
 }
 
-/// Spawns the dedicated writer thread and returns a handle to submit
-/// entries to it, plus the `DbWriter` used to wait for it at shutdown. A
-/// plain OS thread (not a tokio task) because rusqlite's `Connection` is
-/// synchronous; this keeps blocking disk I/O off the tokio runtime
-/// entirely, which is what "async, buffered writes" means in practice here
-/// — the proxy never awaits a DB call.
-pub fn spawn_writer(db_path: &Path) -> (DbHandle, DbWriter) {
+/// Opens the audit database and spawns the dedicated writer thread,
+/// returning a handle to submit entries plus the `DbWriter` used to wait
+/// for it at shutdown. A plain OS thread (not a tokio task) because
+/// rusqlite's `Connection` is synchronous; this keeps blocking disk I/O off
+/// the tokio runtime entirely, which is what "async, buffered writes" means
+/// in practice here — the proxy never awaits a DB call.
+///
+/// **The open happens here, on the calling thread, so that failing to open
+/// the database is a startup error rather than a silent condition.** It
+/// used to happen on the writer thread, which meant an unopenable database
+/// produced a proxy that forwarded every tool call while recording nothing
+/// — presenting as an audit tool and providing none of one. Fail-open
+/// exists to keep the proxy from becoming a blocking dependency of work in
+/// flight; at startup nothing is in flight, so there is nothing to protect
+/// and the honest response is to refuse.
+///
+/// It is also the one degradation that cannot be recorded in-band: "I could
+/// not record anything" is unwritable to the database that would not open,
+/// so there is no way to tell the user later and the obligation moves to
+/// telling them now.
+pub fn spawn_writer(db_path: &Path) -> anyhow::Result<(DbHandle, DbWriter)> {
+    let conn = open_db(db_path)?;
     let (tx, rx) = sync_channel::<ToolCallEntry>(CHANNEL_CAPACITY);
-    let path = db_path.to_path_buf();
 
-    let handle = std::thread::spawn(move || writer_loop(&path, rx));
+    let handle = std::thread::spawn(move || writer_loop(conn, rx));
 
-    (
+    Ok((
         DbHandle {
             sender: tx,
             dropped: Arc::new(AtomicU64::new(0)),
         },
         DbWriter { handle },
-    )
+    ))
 }
 
 /// Runs on the dedicated writer thread. Every failure mode here is
@@ -1086,19 +1152,11 @@ pub fn spawn_writer(db_path: &Path) -> (DbHandle, DbWriter) {
 /// release profile, a panic on this thread would abort the *entire*
 /// process, taking the proxied session down with it — exactly what
 /// fail-open logging must not do.
-fn writer_loop(path: &Path, rx: Receiver<ToolCallEntry>) {
-    let mut conn = match open_db(path) {
-        Ok(conn) => conn,
-        Err(e) => {
-            tracing::error!("audit db unavailable ({e}); all audit log entries will be dropped for this session");
-            // Keep draining so `DbHandle::log` sends don't pile up in an
-            // ever-growing unbounded channel for the life of the process.
-            for _ in rx.iter() {
-                tracing::warn!("audit log entry dropped: db unavailable");
-            }
-            return;
-        }
-    };
+fn writer_loop(mut conn: Connection, rx: Receiver<ToolCallEntry>) {
+    // No "database unavailable" branch here any more: `spawn_writer` opens
+    // the connection before this thread exists, so reaching this function
+    // means the database is open. A proxy that runs while recording nothing
+    // is refused at startup instead (see `spawn_writer`).
 
     // Deliberately NO in-memory prev_hash cache here (there used to be
     // one). Other `auditmcp run` processes may share this db_path, so the
@@ -1443,6 +1501,26 @@ mod tests {
         remove_db_files(&path);
     }
 
+    /// An unopenable database must fail at startup, not become a session
+    /// that proxies traffic while recording nothing. The open used to
+    /// happen on the writer thread, where its failure was invisible to the
+    /// caller and unrecordable anywhere else — there is no way to write "I
+    /// could not record anything" into the database that would not open.
+    #[test]
+    fn spawn_writer_refuses_to_start_when_the_database_cannot_be_opened() {
+        // A directory is not a database file, so SQLite cannot open it.
+        let dir =
+            std::env::temp_dir().join(format!("auditmcp_test_notadb_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(
+            spawn_writer(&dir).is_err(),
+            "an unopenable db must be a startup error, not a silent degradation"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression test for silent audit-log data loss. Before `DbWriter`
     /// existed the writer thread was detached, so entries still queued when
     /// the process exited were discarded with no error and no warning —
@@ -1451,7 +1529,7 @@ mod tests {
     #[test]
     fn every_queued_entry_reaches_disk_after_join() {
         let path = temp_db_path("writer_join");
-        let (db, writer) = spawn_writer(&path);
+        let (db, writer) = spawn_writer(&path).unwrap();
 
         const N: usize = 500;
         for i in 0..N {

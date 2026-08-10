@@ -76,6 +76,25 @@ auditmcp unmask --config config.toml <sha256> --note "confirmed false positive"
 
 `--since` takes a duration with a required unit: `45s`, `30m`, `2h`, `1d`.
 
+### Diagnostics
+
+Warnings go to stderr and are on by default, because the things auditmcp
+warns about are the ways your record can be incomplete — an entry dropped
+under load, the redactions index drifting, a pipe error. Set `RUST_LOG` to
+change it:
+
+```bash
+RUST_LOG=error auditmcp run --config config.toml    # quieter
+RUST_LOG=debug auditmcp run --config config.toml    # louder
+```
+
+Two conditions refuse to start rather than warn, because both would mean
+proxying traffic while silently failing at the job: a database that cannot
+be opened (nothing would be recorded, and that fact cannot be recorded
+either), and a bundled pattern set that fails to load (every secret would
+be stored in the clear). The second indicates a defective build rather than
+a configuration problem — the pattern set is compiled into the binary.
+
 ### Exit codes
 
 `verify` has two distinct nonzero codes so a monitoring script can tell
@@ -162,6 +181,12 @@ phased spec.
   columns exist in the schema and are always `NULL`; they were added on day
   one specifically to avoid a migration later. `query --anomalous` and
   `watch` do not exist.
+- **A user-updatable patterns file.** The spec calls for one; `patterns.toml`
+  is currently compiled into the binary with `include_str!` and there is no
+  config key pointing at a user copy. Editing `patterns.toml` and rebuilding
+  works; editing it next to an installed binary does nothing. This is also
+  what makes refusing to start on a pattern-load failure correct — that
+  failure can only mean a broken build today, not a user's typo.
 - **Phase 4 — Lua policy layer.** No `mlua` dependency yet, by design.
 
 Two functions — `truncate::truncate_raw_sampled` and

@@ -117,8 +117,17 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Default to `warn`, not to silence. Every fail-open path in this
+    // codebase reports by warning and continuing -- entries dropped, index
+    // drift, a pipe error -- and with `EnvFilter::from_default_env()` alone
+    // an unset RUST_LOG enables nothing, so all of it went to nowhere. A
+    // tool whose job is a complete record must not be quiet about the ways
+    // that record can be incomplete. RUST_LOG still overrides, in both
+    // directions.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
 
