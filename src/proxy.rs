@@ -18,52 +18,19 @@
 //! impossible: you can't retroactively un-truncate a value to redact a
 //! secret that only got cut off by the earlier preview.
 
-use crate::config::{Config, Tier};
-use crate::db::{self, DbHandle, ToolCallEntry};
+use crate::audit::{self, CallOutcome};
+use crate::config::Config;
+use crate::db::{self, DbHandle};
 use crate::jsonrpc::RpcMessage;
-use crate::secrets::{self, PatternSet, Severity};
-use crate::truncate;
-use serde::Serialize;
-use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use crate::secrets::PatternSet;
+use crate::session::{PendingCall, Session};
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
-
-/// Byte cap applied when rendering a value under the `minimal` tier.
-/// Unrelated to `standard` tier's semantic truncation (see `truncate.rs`)
-/// — this is a blunt, cheap preview for the tier that wants the smallest
-/// possible footprint, not a structure-preserving cap.
-const PREVIEW_BYTES: usize = 200;
-
-pub(crate) struct PendingCall {
-    pub(crate) tool_name: String,
-    /// Full, untruncated parsed `arguments` value — see the module-level
-    /// doc comment for why this can't be truncated yet at capture time.
-    pub(crate) args: Option<Value>,
-    pub(crate) bytes_in: i64,
-    pub(crate) started: Instant,
-}
-
-type PendingMap = Arc<Mutex<HashMap<String, PendingCall>>>;
-
-/// One entry in the `redaction_flags` JSON array stored per row: which
-/// pattern fired, at what severity, plus the sha256 of the plaintext secret
-/// (never the plaintext itself) so the same secret can be correlated
-/// across rows. No `allowlisted` field here -- this array is only ever
-/// built from hits already filtered to non-allowlisted ones (see
-/// `active_hit_count`/`redaction_flags` below), so it would always read
-/// `false` and add nothing.
-#[derive(Serialize)]
-struct RedactionRecord<'a> {
-    pattern: &'a str,
-    severity: Severity,
-    sha256: &'a str,
-}
 
 pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> {
     let config = Arc::new(Config::load(config_path)?);
@@ -72,7 +39,10 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         .split_first()
         .expect("resolve_target rejects an empty command");
 
-    let session_id = uuid::Uuid::new_v4().to_string();
+    // Exactly one session: stdio proxies exactly one client, so all
+    // JSON-RPC ids on this pipe come from that one caller and are
+    // unambiguous. See `session.rs` for why the scope has to exist anyway.
+    let session = Arc::new(Session::new(uuid::Uuid::new_v4().to_string()));
     let server_name = config.server_name_for(program);
     let db = db::spawn_writer(Path::new(&config.logging.db_path));
 
@@ -124,15 +94,12 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         .take()
         .ok_or_else(|| anyhow::anyhow!("child stdout was not piped"))?;
 
-    let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-
-    let inbound = tokio::spawn(pump_client_to_child(child_stdin, Arc::clone(&pending)));
+    let inbound = tokio::spawn(pump_client_to_child(child_stdin, Arc::clone(&session)));
 
     let outbound = tokio::spawn(pump_child_to_client(
         child_stdout,
-        Arc::clone(&pending),
+        Arc::clone(&session),
         db,
-        session_id,
         server_name,
         Arc::clone(&config),
         patterns,
@@ -165,7 +132,7 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
 /// best-effort parses `tools/call` requests to start tracking a pending
 /// call. Parsing never gates forwarding: a malformed or non-UTF-8 line is
 /// still passed through untouched, just not logged.
-async fn pump_client_to_child(mut child_in: ChildStdin, pending: PendingMap) {
+async fn pump_client_to_child(mut child_in: ChildStdin, session: Arc<Session>) {
     let mut reader = BufReader::new(tokio::io::stdin());
     let mut buf: Vec<u8> = Vec::new();
 
@@ -193,17 +160,17 @@ async fn pump_client_to_child(mut child_in: ChildStdin, pending: PendingMap) {
         if let Some(msg) = parse_rpc_message(&buf) {
             if msg.is_tool_call_request() {
                 if let (Some(id_key), Some(tool_name)) = (msg.id_key(), msg.tool_name()) {
-                    let args = msg.arguments().cloned();
-                    let mut guard = pending.lock().await;
-                    guard.insert(
-                        id_key,
-                        PendingCall {
-                            tool_name,
-                            args,
-                            bytes_in: buf.len() as i64,
-                            started: Instant::now(),
-                        },
-                    );
+                    session
+                        .register(
+                            id_key,
+                            PendingCall {
+                                tool_name,
+                                args: msg.arguments().cloned(),
+                                bytes_in: buf.len() as i64,
+                                started: Instant::now(),
+                            },
+                        )
+                        .await;
                 }
             }
         }
@@ -213,12 +180,10 @@ async fn pump_client_to_child(mut child_in: ChildStdin, pending: PendingMap) {
 /// Child stdout -> client stdout. Forwards every line byte-for-byte, and
 /// best-effort parses responses to close out a pending call and submit a
 /// `ToolCallEntry`. Same fail-open contract as `pump_client_to_child`.
-#[allow(clippy::too_many_arguments)]
 async fn pump_child_to_client(
     child_out: ChildStdout,
-    pending: PendingMap,
+    session: Arc<Session>,
     db: DbHandle,
-    session_id: String,
     server_name: String,
     config: Arc<Config>,
     patterns: Arc<PatternSet>,
@@ -256,20 +221,18 @@ async fn pump_child_to_client(
             continue;
         };
 
-        let pending_call = {
-            let mut guard = pending.lock().await;
-            guard.remove(&id_key)
-        };
-        let Some(call) = pending_call else {
-            continue; // Response to something we didn't track (e.g. not a tools/call).
+        // Response to something we didn't track (not a tools/call), or a
+        // replay of one already resolved — either way there is nothing to
+        // close out and nothing to log.
+        let Some(call) = session.resolve(&id_key).await else {
+            continue;
         };
 
         let configured_tier = config.tier_for_tool(&call.tool_name);
-        let entry = build_entry(
+        let entry = audit::build_entry(
             call,
-            &msg,
-            buf.len() as i64,
-            &session_id,
+            CallOutcome::from_rpc(&msg, buf.len() as i64),
+            session.id(),
             &server_name,
             configured_tier,
             &patterns,
@@ -277,139 +240,6 @@ async fn pump_child_to_client(
         );
 
         db.log(entry);
-    }
-}
-
-/// Builds the `ToolCallEntry` for one completed tools/call from the parsed
-/// response and its pending request state: detect secrets → decide status →
-/// escalate tier → render the (already redacted) values → assemble the row.
-/// Pure data transformation, no I/O and no awaits — extracted from
-/// `pump_child_to_client` so this whole pipeline is regression-testable end
-/// to end (see `db::tests::secret_in_sentence_is_redacted_in_the_actual_stored_row`):
-/// a bug where the redacted value and the value actually persisted diverge
-/// would be invisible to unit tests that only assert on
-/// `scan_and_redact_json`'s in-memory output.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_entry(
-    call: PendingCall,
-    msg: &RpcMessage,
-    bytes_out: i64,
-    session_id: &str,
-    server_name: &str,
-    configured_tier: Tier,
-    patterns: &PatternSet,
-    allowlist: &HashSet<String>,
-) -> ToolCallEntry {
-    let duration_ms = call.started.elapsed().as_millis() as i64;
-    // Covers both a JSON-RPC-level error (e.g. "method not found") and
-    // the MCP convention of a tool's own failure reported inside an
-    // otherwise-successful result via `isError: true` (e.g. a delete
-    // tool that ran but couldn't find the file) -- per the threat
-    // model, a failed destructive tool call must never be under-logged
-    // by only checking the JSON-RPC transport-level error field.
-    let is_error = msg.is_error_response() || msg.is_mcp_tool_error();
-    let status = if is_error { "error" } else { "success" };
-
-    // Secrets detection runs on the full, untruncated args/result/error
-    // values before any tier-based truncation is even decided — the
-    // decision of *how much* to truncate depends on whether detection
-    // fired, so detection must go first.
-    let mut args_value = call.args;
-    let mut result_value = msg.result.clone();
-    let mut error_value = msg.error.clone();
-
-    let mut hits = Vec::new();
-    if let Some(v) = args_value.as_mut() {
-        hits.extend(secrets::scan_and_redact_json(v, patterns, allowlist));
-    }
-    if let Some(v) = result_value.as_mut() {
-        hits.extend(secrets::scan_and_redact_json(v, patterns, allowlist));
-    }
-    if let Some(v) = error_value.as_mut() {
-        hits.extend(secrets::scan_and_redact_json(v, patterns, allowlist));
-    }
-
-    // Allowlisted hits are confirmed false positives (left unredacted
-    // by `scan_and_redact_json` itself) -- they must not count toward
-    // escalation or the stored redaction metadata, only genuine,
-    // still-redacted hits do.
-    let active_hit_count = hits.iter().filter(|h| !h.allowlisted).count();
-    let secrets_fired = active_hit_count > 0;
-
-    // Tier escalation: configured tier, forced to `full` if secrets
-    // fired anywhere in this call or the call errored. Anomalies (a
-    // leaked secret, a failing tool call) must never be hidden by
-    // truncation, regardless of what the user configured for this tool.
-    let effective_tier = if secrets_fired || is_error {
-        Tier::Full
-    } else {
-        configured_tier
-    };
-
-    // Truncation runs AFTER redaction, on the already-redacted values,
-    // so it can never slice a secret in half before detection catches
-    // it, and never re-exposes a redaction marker by cutting around it.
-    // These are the SAME `*_value` bindings `scan_and_redact_json` mutated
-    // above — no clone of the pre-redaction originals survives past this
-    // point, so what gets rendered is provably the redacted tree.
-    let args_json = args_value.map(|v| render_tier(&v, effective_tier));
-    let result_json = result_value.map(|v| render_tier(&v, effective_tier));
-    let error_message = error_value.map(|v| render_tier(&v, effective_tier));
-
-    // Structured, not a flat array of pattern names: each entry pairs
-    // the pattern (plus its severity) with the sha256 of the plaintext
-    // secret it matched, so the same leaked value can be correlated
-    // across separate tool calls/rows without ever persisting the
-    // plaintext itself. This is a data-SHAPE change to `redaction_flags`
-    // (still the same TEXT column, no migration) — `query`/`export`
-    // must parse this as `[{"pattern":..,"severity":..,"sha256":..}, ...]`,
-    // not `["pattern", ...]`.
-    let redaction_flags = if secrets_fired {
-        let records: Vec<RedactionRecord> = hits
-            .iter()
-            .filter(|h| !h.allowlisted)
-            .map(|h| RedactionRecord {
-                pattern: h.pattern_name.as_str(),
-                severity: h.severity,
-                sha256: h.secret_sha256.as_str(),
-            })
-            .collect();
-        serde_json::to_string(&records).ok()
-    } else {
-        None
-    };
-
-    ToolCallEntry {
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        session_id: session_id.to_string(),
-        agent_id: None,
-        tool_name: call.tool_name,
-        server_name: Some(server_name.to_string()),
-        args_json,
-        result_json,
-        status: status.to_string(),
-        error_message,
-        duration_ms: Some(duration_ms),
-        bytes_in: Some(call.bytes_in),
-        bytes_out: Some(bytes_out),
-        source: None,
-        destination: None,
-        redaction_flags,
-        redaction_count: active_hit_count as i64,
-        anomaly_score: None,
-        anomaly_reasons: None,
-    }
-}
-
-/// Renders a (already redacted) JSON value to its stored string form under
-/// the given effective tier. `minimal` keeps Phase 1's blunt byte-preview
-/// behavior; `standard` applies structure-preserving semantic truncation;
-/// `full` stores the value as-is.
-fn render_tier(value: &Value, tier: Tier) -> String {
-    match tier {
-        Tier::Minimal => truncate_preview(&value.to_string()),
-        Tier::Standard => truncate::truncate_json_semantic(value).to_string(),
-        Tier::Full => value.to_string(),
     }
 }
 
@@ -436,36 +266,9 @@ fn strip_trailing_newline(buf: &[u8]) -> &[u8] {
     &buf[..end]
 }
 
-/// Truncates to at most `PREVIEW_BYTES` bytes, snapping back to the
-/// nearest char boundary so this can never panic by slicing into the
-/// middle of a multi-byte UTF-8 sequence.
-fn truncate_preview(s: &str) -> String {
-    if s.len() <= PREVIEW_BYTES {
-        return s.to_string();
-    }
-    let end = truncate::snap_boundary(s, PREVIEW_BYTES);
-    format!("{}... [truncated, {} bytes total]", &s[..end], s.len())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn truncate_preview_leaves_short_strings_untouched() {
-        assert_eq!(truncate_preview("hello"), "hello");
-    }
-
-    #[test]
-    fn truncate_preview_does_not_panic_on_multibyte_boundary() {
-        // Each '✓' is 3 bytes in UTF-8; PREVIEW_BYTES (200) is not a
-        // multiple of 3, so a naive byte-slice at exactly 200 would land
-        // mid-character.
-        let s: String = "✓".repeat(100);
-        let preview = truncate_preview(&s);
-        assert!(preview.starts_with('✓'));
-        assert!(preview.contains("truncated"));
-    }
 
     #[test]
     fn parse_rpc_message_returns_none_on_invalid_utf8() {

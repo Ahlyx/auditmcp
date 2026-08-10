@@ -1701,7 +1701,7 @@ mod tests {
     /// `redaction_flags` records the hit and `query --verbose` reports it)
     /// but the redacted content never makes it into the persisted row --
     /// the stored JSON and the redaction metadata must never diverge.
-    /// Runs the REAL response pipeline (`proxy::build_entry`: detect →
+    /// Runs the REAL response pipeline (`audit::build_entry`: detect →
     /// escalate → redact → render) on a parsed JSON-RPC response, inserts
     /// through the real write path, and then asserts on the raw string
     /// read back OUT of SQLite -- not on any in-memory value. The secret
@@ -1719,17 +1719,16 @@ mod tests {
         );
         let msg: crate::jsonrpc::RpcMessage = serde_json::from_str(&line).unwrap();
 
-        let call = crate::proxy::PendingCall {
+        let call = crate::session::PendingCall {
             tool_name: "leak_secret".to_string(),
             args: None,
             bytes_in: 0,
             started: std::time::Instant::now(),
         };
         let patterns = crate::secrets::PatternSet::bundled().unwrap();
-        let entry = crate::proxy::build_entry(
+        let entry = crate::audit::build_entry(
             call,
-            &msg,
-            line.len() as i64,
+            crate::audit::CallOutcome::from_rpc(&msg, line.len() as i64),
             "sess-test",
             "fake_server",
             crate::config::Tier::Standard,

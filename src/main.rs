@@ -1,3 +1,4 @@
+mod audit;
 mod config;
 mod db;
 mod export;
@@ -5,6 +6,7 @@ mod jsonrpc;
 mod proxy;
 mod query;
 mod secrets;
+mod session;
 mod truncate;
 mod unmask;
 mod verify;
