@@ -97,22 +97,38 @@ struct SseParser {
     resyncing: bool,
 }
 
+/// One complete SSE event: the exact bytes it occupied on the wire,
+/// terminator included, alongside what they mean.
+///
+/// `raw` exists so the stream can be re-emitted byte for byte. Everything
+/// except the legacy `endpoint` event is forwarded exactly as received, and
+/// keeping the original bytes rather than re-serialising from the parsed
+/// fields is what makes that guarantee hold for framing this parser does
+/// not model — unknown fields, spacing, line-ending style.
+struct SseEvent {
+    raw: Vec<u8>,
+    name: Option<String>,
+    data: Option<String>,
+}
+
 impl SseParser {
-    /// Feeds one chunk and returns every `data` payload completed by it.
-    fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+    /// Feeds one chunk and returns every event completed by it.
+    fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
 
-        while let Some(end) = find_event_end(&self.buf) {
-            let event: Vec<u8> = self.buf.drain(..end.0).collect();
-            self.buf.drain(..end.1);
+        while let Some((body_len, term_len)) = find_event_end(&self.buf) {
+            let raw: Vec<u8> = self.buf.drain(..body_len + term_len).collect();
             if self.resyncing {
                 self.resyncing = false;
                 continue;
             }
-            if let Some(data) = data_payload(&event) {
-                out.push(data);
-            }
+            let body = &raw[..body_len];
+            out.push(SseEvent {
+                name: field(body, "event:"),
+                data: data_payload(body),
+                raw,
+            });
         }
 
         if self.buf.len() > MAX_SSE_EVENT_BYTES {
@@ -121,6 +137,22 @@ impl SseParser {
         }
         out
     }
+
+    /// Bytes received that have not yet formed a complete event, taken so
+    /// they can be flushed when the stream ends. A server that closes
+    /// without a final terminator still gets its last bytes forwarded.
+    fn take_remainder(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+}
+
+/// The value of the first line with the given field prefix.
+fn field(event: &[u8], prefix: &str) -> Option<String> {
+    let text = std::str::from_utf8(event).ok()?;
+    text.lines().find_map(|line| {
+        line.strip_prefix(prefix)
+            .map(|rest| rest.strip_prefix(' ').unwrap_or(rest).to_string())
+    })
 }
 
 /// Offset of an event terminator and its length (`\n\n` or `\r\n\r\n`).
@@ -153,6 +185,76 @@ fn data_payload(event: &[u8]) -> Option<String> {
     (!data.is_empty()).then_some(data)
 }
 
+/// Rewrites the URI carried by a legacy `endpoint` event so it points at
+/// this proxy instead of the upstream.
+///
+/// **This is the only place auditmcp deliberately alters a byte it
+/// forwards, and it is not optional.** In the HTTP+SSE transport of
+/// protocol version 2024-11-05 the server's first event hands the client
+/// the URI to POST every subsequent message to. Relayed untouched, that
+/// URI names the upstream, so the client would POST directly to it — past
+/// the proxy — and the audit log would contain the opening connection and
+/// nothing else. A proxy that looks healthy and records nothing is the
+/// worst failure this tool has, so the rewrite ships with legacy support
+/// rather than after it.
+///
+/// A relative URI already resolves against whoever served the stream,
+/// which is this proxy, so it is returned unchanged; only an absolute one
+/// needs its scheme and authority replaced. Anything that does not parse
+/// is left alone — corrupting an event we do not understand would be worse
+/// than failing to redirect it, and the failure is visible (the client
+/// bypasses us) rather than silent traffic damage.
+fn rewrite_endpoint_uri(raw: &str, local_addr: &std::net::SocketAddr) -> Option<String> {
+    let uri: http::Uri = raw.trim().parse().ok()?;
+    uri.authority()?; // relative: already points at us
+    let mut parts = uri.into_parts();
+    parts.scheme = Some(http::uri::Scheme::HTTP);
+    parts.authority = Some(local_addr.to_string().parse().ok()?);
+    if parts.path_and_query.is_none() {
+        parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+    }
+    Some(http::Uri::from_parts(parts).ok()?.to_string())
+}
+
+/// The path-and-query a legacy POST will carry, which is what identifies
+/// the session on the way back. Everything before it is our own authority
+/// after the rewrite, and a client that resolved a relative URI sends only
+/// this part anyway — so it is the one stable key both sides agree on.
+fn endpoint_key(uri: &str) -> Option<String> {
+    let parsed: http::Uri = uri.trim().parse().ok()?;
+    Some(parsed.path_and_query()?.to_string())
+}
+
+/// Replaces the `data:` payload of one event, preserving its other lines
+/// and its terminator so nothing else about the frame changes.
+fn replace_event_data(raw: &[u8], new_data: &str) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return raw.to_vec();
+    };
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = String::with_capacity(text.len() + new_data.len());
+    let mut replaced = false;
+    for line in text.split(newline) {
+        if line.starts_with("data:") {
+            // Multi-line data collapses to one line; the payload is a URI,
+            // which cannot legally span lines.
+            if !replaced {
+                out.push_str("data: ");
+                out.push_str(new_data);
+                out.push_str(newline);
+                replaced = true;
+            }
+        } else {
+            out.push_str(line);
+            out.push_str(newline);
+        }
+    }
+    // `split` yields a trailing empty piece for the terminator, which the
+    // loop already re-added; drop the extra newline it introduces.
+    out.truncate(out.len() - newline.len());
+    out.into_bytes()
+}
+
 /// The body type returned to clients: either a streamed upstream response
 /// or a small locally-generated error.
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
@@ -162,6 +264,9 @@ type ProxyBody = BoxBody<Bytes, hyper::Error>;
 struct Listener {
     server_name: String,
     upstream: http::Uri,
+    /// This listener's own address, needed to point a rewritten legacy
+    /// `endpoint` event back at ourselves.
+    local_addr: std::net::SocketAddr,
     allowed_origins: Vec<String>,
     config: Arc<Config>,
     db: DbHandle,
@@ -182,6 +287,15 @@ struct Listener {
 struct SessionRegistry {
     next_id: AtomicU64,
     open: Mutex<HashMap<u64, Arc<Session>>>,
+    /// Legacy HTTP+SSE only: the POST endpoint a server advertised, mapped
+    /// to the session of the SSE stream that advertised it.
+    ///
+    /// That transport splits one logical session across two connections --
+    /// messages go out on a POST, answers come back on the GET stream --
+    /// so correlation cannot be per connection there. Keyed by the
+    /// endpoint's path and query, which is what the server chose to
+    /// identify the session with and what the client sends back.
+    endpoints: Mutex<HashMap<String, Arc<Session>>>,
 }
 
 impl SessionRegistry {
@@ -208,7 +322,26 @@ impl SessionRegistry {
 
     /// Every session still open, for the shutdown drain.
     async fn take_all(&self) -> Vec<Arc<Session>> {
-        self.open.lock().await.drain().map(|(_, s)| s).collect()
+        let mut all: Vec<Arc<Session>> = self.open.lock().await.drain().map(|(_, s)| s).collect();
+        all.extend(self.endpoints.lock().await.drain().map(|(_, s)| s));
+        all
+    }
+
+    /// Binds a legacy POST endpoint to the session of the stream that
+    /// advertised it.
+    async fn bind_endpoint(&self, key: String, session: Arc<Session>) {
+        self.endpoints.lock().await.insert(key, session);
+    }
+
+    /// The session a legacy POST belongs to, if this path and query was
+    /// advertised as an endpoint. Falls back to the connection's own
+    /// session for every modern transport, where the two coincide.
+    async fn session_for_endpoint(&self, key: &str) -> Option<Arc<Session>> {
+        self.endpoints.lock().await.get(key).cloned()
+    }
+
+    async fn unbind_endpoint(&self, key: &str) -> Option<Arc<Session>> {
+        self.endpoints.lock().await.remove(key)
     }
 }
 
@@ -227,11 +360,17 @@ struct TeeBody {
     inner: Incoming,
     /// Taken when the stream ends, so the final audit runs exactly once.
     tee: Option<Tee>,
+    /// Event-stream mode only: complete events waiting to go out. Empty
+    /// for whole-body responses, which forward their frames directly.
+    pending_out: std::collections::VecDeque<Bytes>,
 }
 
 struct Tee {
     listener: Arc<Listener>,
     session: Arc<Session>,
+    /// Set once a legacy `endpoint` event has been seen, so the binding
+    /// is released when the stream ends.
+    endpoint_key: Option<String>,
     /// Correlation key from the request, used when the response body is
     /// not parseable JSON-RPC and therefore carries no id of its own.
     pending_key: Option<String>,
@@ -242,10 +381,20 @@ struct Tee {
 
 enum TeeMode {
     /// A single JSON body: accumulate up to the cap, audit when it ends.
+    /// Frames pass straight through; nothing here is ever rewritten.
     Whole { captured: Vec<u8>, truncated: bool },
     /// An event stream: audit each complete message as it goes by, and
     /// never accumulate, so a stream that stays open for hours costs
     /// nothing.
+    ///
+    /// Unlike `Whole`, this re-emits at event granularity rather than
+    /// passing frames through as they arrive, because the legacy
+    /// `endpoint` event has to be rewritten before the client sees it and
+    /// a frame already forwarded cannot be taken back. The delay is until
+    /// the event's terminator, which the server sends with it — an event
+    /// is still delivered the moment it is complete, which is the unit SSE
+    /// is defined in. Every event except `endpoint` is re-emitted from its
+    /// original bytes, so the stream stays byte-identical.
     Events(SseParser),
 }
 
@@ -260,9 +409,11 @@ impl TeeBody {
     ) -> Self {
         TeeBody {
             inner,
+            pending_out: std::collections::VecDeque::new(),
             tee: Some(Tee {
                 listener,
                 session,
+                endpoint_key: None,
                 pending_key,
                 succeeded,
                 bytes_out: 0,
@@ -287,27 +438,58 @@ impl hyper::body::Body for TeeBody {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        use std::task::Poll;
         let this = self.get_mut();
-        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
 
-        match &polled {
-            std::task::Poll::Ready(Some(Ok(frame))) => {
-                if let Some(chunk) = frame.data_ref() {
-                    if let Some(tee) = this.tee.as_mut() {
-                        tee.observe(chunk);
+        loop {
+            // Event-stream mode may hold bytes ready from a previous poll:
+            // one upstream frame can complete several events.
+            if let Some(ready) = this.pending_out.pop_front() {
+                return Poll::Ready(Some(Ok(hyper::body::Frame::data(ready))));
+            }
+
+            let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+            match polled {
+                Poll::Ready(Some(Ok(frame))) => {
+                    let Some(chunk) = frame.data_ref() else {
+                        // Trailers and other non-data frames pass through.
+                        return Poll::Ready(Some(Ok(frame)));
+                    };
+                    match this.tee.as_mut() {
+                        Some(tee) => {
+                            let out = tee.observe(chunk);
+                            match out {
+                                // `Whole` mode: forward the original frame
+                                // untouched, exactly as before.
+                                None => return Poll::Ready(Some(Ok(frame))),
+                                // `Events` mode: forward whatever complete
+                                // events this chunk produced, if any. If it
+                                // produced none, loop and read more rather
+                                // than emitting an empty frame.
+                                Some(events) => this.pending_out.extend(events),
+                            }
+                        }
+                        None => return Poll::Ready(Some(Ok(frame))),
                     }
                 }
-            }
-            // End of stream, cleanly or otherwise: a body that failed
-            // partway is still evidence of a call that happened.
-            std::task::Poll::Ready(None) | std::task::Poll::Ready(Some(Err(_))) => {
-                if let Some(tee) = this.tee.take() {
-                    tee.finish();
+                // End of stream, cleanly or otherwise: a body that failed
+                // partway is still evidence of a call that happened.
+                Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
+                    if let Some(mut tee) = this.tee.take() {
+                        // Any trailing bytes that never formed an event are
+                        // still the server's, and are forwarded as-is.
+                        let remainder = tee.take_remainder();
+                        tee.finish();
+                        if !remainder.is_empty() {
+                            this.pending_out.push_back(Bytes::from(remainder));
+                            continue;
+                        }
+                    }
+                    return polled;
                 }
+                Poll::Pending => return Poll::Pending,
             }
-            std::task::Poll::Pending => {}
         }
-        polled
     }
 }
 
@@ -326,7 +508,10 @@ impl Tee {
     /// Called with each frame *after* it has been handed onward. Bounded
     /// work only: a copy for the whole-body case, an incremental parse for
     /// the event-stream case.
-    fn observe(&mut self, chunk: &Bytes) {
+    /// Returns `None` for whole-body responses, whose frames the caller
+    /// forwards untouched, and `Some(events)` for event streams, where the
+    /// caller forwards exactly what comes back here.
+    fn observe(&mut self, chunk: &Bytes) -> Option<Vec<Bytes>> {
         self.bytes_out += chunk.len() as i64;
         match &mut self.mode {
             TeeMode::Whole {
@@ -342,28 +527,107 @@ impl Tee {
                 } else {
                     captured.extend_from_slice(chunk);
                 }
+                None
             }
             TeeMode::Events(parser) => {
-                for payload in parser.feed(chunk) {
-                    // Each event carries its own JSON-RPC message, so
-                    // correlation is per message rather than per stream --
-                    // which is what makes one response stream able to close
-                    // one call while notifications flow past unlogged.
-                    let Ok(msg) = serde_json::from_str::<RpcMessage>(&payload) else {
-                        continue;
-                    };
-                    let Some(id_key) = msg.id_key() else { continue };
-                    let Some(call) = self.session.resolve(&id_key) else {
-                        continue;
-                    };
+                let events = parser.feed(chunk);
+                let mut out = Vec::with_capacity(events.len());
+                for event in events {
+                    out.push(self.handle_event(event));
+                }
+                Some(out)
+            }
+        }
+    }
+
+    /// Audits one event and returns the bytes to forward for it --
+    /// unchanged except for a legacy `endpoint`, which is rewritten to
+    /// point at this proxy.
+    fn handle_event(&mut self, event: SseEvent) -> Bytes {
+        if event.name.as_deref() == Some("endpoint") {
+            if let Some(advertised) = event.data.as_deref() {
+                return self.rewrite_endpoint(&event.raw, advertised);
+            }
+        }
+
+        if let Some(payload) = event.data.as_deref() {
+            // Each event carries its own JSON-RPC message, so correlation
+            // is per message rather than per stream -- which is what lets
+            // one response close one call while notifications flow past
+            // unlogged.
+            if let Ok(msg) = serde_json::from_str::<RpcMessage>(payload) {
+                if let Some(call) = msg.id_key().and_then(|k| self.session.resolve(&k)) {
                     let outcome = CallOutcome::from_rpc(&msg, payload.len() as i64);
                     log_entry(&self.listener, self.session.id(), call, outcome);
                 }
             }
         }
+        Bytes::from(event.raw)
+    }
+
+    /// Points the advertised POST endpoint at this proxy and binds a
+    /// session to it.
+    ///
+    /// The session is created here rather than reused from the connection
+    /// because legacy HTTP+SSE splits one logical session across two
+    /// connections: messages go out on a POST, answers come back on this
+    /// stream. Correlation therefore belongs to the endpoint, not to
+    /// either connection. `sse:` records that derivation, the way `conn:`
+    /// records it for the modern transports.
+    fn rewrite_endpoint(&mut self, raw_event: &[u8], advertised: &str) -> Bytes {
+        let session = Arc::new(Session::new(format!("sse:{}", uuid::Uuid::new_v4())));
+        self.session = Arc::clone(&session);
+
+        let rewritten = rewrite_endpoint_uri(advertised, &self.listener.local_addr);
+        let effective = rewritten.as_deref().unwrap_or(advertised);
+
+        // Bound by the path and query the client will send back, which is
+        // all that survives its own resolution of a relative URI.
+        match endpoint_key(effective) {
+            Some(key) => {
+                let listener = Arc::clone(&self.listener);
+                self.endpoint_key = Some(key.clone());
+                tokio::spawn(async move {
+                    listener.sessions.bind_endpoint(key, session).await;
+                });
+            }
+            None => tracing::warn!(
+                "server {}: could not derive an endpoint key from {advertised}; \
+                 legacy POSTs on this stream will not be correlated",
+                self.listener.server_name
+            ),
+        }
+
+        match rewritten {
+            Some(uri) => Bytes::from(replace_event_data(raw_event, &uri)),
+            // Relative already resolves against us, so nothing to change.
+            None => Bytes::from(raw_event.to_vec()),
+        }
+    }
+
+    fn take_remainder(&mut self) -> Vec<u8> {
+        match &mut self.mode {
+            TeeMode::Events(parser) => parser.take_remainder(),
+            TeeMode::Whole { .. } => Vec::new(),
+        }
     }
 
     fn finish(self) {
+        // A legacy stream ending takes its endpoint with it: the client
+        // must reconnect to get a new one, and leaving the binding would
+        // let a later POST resolve against a dead session.
+        if let Some(key) = self.endpoint_key.clone() {
+            let listener = Arc::clone(&self.listener);
+            let session = Arc::clone(&self.session);
+            tokio::spawn(async move {
+                if listener.sessions.unbind_endpoint(&key).await.is_some() {
+                    for call in session.drain_abandoned() {
+                        log_timeout(&listener, session.id(), call);
+                    }
+                }
+            });
+        }
+
         let TeeMode::Whole {
             captured,
             truncated,
@@ -440,7 +704,9 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     let mut listeners = Vec::new();
     let mut tasks = Vec::new();
     for (tcp, addr, s) in bound {
-        let listener = Arc::new(build_listener(s, &config, &db, &patterns, &allowlist)?);
+        let listener = Arc::new(build_listener(
+            s, addr, &config, &db, &patterns, &allowlist,
+        )?);
         tracing::warn!(
             "auditmcp listening on http://{addr} -> {} (server '{}')",
             listener.upstream,
@@ -499,6 +765,7 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
 
 fn build_listener(
     s: &ServerConfig,
+    local_addr: std::net::SocketAddr,
     config: &Arc<Config>,
     db: &DbHandle,
     patterns: &Arc<PatternSet>,
@@ -512,6 +779,7 @@ fn build_listener(
     Ok(Listener {
         server_name: s.name.clone(),
         upstream,
+        local_addr,
         allowed_origins: s
             .allowed_origins
             .clone()
@@ -631,7 +899,6 @@ async fn proxy_once(
     session_arc: &Arc<Session>,
 ) -> anyhow::Result<Response<ProxyBody>> {
     let listener: &Listener = listener_arc;
-    let session: &Session = session_arc;
     if let Some(origin) = req.headers().get(hyper::header::ORIGIN) {
         let origin = origin.to_str().unwrap_or("");
         if !origin_allowed(origin, &listener.allowed_origins) {
@@ -657,9 +924,27 @@ async fn proxy_once(
         }
     };
 
+    // Legacy HTTP+SSE posts to an endpoint the server advertised on a
+    // different connection, and its answer comes back on that connection.
+    // So correlation follows the endpoint when this path was advertised as
+    // one, and the connection otherwise -- which is every modern transport,
+    // where request and response share a connection anyway.
+    let mut via_legacy_endpoint = false;
+    let session_arc: Arc<Session> = match parts.uri.path_and_query().map(|pq| pq.to_string()) {
+        Some(key) => match listener.sessions.session_for_endpoint(&key).await {
+            Some(bound) => {
+                via_legacy_endpoint = true;
+                bound
+            }
+            None => Arc::clone(session_arc),
+        },
+        None => Arc::clone(session_arc),
+    };
+    let session: &Session = &session_arc;
+
     // Register before forwarding, so a call is tracked even if the upstream
     // never answers.
-    let pending_key = register_if_tool_call(session, &parts, &body).await;
+    let pending_key = register_if_tool_call(session, &parts, &body);
 
     // Origin-level mirror: only scheme and authority change. Headers pass
     // through untouched -- Authorization, MCP-Protocol-Version, Mcp-Method,
@@ -685,11 +970,23 @@ async fn proxy_once(
         .map(|v| v.trim_start().starts_with("text/event-stream"))
         .unwrap_or(false);
 
+    // Whether this response is where the call's answer is expected.
+    //
+    // On legacy HTTP+SSE it never is: a message POST is acknowledged with
+    // `202 Accepted` and a body of no consequence, while the real answer
+    // arrives later on the open event stream. Treating the acknowledgement
+    // as the answer closed every legacy call as a failure -- the body is
+    // not JSON-RPC, so it fell to the raw path and logged `error` for calls
+    // that had in fact succeeded. `202` is excluded for the same reason on
+    // any transport: the modern spec uses it to accept a notification, and
+    // a notification is not an answer to anything.
+    let answer_expected_here = !via_legacy_endpoint && resp_parts.status != StatusCode::ACCEPTED;
+
     let tee = TeeBody::new(
         resp_body,
         Arc::clone(listener_arc),
-        Arc::clone(session_arc),
-        pending_key,
+        session_arc,
+        pending_key.filter(|_| answer_expected_here),
         resp_parts.status.is_success(),
         is_event_stream,
     );
@@ -704,7 +1001,7 @@ async fn proxy_once(
 /// Records a `tools/call` request so its response can be matched to it.
 /// Returns the correlation key, or `None` for anything that is not a tool
 /// call — those are forwarded and not logged, exactly as on stdio.
-async fn register_if_tool_call(
+fn register_if_tool_call(
     session: &Session,
     parts: &http::request::Parts,
     body: &Bytes,
@@ -793,6 +1090,26 @@ fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
 mod tests {
     use super::*;
     use crate::db::test_support::{remove_db_files, temp_db_path};
+
+    /// The `data` payloads of every event a chunk completed, which is what
+    /// the parser tests care about.
+    fn datas(events: Vec<SseEvent>) -> Vec<String> {
+        events.into_iter().filter_map(|e| e.data).collect()
+    }
+
+    /// The session drain `serve` performs at shutdown. Tests need it
+    /// because HTTP keeps connections alive: a connection that never closes
+    /// never runs its own cleanup, so calls still open at shutdown are
+    /// recorded here or not at all.
+    async fn drain_sessions(listeners: &[Arc<Listener>]) {
+        for listener in listeners {
+            for session in listener.sessions.take_all().await {
+                for call in session.drain_abandoned() {
+                    log_timeout(listener, session.id(), call);
+                }
+            }
+        }
+    }
 
     /// A fake upstream MCP server. Echoes the tool name back inside a
     /// JSON-RPC result, so a row can be traced to the request that produced
@@ -887,11 +1204,12 @@ mod tests {
                 "name = '{name}'\nupstream = '{upstream}'\nlisten = '127.0.0.1:0'\n"
             ))
             .unwrap();
-            let listener =
-                Arc::new(build_listener(&sc, &config, &db, &patterns, &allowlist).unwrap());
-            listeners.push(Arc::clone(&listener));
             let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            bases.push(format!("http://{}", tcp.local_addr().unwrap()));
+            let addr = tcp.local_addr().unwrap();
+            let listener =
+                Arc::new(build_listener(&sc, addr, &config, &db, &patterns, &allowlist).unwrap());
+            listeners.push(Arc::clone(&listener));
+            bases.push(format!("http://{addr}"));
             tasks.push(tokio::spawn(accept_loop(tcp, listener, stop_rx.clone())));
         }
         drop(stop_rx);
@@ -975,12 +1293,14 @@ mod tests {
             "name = 'gw'\nupstream = '{upstream}'\nlisten = '127.0.0.1:0'\n"
         ))
         .unwrap();
-        let listener = Arc::new(build_listener(&sc, &config, &db, &patterns, &allowlist).unwrap());
+        let proxy_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = proxy_tcp.local_addr().unwrap();
+        let listener =
+            Arc::new(build_listener(&sc, addr, &config, &db, &patterns, &allowlist).unwrap());
         let listeners = vec![Arc::clone(&listener)];
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", tcp.local_addr().unwrap());
-        let task = tokio::spawn(accept_loop(tcp, listener, stop_rx));
+        let base = format!("http://{addr}");
+        let task = tokio::spawn(accept_loop(proxy_tcp, listener, stop_rx));
 
         let client: Client<HttpConnector, Full<Bytes>> =
             Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
@@ -1020,11 +1340,11 @@ mod tests {
     #[test]
     fn sse_parser_splits_events_on_either_line_ending() {
         let mut p = SseParser::default();
-        assert_eq!(p.feed(b"data: one\n\ndata: two\n\n"), vec!["one", "two"]);
+        assert_eq!(datas(p.feed(b"data: one\n\ndata: two\n\n")), ["one", "two"]);
         let mut p = SseParser::default();
         assert_eq!(
-            p.feed(b"data: one\r\n\r\ndata: two\r\n\r\n"),
-            vec!["one", "two"]
+            datas(p.feed(b"data: one\r\n\r\ndata: two\r\n\r\n")),
+            ["one", "two"]
         );
     }
 
@@ -1035,9 +1355,9 @@ mod tests {
         let mut p = SseParser::default();
         let mut got = Vec::new();
         for byte in b"data: {\"id\":1}\n\n" {
-            got.extend(p.feed(&[*byte]));
+            got.extend(datas(p.feed(&[*byte])));
         }
-        assert_eq!(got, vec!["{\"id\":1}"]);
+        assert_eq!(got, ["{\"id\":1}"]);
     }
 
     /// Servers emit bare `:` comments as keep-alives on idle streams; they
@@ -1045,16 +1365,16 @@ mod tests {
     #[test]
     fn sse_parser_ignores_comments_and_non_data_fields() {
         let mut p = SseParser::default();
-        assert!(p.feed(b":\n\n").is_empty());
-        assert!(p.feed(b": keep-alive\n\n").is_empty());
-        assert!(p.feed(b"event: ping\nid: 7\n\n").is_empty());
-        assert_eq!(p.feed(b"event: message\ndata: hi\n\n"), vec!["hi"]);
+        assert!(datas(p.feed(b":\n\n")).is_empty());
+        assert!(datas(p.feed(b": keep-alive\n\n")).is_empty());
+        assert!(datas(p.feed(b"event: ping\nid: 7\n\n")).is_empty());
+        assert_eq!(datas(p.feed(b"event: message\ndata: hi\n\n")), ["hi"]);
     }
 
     #[test]
     fn sse_parser_joins_multiline_data_fields() {
         let mut p = SseParser::default();
-        assert_eq!(p.feed(b"data: a\ndata: b\n\n"), vec!["a\nb"]);
+        assert_eq!(datas(p.feed(b"data: a\ndata: b\n\n")), ["a\nb"]);
     }
 
     /// An event that never terminates must not grow the buffer without
@@ -1063,15 +1383,15 @@ mod tests {
     fn sse_parser_resyncs_after_an_oversized_event() {
         let mut p = SseParser::default();
         let huge = vec![b'x'; MAX_SSE_EVENT_BYTES + 1024];
-        assert!(p.feed(&huge).is_empty());
+        assert!(datas(p.feed(&huge)).is_empty());
         assert!(
             p.buf.len() <= MAX_SSE_EVENT_BYTES,
             "buffer must stay bounded"
         );
         // The remainder of the oversized event is discarded...
-        assert!(p.feed(b"trailing junk\n\n").is_empty());
+        assert!(datas(p.feed(b"trailing junk\n\n")).is_empty());
         // ...and the next event parses normally.
-        assert_eq!(p.feed(b"data: recovered\n\n"), vec!["recovered"]);
+        assert_eq!(datas(p.feed(b"data: recovered\n\n")), ["recovered"]);
     }
 
     /// One SSE response stream carrying a progress notification and then
@@ -1113,12 +1433,14 @@ mod tests {
             "name = 'sse'\nupstream = '{upstream}'\nlisten = '127.0.0.1:0'\n"
         ))
         .unwrap();
-        let listener = Arc::new(build_listener(&sc, &config, &db, &patterns, &allowlist).unwrap());
+        let proxy_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = proxy_tcp.local_addr().unwrap();
+        let listener =
+            Arc::new(build_listener(&sc, addr, &config, &db, &patterns, &allowlist).unwrap());
         let listeners = vec![Arc::clone(&listener)];
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", tcp.local_addr().unwrap());
-        let task = tokio::spawn(accept_loop(tcp, listener, stop_rx));
+        let base = format!("http://{addr}");
+        let task = tokio::spawn(accept_loop(proxy_tcp, listener, stop_rx));
 
         let client: Client<HttpConnector, Full<Bytes>> =
             Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
@@ -1138,6 +1460,163 @@ mod tests {
         assert_eq!(rows.len(), 1, "the notification must not produce a row");
         assert_eq!(rows[0].entry.tool_name, "streamer");
         assert_eq!(rows[0].entry.status, "success");
+        drop(conn);
+        remove_db_files(&db_path);
+    }
+
+    fn addr() -> std::net::SocketAddr {
+        "127.0.0.1:8787".parse().unwrap()
+    }
+
+    /// An absolute endpoint URI names the upstream. Left alone, the client
+    /// would POST straight to it and never touch the proxy again — the
+    /// audit log would hold the opening connection and nothing else.
+    #[test]
+    fn absolute_endpoint_uri_is_repointed_at_the_proxy() {
+        assert_eq!(
+            rewrite_endpoint_uri("http://upstream.test:3000/messages?sessionId=abc", &addr()),
+            Some("http://127.0.0.1:8787/messages?sessionId=abc".to_string())
+        );
+    }
+
+    /// A relative URI already resolves against whoever served the stream,
+    /// which is the proxy, so rewriting it would be a change for its own
+    /// sake.
+    #[test]
+    fn relative_endpoint_uri_is_left_alone() {
+        assert_eq!(
+            rewrite_endpoint_uri("/messages?sessionId=abc", &addr()),
+            None
+        );
+        assert_eq!(rewrite_endpoint_uri("not a uri at all", &addr()), None);
+    }
+
+    /// Both forms have to produce the same correlation key, because the
+    /// client sends only the path and query back either way.
+    #[test]
+    fn endpoint_key_is_the_path_and_query_for_either_form() {
+        assert_eq!(
+            endpoint_key("http://127.0.0.1:8787/messages?sessionId=abc"),
+            Some("/messages?sessionId=abc".to_string())
+        );
+        assert_eq!(
+            endpoint_key("/messages?sessionId=abc"),
+            Some("/messages?sessionId=abc".to_string())
+        );
+    }
+
+    /// The rewrite replaces the payload and nothing else: other fields,
+    /// ordering and the line-ending style all survive.
+    #[test]
+    fn replacing_event_data_preserves_the_rest_of_the_frame() {
+        assert_eq!(
+            replace_event_data(b"event: endpoint\ndata: OLD\n\n", "NEW"),
+            b"event: endpoint\ndata: NEW\n\n".to_vec()
+        );
+        assert_eq!(
+            replace_event_data(b"event: endpoint\r\ndata: OLD\r\n\r\n", "NEW"),
+            b"event: endpoint\r\ndata: NEW\r\n\r\n".to_vec()
+        );
+        assert_eq!(
+            replace_event_data(b"id: 9\nevent: endpoint\ndata: OLD\nretry: 50\n\n", "NEW"),
+            b"id: 9\nevent: endpoint\ndata: NEW\nretry: 50\n\n".to_vec()
+        );
+    }
+
+    /// The inverse of the rewrite, at the unit level: an event that is not
+    /// an `endpoint` must come back out as the exact bytes that went in.
+    /// A rewrite firing on the wrong frame corrupts traffic rather than
+    /// merely mis-logging it, so this is the more important direction.
+    #[test]
+    fn non_endpoint_events_round_trip_byte_for_byte() {
+        let inputs: Vec<&[u8]> = vec![
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            b"event: message\ndata: {\"a\":1}\n\n",
+            b": keep-alive\n\n",
+            b"event: ping\nid: 3\nretry: 1000\n\n",
+            b"data: line one\ndata: line two\n\n",
+            b"event: endpointish\ndata: http://upstream.test/x\n\n",
+            b"event: message\r\nid: 4\r\ndata: {\"b\":2}\r\n\r\n",
+        ];
+        for raw in inputs {
+            let mut p = SseParser::default();
+            let events = p.feed(raw);
+            assert_eq!(events.len(), 1, "expected one event from {raw:?}");
+            assert_eq!(
+                events[0].raw, raw,
+                "a non-endpoint event must be forwarded unchanged"
+            );
+        }
+    }
+
+    /// A `202 Accepted` acknowledgement is not an answer. Legacy HTTP+SSE
+    /// answers every message POST that way and delivers the real result on
+    /// the event stream, and the modern spec uses 202 for notifications.
+    /// Treating the acknowledgement's body as the response logged every
+    /// such call as an `error` — the body is not JSON-RPC, so it fell to
+    /// the raw path — for calls that had actually succeeded.
+    #[tokio::test]
+    async fn an_accepted_acknowledgement_does_not_close_a_call_as_failed() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", tcp.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = tcp.accept().await {
+                tokio::spawn(async move {
+                    let svc = service_fn(|_req: Request<Incoming>| async move {
+                        Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(StatusCode::ACCEPTED)
+                                .header(hyper::header::CONTENT_TYPE, "text/plain")
+                                .body(Full::new(Bytes::from("accepted")))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let db_path = temp_db_path("http_accepted");
+        let config = test_config(&db_path);
+        let (db, writer) = db::spawn_writer(&db_path).unwrap();
+        let patterns = Arc::new(PatternSet::bundled().unwrap());
+        let allowlist = Arc::new(HashSet::new());
+        let sc: ServerConfig = toml::from_str(&format!(
+            "name = 'ack'\nupstream = '{upstream}'\nlisten = '127.0.0.1:0'\n"
+        ))
+        .unwrap();
+        let proxy_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = proxy_tcp.local_addr().unwrap();
+        let listener =
+            Arc::new(build_listener(&sc, addr, &config, &db, &patterns, &allowlist).unwrap());
+        let listeners = vec![Arc::clone(&listener)];
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let base = format!("http://{addr}");
+        let task = tokio::spawn(accept_loop(proxy_tcp, listener, stop_rx));
+
+        let client: Client<HttpConnector, Full<Bytes>> =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+        post_tool_call(&client, &base, 1, "acked").await;
+
+        let _ = stop_tx.send(true);
+        let _ = task.await;
+        drain_sessions(&listeners).await;
+        drop(listeners);
+        drop(db);
+        assert!(matches!(
+            writer.wait_for_drain(std::time::Duration::from_secs(30)),
+            db::DrainOutcome::Drained { dropped: 0 }
+        ));
+
+        let conn = db::open_readonly(&db_path).unwrap();
+        let rows = db::read_all_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].entry.status, "timeout",
+            "an unanswered call is a timeout, not a failure invented from an ack body"
+        );
         drop(conn);
         remove_db_files(&db_path);
     }

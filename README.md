@@ -96,6 +96,21 @@ so two servers using the same JSON-RPC ids cannot be confused for each
 other. Binding anywhere but loopback is refused, since auditmcp has no
 authentication of its own.
 
+All three generations of MCP-over-HTTP work through the same listener —
+Streamable HTTP (2026-07-28 and 2025-03-26 through 2025-11-25) and the
+deprecated HTTP+SSE transport of 2024-11-05 — because the only thing the
+proxy interprets is the JSON-RPC envelope, which is identical in all of
+them.
+
+**One exception to byte-transparency, and only one.** On the legacy
+HTTP+SSE transport the server's first event hands the client a URI to POST
+every later message to. auditmcp rewrites that one URI to point at itself;
+left alone it names the upstream, so the client would POST straight past
+the proxy and the log would contain the opening connection and nothing
+else. Every other byte of that stream is forwarded unchanged — verified by
+running a full legacy session through the proxy and directly against the
+server and diffing the two streams, which differ on exactly that one line.
+
 Then read the log back:
 
 ```bash
@@ -238,15 +253,10 @@ phased spec.
 
 ### Not yet built
 
-- **The legacy HTTP+SSE transport** (protocol version 2024-11-05, two
-  endpoints). Streamable HTTP works, streaming included; the older
-  two-endpoint shape does not yet, because its `endpoint` event hands the
-  client a URL to POST to and that URL has to be rewritten or the client
-  silently bypasses the proxy and nothing gets audited.
 - **HTTPS upstreams.** TLS is not wired up; `serve` refuses an `https://`
-  upstream at startup rather than failing later. Remote servers therefore
-  aren't reachable yet, which also means OAuth against a real provider is
-  untested.
+  upstream at startup rather than failing later.
+  Remote servers therefore aren't reachable yet, which also means OAuth
+  against a real provider is untested.
 - **Phase 3 — anomaly detection.** The `anomaly_score` / `anomaly_reasons`
   columns exist in the schema and are always `NULL`; they were added on day
   one specifically to avoid a migration later. `query --anomalous` and
