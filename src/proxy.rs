@@ -37,6 +37,88 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 
+/// How long the writer gets to finish its queue at shutdown. Generous
+/// enough to write a full queue on a slow disk, and comfortably inside the
+/// patience of the service managers that will be stopping this process
+/// (systemd's `TimeoutStopSec` defaults to 90s; the Windows SCM's stop
+/// timeout is on the same order). Being killed mid-drain would lose more
+/// than giving up does.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the response pump gets to finish after the target has been
+/// asked to stop. Only reached when a target ignores termination; anything
+/// still in flight then is logged as a timeout, not lost.
+const PUMP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why the proxy is shutting down.
+enum Stop {
+    TargetExited(std::process::ExitStatus),
+    Signal(&'static str),
+}
+
+/// Resolves when the process is asked to stop, naming the mechanism.
+///
+/// Covers the console/POSIX signals a supervisor or a terminal will send.
+/// **Not covered: a true Windows Service stop.** The SCM delivers
+/// `SERVICE_CONTROL_STOP` to a service control handler, which is not a
+/// console control event and cannot be observed from here — wiring that up
+/// needs a service dispatcher and belongs with the install/lifecycle work,
+/// not here. `ctrl_shutdown` below catches system shutdown, which is the
+/// adjacent case, but a plain `net stop` on a service would bypass all of
+/// this.
+///
+/// If a handler can't be registered we log and never resolve, rather than
+/// refusing to start: being unable to observe a signal is not a reason to
+/// decline to audit anything.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "could not install SIGTERM handler ({e}); \
+                                a terminated session may not flush its audit log"
+                );
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT (Ctrl-C)",
+            _ = term.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        // Each is a distinct console control event; a supervisor or
+        // terminal may use any of them.
+        let (mut brk, mut close, mut shutdown) = match (
+            windows::ctrl_break(),
+            windows::ctrl_close(),
+            windows::ctrl_shutdown(),
+        ) {
+            (Ok(b), Ok(c), Ok(s)) => (b, c, s),
+            _ => {
+                tracing::warn!(
+                    "could not install console control handlers; \
+                                    a terminated session may not flush its audit log"
+                );
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "Ctrl-C",
+            _ = brk.recv() => "Ctrl-Break",
+            _ = close.recv() => "console close",
+            _ = shutdown.recv() => "system shutdown",
+        }
+    }
+}
+
 pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> {
     let config = Arc::new(Config::load(config_path)?);
     let target = config.resolve_target(target)?;
@@ -124,10 +206,24 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         Arc::clone(&allowlist),
     ));
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed waiting on child process: {e}"))?;
+    // Either the target exits on its own, or we're told to stop. A stop
+    // signal must not skip the shutdown path below: everything queued for
+    // the audit log would be discarded, which is the same silent gap the
+    // writer join exists to prevent, just triggered by a service restart
+    // instead of by process exit.
+    let stop = tokio::select! {
+        result = child.wait() => Stop::TargetExited(
+            result.map_err(|e| anyhow::anyhow!("failed waiting on child process: {e}"))?,
+        ),
+        signal = shutdown_signal() => Stop::Signal(signal),
+    };
+
+    if let Stop::Signal(name) = stop {
+        tracing::warn!("received {name}; stopping the target and flushing the audit log");
+        // Ends the target, which closes its stdout and lets the outbound
+        // pump finish on its own rather than being cut off mid-message.
+        let _ = child.start_kill();
+    }
 
     // The inbound pump reads from *our* real stdin, which is driven by the
     // external client, not by the child — it has no natural reason to end
@@ -135,9 +231,18 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // function (and the whole proxy process) from returning indefinitely
     // if the client keeps its stdin open without sending anything further.
     // The outbound pump, in contrast, is bounded by the child's stdout
-    // closing, which just happened, so it's safe to await to completion.
+    // closing, which just happened.
     inbound.abort();
-    let _ = outbound.await;
+    // Bounded even so: on the signal path the target was asked to die
+    // rather than having exited, and a target that ignores the request
+    // would otherwise hold shutdown open indefinitely. Anything still in
+    // flight when this expires is drained as a timeout below.
+    if tokio::time::timeout(PUMP_SHUTDOWN_TIMEOUT, outbound)
+        .await
+        .is_err()
+    {
+        tracing::warn!("target did not close its output within the shutdown window");
+    }
 
     // Both pumps have now stopped, which is what makes this safe to do
     // here and nowhere else. Nothing can still be registering a call
@@ -154,7 +259,7 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     let abandoned = session.drain_abandoned().await;
     if !abandoned.is_empty() {
         tracing::warn!(
-            "target server exited with {} tool call(s) still in flight; \
+            "shutting down with {} tool call(s) still in flight; \
              logging them as timeouts",
             abandoned.len()
         );
@@ -172,16 +277,40 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         }
     }
 
-    if !status.success() {
-        tracing::warn!("target command exited with status {status}");
+    if let Stop::TargetExited(status) = stop {
+        if !status.success() {
+            tracing::warn!("target command exited with status {status}");
+        }
     }
 
     // Drop the last sender so the writer's channel closes, then wait for it
     // to finish. Without this the queue is discarded when the process
-    // exits — see `DbWriter`. The drop must come first: joining with a live
-    // sender would hang forever.
+    // exits — see `DbWriter`. The drop must come first: waiting with a live
+    // sender would burn the whole timeout and report a spurious timeout.
     drop(db);
-    writer.join();
+    match writer.wait_for_drain(DRAIN_TIMEOUT) {
+        db::DrainOutcome::Drained { dropped: 0 } => {}
+        db::DrainOutcome::Drained { dropped } => {
+            return Err(anyhow::anyhow!(
+                "audit log incomplete: {dropped} tool call(s) were not recorded \
+                 this session (see the warnings above for why). The calls still \
+                 happened -- the record of them did not."
+            ));
+        }
+        db::DrainOutcome::TimedOut { dropped } => {
+            return Err(anyhow::anyhow!(
+                "audit log incomplete: the writer did not finish within {}s of \
+                 shutdown, so an unknown number of queued tool calls were not \
+                 written{}. Shutting down anyway rather than hanging.",
+                DRAIN_TIMEOUT.as_secs(),
+                if dropped > 0 {
+                    format!(", on top of {dropped} already dropped")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    }
 
     Ok(())
 }

@@ -1033,7 +1033,7 @@ pub fn verify_chain(conn: &Connection) -> anyhow::Result<Result<usize, ChainIssu
 #[derive(Clone)]
 pub struct DbHandle {
     sender: SyncSender<ToolCallEntry>,
-    dropped: Arc<AtomicU64>,
+    dropped: DropTally,
 }
 
 impl DbHandle {
@@ -1046,7 +1046,7 @@ impl DbHandle {
         match self.sender.try_send(entry) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                let prev = self.dropped.fetch_add(1, Ordering::Relaxed);
+                let prev = self.dropped.record();
                 // Warn on the first drop and then only periodically, so a
                 // sustained backlog doesn't itself become a logging-storm
                 // performance problem.
@@ -1062,18 +1062,53 @@ impl DbHandle {
                 }
             }
             Err(TrySendError::Disconnected(_)) => {
+                self.dropped.record();
                 tracing::warn!("audit log entry dropped, writer unavailable");
             }
         }
     }
+}
 
-    /// Total entries dropped (queue-full or writer-gone) since this
-    /// handle's writer was spawned. Not surfaced anywhere yet — intended
-    /// for a future "audit gap" marker or `watch` status line.
-    #[allow(dead_code)]
-    pub fn dropped_count(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+/// Tally of entries that will never reach disk, shared by every path that
+/// can lose one.
+///
+/// It exists as a single type precisely because it used to not be. Only the
+/// queue-full path incremented a counter; a dead writer and a failed INSERT
+/// warned and moved on, so the count read zero while rows went missing two
+/// of the three ways they can. An alarm that covers some of the failures it
+/// claims to cover is worse than no alarm, because it is trusted.
+///
+/// Cloned into both the submitting side (`DbHandle`) and the writer thread,
+/// so there is one number and it means "entries this session did not
+/// record".
+#[derive(Clone, Default)]
+pub struct DropTally(Arc<AtomicU64>);
+
+impl DropTally {
+    /// Records one lost entry, returning how many had already been lost
+    /// before it. Callers use that to throttle their own warnings — a
+    /// sustained backlog must not turn logging about dropped entries into
+    /// its own performance problem.
+    fn record(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed)
     }
+
+    pub fn count(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// How shutdown went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The writer finished; `dropped` entries were lost during the session.
+    Drained { dropped: u64 },
+    /// The writer did not finish within the bound. Whatever was still
+    /// queued is lost and is *not* included in `dropped`, because it was
+    /// never handed to a path that could count it — the queue holds no
+    /// accessible length. Reported as its own outcome rather than folded
+    /// into the count, so it can't be mistaken for a clean drain.
+    TimedOut { dropped: u64 },
 }
 
 /// Owns the writer thread so a caller can wait for the queue to be
@@ -1093,22 +1128,47 @@ impl DbHandle {
 /// join rather than a best-effort sleep.
 pub struct DbWriter {
     handle: std::thread::JoinHandle<()>,
+    /// Signalled when the writer thread ends, by an explicit send and again
+    /// by the sender dropping — so a panicking writer still reports
+    /// finished rather than pinning shutdown until the timeout.
+    done: Receiver<()>,
+    tally: DropTally,
 }
 
 impl DbWriter {
-    /// Blocks until every queued entry has been written and the writer has
-    /// exited.
+    /// Waits, up to `timeout`, for every queued entry to be written.
     ///
     /// **All `DbHandle`s must be dropped first.** The writer loop ends when
     /// its channel closes, which happens only when the last sender goes
-    /// away; joining while one is still alive would hang the process
-    /// forever. `proxy::run` drops its handle immediately before calling
-    /// this, and the pump task's clone is already gone because that task
-    /// has been awaited to completion.
-    pub fn join(self) {
-        // A panicking writer already logged and continued (see
-        // `writer_loop`), so there is nothing further to report here.
-        let _ = self.handle.join();
+    /// away; waiting while one is still alive would burn the whole timeout
+    /// and then report a spurious `TimedOut`. `proxy::run` drops its handle
+    /// immediately before calling this, and the pump task's clone is
+    /// already gone because that task has been awaited to completion.
+    ///
+    /// The bound matters at shutdown specifically: this runs while a
+    /// service manager is counting down its own patience (systemd's
+    /// `TimeoutStopSec`, the SCM's stop timeout), and a write wedged on a
+    /// locked database must not turn a stop into a kill. Losing the tail of
+    /// the queue and saying so beats hanging.
+    pub fn wait_for_drain(self, timeout: std::time::Duration) -> DrainOutcome {
+        let dropped = match self.done.recv_timeout(timeout) {
+            // Explicit send, or the sender dropped with the thread: either
+            // way the writer is finished and the queue is written out.
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Now safe: the thread is already ending, so this returns
+                // promptly. A panicking writer logged and continued (see
+                // `writer_loop`), so there is nothing further to report.
+                let _ = self.handle.join();
+                return DrainOutcome::Drained {
+                    dropped: self.tally.count(),
+                };
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.tally.count(),
+        };
+        // Deliberately not joined: the thread is still working and joining
+        // would reintroduce the unbounded wait this method exists to avoid.
+        // The process is ending anyway.
+        DrainOutcome::TimedOut { dropped }
     }
 }
 
@@ -1135,15 +1195,25 @@ impl DbWriter {
 pub fn spawn_writer(db_path: &Path) -> anyhow::Result<(DbHandle, DbWriter)> {
     let conn = open_db(db_path)?;
     let (tx, rx) = sync_channel::<ToolCallEntry>(CHANNEL_CAPACITY);
+    let (done_tx, done_rx) = sync_channel::<()>(1);
+    let tally = DropTally::default();
 
-    let handle = std::thread::spawn(move || writer_loop(conn, rx));
+    let writer_tally = tally.clone();
+    let handle = std::thread::spawn(move || {
+        writer_loop(conn, rx, writer_tally);
+        let _ = done_tx.send(());
+    });
 
     Ok((
         DbHandle {
             sender: tx,
-            dropped: Arc::new(AtomicU64::new(0)),
+            dropped: tally.clone(),
         },
-        DbWriter { handle },
+        DbWriter {
+            handle,
+            done: done_rx,
+            tally,
+        },
     ))
 }
 
@@ -1152,7 +1222,7 @@ pub fn spawn_writer(db_path: &Path) -> anyhow::Result<(DbHandle, DbWriter)> {
 /// release profile, a panic on this thread would abort the *entire*
 /// process, taking the proxied session down with it — exactly what
 /// fail-open logging must not do.
-fn writer_loop(mut conn: Connection, rx: Receiver<ToolCallEntry>) {
+fn writer_loop(mut conn: Connection, rx: Receiver<ToolCallEntry>, dropped: DropTally) {
     // No "database unavailable" branch here any more: `spawn_writer` opens
     // the connection before this thread exists, so reaching this function
     // means the database is open. A proxy that runs while recording nothing
@@ -1167,6 +1237,13 @@ fn writer_loop(mut conn: Connection, rx: Receiver<ToolCallEntry>) {
     for entry in rx.iter() {
         let tool_name = entry.tool_name.clone();
         if let Err(e) = insert_row(&mut conn, &entry) {
+            // Counted, not just warned. This is a genuine loss -- the
+            // transaction rolled back, so the chain is intact but shorter
+            // than the calls that happened -- and it is the loss path most
+            // likely under the deployment this project recommends, where
+            // several processes share one database and contend for the
+            // write lock.
+            dropped.record();
             tracing::warn!("failed to write audit log entry for tool '{tool_name}': {e}");
         }
     }
@@ -1501,6 +1578,72 @@ mod tests {
         remove_db_files(&path);
     }
 
+    /// Writer-side losses must reach the same tally as submit-side ones.
+    /// A failed INSERT used to warn and move on, so `dropped_count` read
+    /// zero while rows went missing — the alarm covered one of the three
+    /// ways entries vanish. Simulated here by removing the table out from
+    /// under the writer; in production this is lock contention between
+    /// processes sharing a database, which is the recommended deployment.
+    #[test]
+    fn writer_side_insert_failures_are_counted() {
+        let path = temp_db_path("writer_drops");
+        let (db, writer) = spawn_writer(&path).unwrap();
+
+        // A second connection, so the writer's own connection stays valid
+        // and it is the INSERT that fails rather than the open.
+        let saboteur = open_db(&path).unwrap();
+        saboteur.execute("DROP TABLE tool_calls", []).unwrap();
+        drop(saboteur);
+
+        for _ in 0..5 {
+            db.log(sample_entry());
+        }
+        drop(db);
+
+        let outcome = writer.wait_for_drain(std::time::Duration::from_secs(30));
+        assert_eq!(
+            outcome,
+            DrainOutcome::Drained { dropped: 5 },
+            "every entry the writer failed to insert must be counted, not just warned about"
+        );
+
+        remove_db_files(&path);
+    }
+
+    /// The drain is bounded so a wedged write can't hold shutdown open
+    /// while a service manager counts down to a kill.
+    #[test]
+    fn wait_for_drain_gives_up_instead_of_hanging() {
+        let (done_tx, done_rx) = sync_channel::<()>(1);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let _ = done_tx.send(());
+        });
+        let writer = DbWriter {
+            handle,
+            done: done_rx,
+            tally: DropTally::default(),
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = writer.wait_for_drain(std::time::Duration::from_millis(100));
+
+        assert_eq!(outcome, DrainOutcome::TimedOut { dropped: 0 });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "must return on the bound, not wait for the writer"
+        );
+    }
+
+    #[test]
+    fn drop_tally_is_shared_between_clones() {
+        let a = DropTally::default();
+        let b = a.clone();
+        assert_eq!(a.record(), 0);
+        assert_eq!(b.record(), 1);
+        assert_eq!(a.count(), 2, "both sides must increment one tally");
+    }
+
     /// An unopenable database must fail at startup, not become a session
     /// that proxies traffic while recording nothing. The open used to
     /// happen on the writer thread, where its failure was invisible to the
@@ -1537,11 +1680,13 @@ mod tests {
             entry.tool_name = format!("tool_{i}");
             db.log(entry);
         }
-        assert_eq!(db.dropped_count(), 0, "queue must absorb this burst");
 
         // Exactly the shutdown sequence `proxy::run` performs.
         drop(db);
-        writer.join();
+        assert_eq!(
+            writer.wait_for_drain(std::time::Duration::from_secs(30)),
+            DrainOutcome::Drained { dropped: 0 }
+        );
 
         let conn = open_db(&path).unwrap();
         let count: i64 = conn

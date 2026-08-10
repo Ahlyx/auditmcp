@@ -88,6 +88,16 @@ RUST_LOG=error auditmcp run --config config.toml    # quieter
 RUST_LOG=debug auditmcp run --config config.toml    # louder
 ```
 
+On shutdown — the target exiting, Ctrl-C, Ctrl-Break, a console closing,
+system shutdown, or `SIGTERM` on Unix — auditmcp stops the target, records
+any still-in-flight calls as `timeout`, and waits up to 10 seconds for the
+write queue to reach disk. If entries were lost anyway it says how many and
+exits nonzero, so a supervisor sees an incomplete session rather than a
+clean one. **A true Windows Service stop (`SERVICE_CONTROL_STOP`, e.g. `net
+stop`) is not covered** — that is delivered to a service control handler
+rather than as a console event, and wiring one up belongs with the
+not-yet-built install/lifecycle work.
+
 Two conditions refuse to start rather than warn, because both would mean
 proxying traffic while silently failing at the job: a database that cannot
 be opened (nothing would be recorded, and that fact cannot be recorded
