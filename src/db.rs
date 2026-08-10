@@ -1074,11 +1074,16 @@ fn writer_loop(path: &Path, rx: Receiver<ToolCallEntry>) {
     }
 }
 
+/// Test-only fixtures shared across module test suites. Lives here, next to
+/// the schema and insert path they exercise, so `verify::tests` (and later
+/// `proxy`/transport suites) can seed a real hash-chained database without
+/// each module reimplementing seeding — and without widening any production
+/// function's visibility just to make it testable.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
 
-    fn sample_entry() -> ToolCallEntry {
+    pub(crate) fn sample_entry() -> ToolCallEntry {
         ToolCallEntry {
             timestamp: "2026-07-02T12:00:00Z".to_string(),
             session_id: "sess-1".to_string(),
@@ -1101,19 +1106,76 @@ mod tests {
         }
     }
 
-    /// Known-answer test: the expected digest below was computed
-    /// independently of this codebase (via .NET `SHA256` in PowerShell and
-    /// cross-checked with `sha256sum`) over the literal bytes
-    /// `"GENESIS" + canonical_json`, where `canonical_json` is the exact
-    /// string a minimal all-`None`/zero entry is expected to serialize to.
-    /// If this test ever breaks, either `compute_hash`'s hex encoding or
-    /// its canonical serialization drifted — a bug in `hex_encode` or a
-    /// change to field order/serde behavior would show up here even though
-    /// the other tests (which only compare this function's output against
-    /// itself) would stay green.
-    #[test]
-    fn known_answer_genesis_hash() {
-        let entry = ToolCallEntry {
+    /// Unique-per-run temp DB path so parallel `cargo test` threads don't
+    /// collide on the same file.
+    pub(crate) fn temp_db_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("auditmcp_test_{label}_{}.db", uuid::Uuid::new_v4()))
+    }
+
+    pub(crate) fn cleanup(conn: Connection, path: &std::path::Path) {
+        drop(conn);
+        remove_db_files(path);
+    }
+
+    /// Removes a temp DB and its WAL sidecars. Separate from `cleanup` for
+    /// callers that already dropped (or never held) a `Connection`.
+    pub(crate) fn remove_db_files(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// Inserts `n` entries (each with a distinct tool_name so tests can
+    /// tell rows apart) and returns their ids in order.
+    pub(crate) fn seed_chain(conn: &mut Connection, n: usize) -> Vec<i64> {
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let mut entry = sample_entry();
+            entry.tool_name = format!("tool_{i}");
+            insert_row(conn, &entry).unwrap();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Seeds one row carrying `redaction_flags`, which also populates the
+    /// derived `redactions` index. Returns the new row's id. Used by drift
+    /// tests, which then delete from the index to simulate the fail-open
+    /// gap `verify` is meant to detect.
+    pub(crate) fn seed_redacted_row(conn: &mut Connection, sha256: &str) -> i64 {
+        let mut entry = sample_entry();
+        entry.tool_name = "leak_secret".to_string();
+        entry.redaction_flags = Some(format!(
+            r#"[{{"pattern":"openai_api_key","severity":"high","sha256":"{sha256}"}}]"#
+        ));
+        entry.redaction_count = 1;
+        insert_row(conn, &entry).unwrap();
+        conn.query_row(
+            "SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+
+    /// The minimal all-`None`/zero entry the golden vectors below are
+    /// pinned against. Shared by the known-answer hash test and the
+    /// canonical-JSON shape test so both describe the same fixture.
+    fn golden_entry_minimal() -> ToolCallEntry {
+        ToolCallEntry {
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             session_id: "s1".to_string(),
             agent_id: None,
@@ -1132,11 +1194,137 @@ mod tests {
             redaction_count: 0,
             anomaly_score: None,
             anomaly_reasons: None,
-        };
+        }
+    }
 
+    /// Every field populated, including a string with a quote, a backslash,
+    /// and a multi-byte character — so the golden vector also pins serde's
+    /// string escaping and numeric formatting, not just field order.
+    fn golden_entry_populated() -> ToolCallEntry {
+        ToolCallEntry {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            session_id: "conn:s1".to_string(),
+            agent_id: Some("agent-1".to_string()),
+            tool_name: "leak_secret".to_string(),
+            server_name: Some("vault".to_string()),
+            args_json: Some(r#"{"path":"C:\\tmp\\✓","q":"say \"hi\""}"#.to_string()),
+            result_json: Some(r#"{"api_key":"[REDACTED:openai_api_key]"}"#.to_string()),
+            status: "error".to_string(),
+            error_message: Some("boom".to_string()),
+            duration_ms: Some(42),
+            bytes_in: Some(120),
+            bytes_out: Some(340),
+            source: Some("/etc/passwd".to_string()),
+            destination: Some("example.com".to_string()),
+            redaction_flags: Some(
+                r#"[{"pattern":"openai_api_key","severity":"high","sha256":"abc"}]"#.to_string(),
+            ),
+            redaction_count: 1,
+            anomaly_score: Some(0.5),
+            anomaly_reasons: Some(r#"["unseen destination"]"#.to_string()),
+        }
+    }
+
+    /// GOLDEN VECTOR — if this fails, do NOT update the expected string to
+    /// make it pass until you have read this comment.
+    ///
+    /// `ToolCallEntry`'s serialized form is the canonicalization input to
+    /// `compute_hash`, and `verify_chain` re-derives every row's hash by
+    /// deserializing that row's columns back into a `ToolCallEntry` and
+    /// re-serializing it. So the shape pinned here is not an internal
+    /// detail — it is the on-disk hash-chain format.
+    ///
+    /// Consequence, and the reason this test exists: **adding a field to
+    /// `ToolCallEntry` retroactively invalidates every row already in every
+    /// existing database.** A plain `Option<T>` field serializes as
+    /// `"field":null` rather than being omitted, so a row written before
+    /// the field existed would canonicalize differently on read than it did
+    /// on write, its recomputed hash would not match its stored hash, and
+    /// `verify` would report `ContentTampered` on the entire historical log
+    /// — telling the user their audit trail was tampered with when it was
+    /// not. Reordering or renaming a field does the same.
+    ///
+    /// If a new field is genuinely required, it MUST be `Option<T>`,
+    /// appended last, and carry
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` so that `None`
+    /// is omitted entirely and pre-existing rows keep canonicalizing to
+    /// exactly the bytes they were hashed as. Only rows that populate the
+    /// new field hash differently, and those are new rows by definition.
+    /// Add a golden vector for the populated case at the same time.
+    #[test]
+    fn canonical_json_shape_is_frozen() {
+        let expected_minimal = concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","session_id":"s1","agent_id":null,"#,
+            r#""tool_name":"echo","server_name":null,"args_json":null,"result_json":null,"#,
+            r#""status":"success","error_message":null,"duration_ms":null,"bytes_in":null,"#,
+            r#""bytes_out":null,"source":null,"destination":null,"redaction_flags":null,"#,
+            r#""redaction_count":0,"anomaly_score":null,"anomaly_reasons":null}"#
+        );
+        let actual_minimal = serde_json::to_string(&golden_entry_minimal()).unwrap();
+        assert_eq!(
+            actual_minimal, expected_minimal,
+            "ToolCallEntry's canonical form changed. This is the hash-chain \
+             format: every row in every existing database was hashed against \
+             the old shape and will now fail `verify` as tampered. Read this \
+             test's doc comment before changing the expected value."
+        );
+
+        let expected_populated = concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","session_id":"conn:s1","agent_id":"agent-1","#,
+            r#""tool_name":"leak_secret","server_name":"vault","#,
+            r#""args_json":"{\"path\":\"C:\\\\tmp\\\\✓\",\"q\":\"say \\\"hi\\\"\"}","#,
+            r#""result_json":"{\"api_key\":\"[REDACTED:openai_api_key]\"}","#,
+            r#""status":"error","error_message":"boom","duration_ms":42,"bytes_in":120,"#,
+            r#""bytes_out":340,"source":"/etc/passwd","destination":"example.com","#,
+            r#""redaction_flags":"[{\"pattern\":\"openai_api_key\",\"severity\":\"high\",\"sha256\":\"abc\"}]","#,
+            r#""redaction_count":1,"anomaly_score":0.5,"anomaly_reasons":"[\"unseen destination\"]"}"#
+        );
+        let actual_populated = serde_json::to_string(&golden_entry_populated()).unwrap();
+        assert_eq!(
+            actual_populated, expected_populated,
+            "ToolCallEntry's canonical form changed for populated fields \
+             (escaping or numeric formatting). See this test's doc comment."
+        );
+    }
+
+    /// Known-answer test: the expected digest below was computed
+    /// independently of this codebase (via .NET `SHA256` in PowerShell and
+    /// cross-checked with `sha256sum`) over the literal bytes
+    /// `"GENESIS" + canonical_json`, where `canonical_json` is the exact
+    /// string pinned by `canonical_json_shape_is_frozen` above.
+    ///
+    /// The two tests fail together on a shape change but catch different
+    /// bugs: this one also covers `hex_encode` and the `prev_hash ||
+    /// canonical` concatenation order, neither of which the shape test
+    /// touches. The other tests only compare this function's output against
+    /// itself and would stay green through either defect.
+    #[test]
+    fn known_answer_genesis_hash() {
         let expected = "8d16aeafa3d69b740a7c3f293a151753fe3b5b67f0c8620212df6668e0c6ffe0";
-        let actual = compute_hash(GENESIS_PREV_HASH, &entry).unwrap();
+        let actual = compute_hash(GENESIS_PREV_HASH, &golden_entry_minimal()).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    /// The property the golden vector protects, asserted end to end: a row
+    /// written to disk and read back through the same path `verify` uses
+    /// re-derives its stored hash exactly. This is what breaks silently for
+    /// *historical* rows if `ToolCallEntry` gains a field.
+    #[test]
+    fn stored_row_rehashes_to_its_stored_hash() {
+        let path = temp_db_path("rehash");
+        let mut conn = open_db(&path).unwrap();
+        insert_row(&mut conn, &golden_entry_populated()).unwrap();
+
+        let rows = read_all_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let recomputed = compute_hash(GENESIS_PREV_HASH, &row.entry).unwrap();
+        assert_eq!(
+            recomputed, row.hash,
+            "a row read back from disk must re-derive its stored hash"
+        );
+
+        cleanup(conn, &path);
     }
 
     #[test]
@@ -1164,12 +1352,6 @@ mod tests {
         assert_ne!(baseline, changed);
     }
 
-    /// Unique-per-run temp DB path so parallel `cargo test` threads don't
-    /// collide on the same file.
-    fn temp_db_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("auditmcp_test_{label}_{}.db", uuid::Uuid::new_v4()))
-    }
-
     #[test]
     fn open_db_creates_schema_and_enables_wal() {
         let path = temp_db_path("open");
@@ -1187,9 +1369,7 @@ mod tests {
         assert_eq!(count, 0);
 
         drop(conn);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("db-wal"));
-        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        remove_db_files(&path);
     }
 
     #[test]
@@ -1220,36 +1400,7 @@ mod tests {
         assert_eq!(stored_prev, None);
 
         drop(conn);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("db-wal"));
-        let _ = std::fs::remove_file(path.with_extension("db-shm"));
-    }
-
-    fn cleanup(conn: Connection, path: &std::path::Path) {
-        drop(conn);
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("db-wal"));
-        let _ = std::fs::remove_file(path.with_extension("db-shm"));
-    }
-
-    /// Inserts `n` entries (each with a distinct tool_name so tests can
-    /// tell rows apart) and returns their ids in order.
-    fn seed_chain(conn: &mut Connection, n: usize) -> Vec<i64> {
-        let mut ids = Vec::new();
-        for i in 0..n {
-            let mut entry = sample_entry();
-            entry.tool_name = format!("tool_{i}");
-            insert_row(conn, &entry).unwrap();
-            let id: i64 = conn
-                .query_row(
-                    "SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            ids.push(id);
-        }
-        ids
+        remove_db_files(&path);
     }
 
     #[test]

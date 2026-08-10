@@ -136,7 +136,17 @@ async fn main() -> anyhow::Result<()> {
             config,
             repair_index,
             yes,
-        } => verify::run(&config, repair_index, yes),
+        } => {
+            // The only place a verify outcome ends the process, so the
+            // exit-code policy itself stays testable in `verify::tests`.
+            // `Clean` returns normally rather than exiting, keeping the
+            // ordinary success path identical to every other subcommand's.
+            let outcome = verify::run(&config, repair_index, yes)?;
+            if outcome != verify::VerifyOutcome::Clean {
+                std::process::exit(outcome.exit_code());
+            }
+            Ok(())
+        }
         Command::Export {
             config,
             format,
