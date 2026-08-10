@@ -88,15 +88,35 @@ RUST_LOG=error auditmcp run --config config.toml    # quieter
 RUST_LOG=debug auditmcp run --config config.toml    # louder
 ```
 
-On shutdown — the target exiting, Ctrl-C, Ctrl-Break, a console closing,
-system shutdown, or `SIGTERM` on Unix — auditmcp stops the target, records
-any still-in-flight calls as `timeout`, and waits up to 10 seconds for the
-write queue to reach disk. If entries were lost anyway it says how many and
-exits nonzero, so a supervisor sees an incomplete session rather than a
-clean one. **A true Windows Service stop (`SERVICE_CONTROL_STOP`, e.g. `net
-stop`) is not covered** — that is delivered to a service control handler
-rather than as a console event, and wiring one up belongs with the
-not-yet-built install/lifecycle work.
+On shutdown, auditmcp stops the target, records any still-in-flight calls
+as `timeout`, and waits up to 10 seconds for the write queue to reach disk.
+If entries were lost anyway it says how many and exits nonzero, so a
+supervisor sees an incomplete session rather than a clean one.
+
+Which stop mechanisms this covers, and how far each has actually been
+verified rather than merely compiled:
+
+| Mechanism | Platform | Status |
+|---|---|---|
+| Target process exits | all | Verified |
+| `SIGTERM` | Unix | Verified — real signal, mid-session |
+| `SIGINT` / Ctrl-C | Unix | Verified — real signal, mid-session |
+| Ctrl-Break | Windows | Verified — real event, mid-session |
+| Ctrl-C | Windows | Compiled, not verified¹ |
+| Console close | Windows | Compiled, not verified¹ |
+| System shutdown | Windows | Compiled, not verified¹ |
+| **Windows Service stop** | Windows | **Not covered²** |
+
+¹ These register through the same console-control handler as Ctrl-Break,
+which is verified. They are not separately testable without closing a
+console or shutting the machine down, and Windows will not deliver
+`CTRL_C_EVENT` to a process group created for testing.
+
+² `SERVICE_CONTROL_STOP` (what `net stop` sends) goes to a service control
+handler, not a console event, so none of the above sees it. Running
+auditmcp as a true Windows Service needs a service dispatcher, which
+belongs with the not-yet-built install/lifecycle work. Until then, stopping
+it that way can lose whatever is still queued.
 
 Two conditions refuse to start rather than warn, because both would mean
 proxying traffic while silently failing at the job: a database that cannot
