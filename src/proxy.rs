@@ -67,9 +67,10 @@ struct RedactionRecord<'a> {
 
 pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> {
     let config = Arc::new(Config::load(config_path)?);
+    let target = config.resolve_target(target)?;
     let (program, args) = target
         .split_first()
-        .ok_or_else(|| anyhow::anyhow!("no target command given after `--`"))?;
+        .expect("resolve_target rejects an empty command");
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let server_name = config.server_name_for(program);
@@ -210,6 +211,7 @@ async fn pump_client_to_child(mut child_in: ChildStdin, pending: PendingMap) {
 /// Child stdout -> client stdout. Forwards every line byte-for-byte, and
 /// best-effort parses responses to close out a pending call and submit a
 /// `ToolCallEntry`. Same fail-open contract as `pump_client_to_child`.
+#[allow(clippy::too_many_arguments)]
 async fn pump_child_to_client(
     child_out: ChildStdout,
     pending: PendingMap,

@@ -455,6 +455,15 @@ fn redact_ranges(s: &str, hits: &[Hit]) -> String {
 /// Same as `scan_and_redact_json`, for raw/non-JSON payloads: no key-name
 /// context exists, so only patterns that can fire without it (see
 /// `passes_entropy_gate`) contribute hits here.
+///
+/// Unreachable under the current stdio transport and therefore not called
+/// yet: stdio MCP is JSON-RPC end to end, so every payload the proxy sees
+/// is already parsed JSON and goes through `scan_and_redact_json`. This is
+/// the entry point for the HTTP/SSE transport (the remaining Phase 2 item),
+/// where a response body genuinely can be non-JSON. Kept rather than
+/// deleted because it is spec-required and unit-tested; see README
+/// "Current state".
+#[allow(dead_code)]
 pub fn scan_and_redact_text(
     text: &str,
     patterns: &PatternSet,

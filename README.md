@@ -1,71 +1,275 @@
 # auditmcp
 
-Local-first audit logging proxy for MCP (Model Context Protocol) tool calls.
-See `auditmcp-claude-code-prompt.md` for the full project spec and phased
-build plan.
+A local-first audit logging proxy for MCP (Model Context Protocol) tool calls.
 
-## Development status
+auditmcp sits transparently between an MCP client (Claude Code, Claude
+Desktop, Cursor, …) and an MCP server. It forwards JSON-RPC traffic
+byte-for-byte in both directions while logging every `tools/call` to a local
+SQLite database with a tamper-evident SHA-256 hash chain, redacting likely
+secrets *before* they are ever written to disk. Everything stays on your
+machine: no telemetry, no accounts, no network calls, no cloud dependency.
 
-**Phase 1 (stdio proxy + minimal logging) — done.**
+It is deliberately not an enterprise MCP gateway. There is no Kubernetes, no
+OAuth, no multi-tenancy — it is one binary and one config file.
 
-### Testing environment note
+The design contract is **fail-open**: the proxy must never become a blocking
+dependency of the agent it is auditing. If logging fails, the tool call still
+goes through.
 
-Dev-loop testing (`cargo build`, `cargo test`, and end-to-end smoke tests
-against `test-fixtures/fake_server.py`) has been run on both native Windows
-(Git Bash + PowerShell) and the Ubuntu VM, per the Phase 1 requirement to
-confirm process spawning, pipe handling, and file paths work identically on
-both. The Linux run also carried over the Windows-generated `auditmcp.db`
-(via scp) and appended to it, confirming the hash chain continues correctly
-across platforms (the first Linux-generated row's `prev_hash` matched the
-last Windows row's `hash`).
+---
 
-Also validated against a real MCP client (Claude Code, via `.mcp.json`,
-through the normal server-approval flow) — `echo`, `delete_file`, and
-`leak_secret` were called through natural conversation rather than manually
-typed JSON-RPC, and `query`/`verify` both showed correct, intact results
-afterward. Not yet covered: macOS.
+## How do I run it?
+
+You need the [Rust toolchain](https://rustup.rs/) (stable) to build, and
+Python 3 only if you want to exercise the bundled fake MCP server.
+
+```bash
+git clone <this repo>
+cd auditmcp
+cargo build --release
+```
+
+The binary lands at `target/release/auditmcp` (`auditmcp.exe` on Windows).
+
+Copy the example config and point it at your MCP server:
+
+```bash
+cp config.example.toml config.toml
+```
+
+Then run the proxy, the target server command coming either from the config's
+`[target].command` or from trailing args after `--` (trailing args win):
+
+```bash
+# Target from config.toml
+auditmcp run --config config.toml
+
+# Or override it explicitly
+auditmcp run --config config.toml -- python test-fixtures/fake_server.py
+```
+
+To put it in front of a real client, wrap the server command in your client's
+MCP config. A Claude Code `.mcp.json` entry looks like:
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "/absolute/path/to/auditmcp",
+      "args": ["run", "--config", "/absolute/path/to/config.toml",
+               "--", "npx", "-y", "@some/mcp-server"]
+    }
+  }
+}
+```
+
+Then read the log back:
+
+```bash
+auditmcp query  --config config.toml                    # table of tool calls
+auditmcp query  --config config.toml --verbose          # + what was redacted and why
+auditmcp query  --config config.toml --tool delete_file --since 2h --status error
+auditmcp verify --config config.toml                    # walk the hash chain
+auditmcp export --config config.toml --format jsonl --output audit.jsonl
+auditmcp unmask --config config.toml <sha256> --note "confirmed false positive"
+```
+
+`--since` takes a duration with a required unit: `45s`, `30m`, `2h`, `1d`.
+
+### Exit codes
+
+`verify` has two distinct nonzero codes so a monitoring script can tell
+tampering apart from an internal index going stale, without parsing output:
+
+| Code | Meaning |
+|---|---|
+| 0 | Chain intact and redactions index consistent |
+| 1 | Hash-chain verification failed — a row was altered, deleted, or reordered |
+| 2 | Chain intact, but the derived redactions index drifted (fix with `--repair-index [--yes]`) |
+
+Every other subcommand uses plain 0/1.
+
+---
+
+## What does it need?
+
+- **Rust** stable (build only — end users of a released binary need nothing).
+- **Python 3** only to run `test-fixtures/fake_server.py`.
+- No external services, no network access, no GPU, no data files to fetch.
+  SQLite is compiled in via `rusqlite`'s bundled feature, so there is no
+  system SQLite requirement.
+
+All dependencies are pinned in `Cargo.lock`; `cargo build --locked` is
+reproducible from a clean clone.
+
+**Platforms.** Windows and Linux are both actively tested (see Current
+state). macOS should work without special-casing and is covered by CI, but
+has never been manually exercised. Released Windows binaries will be
+unsigned initially, so SmartScreen may warn on first run.
+
+---
+
+## What state is it in?
+
+Phase 1 is complete. Phase 2 is complete except for HTTP/SSE transport.
+Phases 3 and 4 are unstarted. `auditmcp-claude-code-prompt.md` holds the full
+phased spec.
+
+### Working
+
+- **stdio proxy** — spawns the target MCP server, pipes stdin/stdout
+  transparently, intercepts `tools/call` request/response pairs. Non-tool
+  traffic (`initialize`, `tools/list`, notifications) is forwarded but not
+  logged, since this tool audits *tool calls*. Child stderr is inherited so
+  tracebacks still reach your terminal.
+- **Hash-chained SQLite log** (WAL mode) — `hash = SHA256(prev_hash +
+  canonical_json(entry))`, written from a dedicated writer thread behind a
+  channel so interception never blocks on disk I/O.
+- **Logging tiers** — `minimal` (200-byte preview), `standard` (structure
+  preserving: full keys, string values capped at 500 bytes, long arrays kept
+  as first 3 + last 3 with an omitted count), `full` (untruncated).
+  Per-tool overrides via `[logging.tool_overrides]`. Tier is **force-escalated
+  to `full`** whenever secrets detection fires or the call errored, so
+  anomalies can never be hidden by truncation.
+- **Secrets detection** — runs before anything is persisted. Ten bundled
+  patterns (AWS access key, OpenAI, GitHub, Slack, Google, Stripe, JWT,
+  bearer token, PEM private key, plus a generic high-entropy-near-keyword
+  heuristic), compiled into the binary from `patterns.toml` so detection
+  works with zero config. Shannon entropy scoring is weighted by key-name
+  proximity rather than used alone. Overlapping hits from specific and
+  heuristic patterns merge into one redaction. Only `sha256(secret)` is
+  stored — never the plaintext — so the same leaked value can be correlated
+  across rows.
+- **`unmask`** — marks a secret's hash as a confirmed false positive so
+  *future* occurrences stop being redacted. Deliberately a separate,
+  audited write requiring a `--note`, rather than a `--unmask` flag on
+  `query`/`export`. It never recovers past plaintext, because none was ever
+  stored.
+- **`export`** — JSONL, with the same filters as `query` plus `--server`.
+  Writes atomically via temp-file rename when `--output` is given. Fails
+  loudly rather than silently emitting an incomplete audit export.
+- **`verify --repair-index`** — rebuilds the derived redactions index from
+  `redaction_flags` (the source of truth). Dry run unless `--yes`; only ever
+  touches the derived index, never `tool_calls` or any hash. Refuses to run
+  at all if chain verification failed.
+- **Multi-server support** — see below.
+
+### Not yet built
+
+- **HTTP/SSE transport** (the one remaining Phase 2 item). Only stdio servers
+  can be proxied today.
+- **Phase 3 — anomaly detection.** The `anomaly_score` / `anomaly_reasons`
+  columns exist in the schema and are always `NULL`; they were added on day
+  one specifically to avoid a migration later. `query --anomalous` and
+  `watch` do not exist.
+- **Phase 4 — Lua policy layer.** No `mlua` dependency yet, by design.
+
+Two functions — `truncate::truncate_raw_sampled` and
+`secrets::scan_and_redact_text` — are written and unit-tested but not yet
+called anywhere. They are the non-JSON payload paths, and stdio MCP is
+JSON-RPC end to end, so nothing reaches them under the current transport.
+They become live when HTTP/SSE lands, where a response body genuinely can be
+non-JSON. They are marked `#[allow(dead_code)]` with that reason at each
+site rather than left as a silent surprise.
+
+### How it has been verified
+
+`cargo test` runs 87 tests covering the hash chain (including concurrent
+writers against a shared DB and interleaved multi-server chains), secrets
+detection and its false-positive cases, truncation UTF-8 boundary safety,
+export fidelity, and unmask hash resolution.
+
+Beyond unit tests, the proxy has been exercised end to end on **native
+Windows** (Git Bash + PowerShell) and on an **Ubuntu VM**. The Linux run
+carried over the Windows-generated `auditmcp.db` and appended to it,
+confirming the hash chain continues correctly across platforms — the first
+Linux-written row's `prev_hash` matched the last Windows row's `hash`.
+
+It has also been driven by a **real MCP client** (Claude Code, via
+`.mcp.json`, through the normal server-approval flow) rather than
+hand-typed JSON-RPC: `echo`, `delete_file`, and `leak_secret` were invoked
+through ordinary conversation, and `query` / `verify` both showed correct,
+intact results afterward.
+
+CI runs fmt, clippy (warnings denied), the test suite, and an end-to-end
+smoke test against the fake server on Windows, Linux, and macOS.
+
+**Not covered:** manual macOS testing, and any real-world load beyond
+hand-driven sessions.
+
+---
 
 ## Running multiple MCP servers: share one database
 
-A realistic setup wraps several MCP servers, each behind its own
-`auditmcp run` instance with its own config file. **The recommended
-pattern is to point every config's `db_path` at the same database file.**
-Concurrent `auditmcp run` processes are safe against a shared DB: each
-append happens inside an exclusive write transaction (SQLite
-`BEGIN IMMEDIATE`) that reads the current chain head and inserts the new
-row atomically, so writers from different processes serialize into one
-linear hash chain in arrival order — a second writer briefly waits (up to
-5s) rather than forking the chain. `verify` walks the combined chain
-exactly as it walks a single-server one, since chain linkage is purely
-row-to-row and doesn't care which server a row came from.
+A realistic setup wraps several MCP servers, each behind its own `auditmcp
+run` instance with its own config file. **The recommended pattern is to point
+every config's `db_path` at the same database file.**
 
-Sharing one DB is not just a convenience: cross-server activity is the
-point. An exfiltration chain that reads sensitive data via one server and
-sends it out via another is only visible to `query` when both servers'
-rows land in the same log. Rows are told apart by the `server_name`
-column (a Phase 1 schema column) — set `[target].server_name` in each
-config, since the fallback (the target command's program name, e.g. `npx`
-or `python`) is usually shared across servers and won't distinguish them.
+Concurrent `auditmcp run` processes are safe against a shared DB: each append
+happens inside an exclusive write transaction (SQLite `BEGIN IMMEDIATE`) that
+reads the current chain head and inserts the new row atomically, so writers
+from different processes serialize into one linear hash chain in arrival
+order — a second writer briefly waits (up to 5s) rather than forking the
+chain. `verify` walks the combined chain exactly as it walks a single-server
+one, since chain linkage is purely row-to-row and doesn't care which server a
+row came from.
+
+Sharing one DB is not just a convenience: cross-server activity is the point.
+An exfiltration chain that reads sensitive data via one server and sends it
+out via another is only visible to `query` when both servers' rows land in
+the same log. Rows are told apart by the `server_name` column — set
+`[target].server_name` in each config, since the fallback (the target
+command's program name, e.g. `npx` or `python`) is usually shared across
+servers and won't distinguish them.
 
 Per-server DB isolation still works if you want independent audit trails:
 give each config its own `db_path` and each file carries its own complete
-hash chain. You just lose the single timeline across servers, so treat it
-as the opt-in exception.
+hash chain. You just lose the single timeline across servers, so treat it as
+the opt-in exception.
+
+---
 
 ## Known limitations
 
-- **`verify` cannot detect deletion of the most recent row(s).** Hash
-  chaining proves that every row from the beginning up to some point is
-  unaltered and in its original order, but it can only do that by having a
-  *later* row whose `id`/`prev_hash` fails to line up with what was
-  deleted. If the tail of the chain is truncated (the newest N rows
-  removed) there is no later row left to expose the gap — `verify` will
-  report the chain as fully intact, and this stays true forever, even
-  after new rows are appended in a future session (the writer just chains
-  onto whatever the current last row happens to be; it has no way to know
-  rows used to exist after it). This is an inherent limit of hash-chaining
-  alone, not a bug — the same reason real append-only transparency logs
-  need an external checkpoint/witness mechanism, which is out of scope for
-  a local single-user tool. In short: `auditmcp verify` proves nothing in
-  the middle of the log was altered or removed, not that nothing was
-  truncated off the end.
+**`verify` cannot detect deletion of the most recent row(s).** Hash chaining
+proves that every row from the beginning up to some point is unaltered and in
+its original order, but it can only do that by having a *later* row whose
+`id`/`prev_hash` fails to line up with what was deleted. If the tail of the
+chain is truncated (the newest N rows removed) there is no later row left to
+expose the gap — `verify` will report the chain as fully intact, and this
+stays true forever, even after new rows are appended in a future session (the
+writer just chains onto whatever the current last row happens to be; it has
+no way to know rows used to exist after it).
+
+This is an inherent limit of hash-chaining alone, not a bug — it is the same
+reason real append-only transparency logs need an external
+checkpoint/witness mechanism, which is out of scope for a local single-user
+tool. In short: `auditmcp verify` proves nothing in the middle of the log was
+altered or removed, not that nothing was truncated off the end.
+
+**Secrets detection is heuristic.** It defaults to over-redaction and will
+produce false positives; `unmask` is the escape hatch. It will also miss
+credential formats not in `patterns.toml` that don't clear the entropy bar.
+
+**The proxy is not a security boundary.** Per the threat model, it defends
+against a prompt-injected or compromised *agent* misusing tool calls. It does
+not defend against a malicious MCP *client* that simply bypasses the proxy,
+and it cannot audit what never flows through it.
+
+---
+
+## Threat model
+
+Primary concern: a prompt-injected or otherwise compromised agent using MCP
+tool calls to exfiltrate data or take unintended destructive actions.
+Secondary: general accountability — "what did my agent actually do."
+
+Not defended against: a fully malicious MCP client that bypasses the proxy
+entirely, or nation-state-level adversaries. This is a practical safety net,
+not a hardened boundary.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).

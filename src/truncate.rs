@@ -75,10 +75,22 @@ fn truncate_array(arr: &[Value]) -> Vec<Value> {
 /// first couple hundred bytes — e.g. an error stack trace's actual
 /// exception, or the tail of a large file dump, both of which tend to
 /// matter more than the middle.
+///
+/// Not called yet, for the same transport reason as
+/// `secrets::scan_and_redact_text`: under stdio, every payload is parsed
+/// JSON and takes the `truncate_json_semantic` path, so there is no
+/// non-JSON payload to sample. This is the `standard`-tier entry point for
+/// the HTTP/SSE transport (the remaining Phase 2 item). Kept rather than
+/// deleted because it is spec-required and unit-tested; see README
+/// "Current state".
+#[allow(dead_code)]
 const RAW_HEAD_BYTES: usize = 300;
+#[allow(dead_code)]
 const RAW_MIDDLE_BYTES: usize = 200;
+#[allow(dead_code)]
 const RAW_TAIL_BYTES: usize = 300;
 
+#[allow(dead_code)]
 pub fn truncate_raw_sampled(text: &str) -> String {
     let total = text.len();
     let window_total = RAW_HEAD_BYTES + RAW_MIDDLE_BYTES + RAW_TAIL_BYTES;

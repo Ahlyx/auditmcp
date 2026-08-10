@@ -18,11 +18,13 @@
 # but you lose the cross-server picture, so treat that as the opt-in
 # exception rather than the default.
 
-# NOTE: [target].command is currently unused by `auditmcp run` — the real
-# target command comes from the CLI trailing args instead, e.g.:
+# The target MCP server command. Used when `auditmcp run` is invoked with no
+# trailing command:
+#   auditmcp run --config config.toml
+# Trailing args, when given, override it:
 #   auditmcp run --config config.toml -- python test-fixtures/fake_server.py
-# It's kept here (and required by the schema) for forward compatibility with
-# a future `auditmcp run --config config.toml` mode that reads it from here.
+# One of the two must be present; with neither, `run` errors rather than
+# starting up with nothing to proxy.
 [target]
 command = ["python", "test-fixtures/fake_server.py"]
 # Recorded in every row's `server_name` column. Optional — defaults to the

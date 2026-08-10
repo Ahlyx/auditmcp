@@ -929,6 +929,7 @@ impl DbHandle {
     /// Total entries dropped (queue-full or writer-gone) since this
     /// handle's writer was spawned. Not surfaced anywhere yet — intended
     /// for a future "audit gap" marker or `watch` status line.
+    #[allow(dead_code)]
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }

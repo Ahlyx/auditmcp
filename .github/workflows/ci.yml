@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on warnings in CI without needing `-D warnings` on every
+  # individual cargo invocation below.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Formatting and lints are OS-independent, so they run once rather than
+  # three times across the test matrix.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The three platforms the project claims to support. macOS is here
+        # specifically because it is the one target never manually verified
+        # (see README "Current state") -- CI is what backs that claim.
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: cargo test --locked
+
+      # End-to-end smoke test against the bundled fake MCP server: proves the
+      # binary actually proxies, logs, and produces a verifiable hash chain on
+      # this OS -- not just that the unit tests pass.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: End-to-end smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > ci-config.toml <<'EOF'
+          [target]
+          command = ["python", "test-fixtures/fake_server.py"]
+          server_name = "fake_server"
+
+          [logging]
+          db_path = "./ci-smoke.db"
+          default_tier = "standard"
+          EOF
+
+          # Drive the proxy with real JSON-RPC on stdin: initialize, then a
+          # tool call that returns a fake API key, which must come back
+          # redacted in the log.
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"leak_secret","arguments":{}}}' \
+            | cargo run --locked --quiet -- run --config ci-config.toml
+
+          cargo run --locked --quiet -- verify --config ci-config.toml
+          cargo run --locked --quiet -- query --config ci-config.toml --verbose
+          cargo run --locked --quiet -- export --config ci-config.toml --format jsonl > ci-export.jsonl
+
+          # The leaked key must be redacted in what was actually persisted.
+          if grep -q 'sk-' ci-export.jsonl; then
+            echo "FAIL: unredacted secret present in export" >&2
+            exit 1
+          fi
+          grep -q 'REDACTED' ci-export.jsonl || {
+            echo "FAIL: no redaction recorded for leak_secret call" >&2
+            exit 1
+          }
+          echo "smoke test OK"

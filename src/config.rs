@@ -10,9 +10,10 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 pub struct TargetConfig {
-    /// Kept for config-file completeness; `run` currently takes the target
-    /// command from CLI trailing args instead. Reserved for a future
-    /// `auditmcp run --config config.toml` (no trailing command) mode.
+    /// Target MCP server command. Used when `auditmcp run` is invoked with
+    /// no trailing `-- <command...>`; trailing args, when present, take
+    /// precedence (see `Config::resolve_target`). Optional so a config can
+    /// rely entirely on trailing args.
     #[serde(default)]
     pub command: Vec<String>,
     /// Logged into every row's `server_name` column. Optional; falls back
@@ -62,6 +63,27 @@ impl Config {
             .unwrap_or(self.logging.default_tier)
     }
 
+    /// Resolves which command to launch as the target MCP server.
+    ///
+    /// CLI trailing args win when given, so an explicit
+    /// `-- python server.py` always overrides whatever the config says and
+    /// the pre-existing invocation style keeps working unchanged. Falling
+    /// back to `[target].command` is what makes a bare
+    /// `auditmcp run --config config.toml` work. An empty result from both
+    /// is an error rather than a silent no-op: there is nothing to proxy.
+    pub fn resolve_target(&self, cli_target: Vec<String>) -> anyhow::Result<Vec<String>> {
+        if !cli_target.is_empty() {
+            return Ok(cli_target);
+        }
+        if !self.target.command.is_empty() {
+            return Ok(self.target.command.clone());
+        }
+        Err(anyhow::anyhow!(
+            "no target command: pass one after `--` (e.g. `-- python server.py`) \
+             or set [target].command in the config file"
+        ))
+    }
+
     /// The name logged into every row's `server_name` column: the config's
     /// `[target].server_name` if set, else the target command's program
     /// name — the pre-Phase-2 behavior, which configs written before the
@@ -95,6 +117,36 @@ db_path = "./test.db"
         let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
         assert_eq!(config.target.server_name, None);
         assert_eq!(config.server_name_for("python"), "python");
+    }
+
+    #[test]
+    fn cli_trailing_args_win_over_config_command() {
+        let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        let resolved = config
+            .resolve_target(vec!["node".into(), "other.js".into()])
+            .unwrap();
+        assert_eq!(resolved, vec!["node", "other.js"]);
+    }
+
+    #[test]
+    fn config_command_used_when_no_trailing_args() {
+        let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        let resolved = config.resolve_target(vec![]).unwrap();
+        assert_eq!(resolved, vec!["python", "server.py"]);
+    }
+
+    /// Both sources empty is a hard error, not a silent no-op: there would
+    /// be no server to proxy and nothing to audit.
+    #[test]
+    fn no_target_anywhere_is_an_error() {
+        let raw = r#"
+[target]
+
+[logging]
+db_path = "./test.db"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        assert!(config.resolve_target(vec![]).is_err());
     }
 
     #[test]

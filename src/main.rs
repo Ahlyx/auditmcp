@@ -25,8 +25,10 @@ enum Command {
     Run {
         #[arg(long)]
         config: PathBuf,
-        /// Command to launch the target MCP server, e.g. -- python server.py
-        #[arg(trailing_var_arg = true, required = true)]
+        /// Command to launch the target MCP server, e.g. -- python
+        /// server.py. Optional: if omitted, `[target].command` from the
+        /// config file is used instead.
+        #[arg(trailing_var_arg = true)]
         target: Vec<String>,
     },
     /// Read logged tool calls back in a table format
