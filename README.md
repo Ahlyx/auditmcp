@@ -238,12 +238,11 @@ phased spec.
 
 ### Not yet built
 
-- **SSE responses.** `serve` reads each response to completion before
-  returning it, so a `text/event-stream` response would be buffered until
-  the upstream closed the stream. Streaming — and with it the legacy
-  HTTP+SSE transport, whose `endpoint` event needs rewriting so clients
-  don't bypass the proxy — is the next piece of work. Non-streaming
-  Streamable HTTP servers work today.
+- **The legacy HTTP+SSE transport** (protocol version 2024-11-05, two
+  endpoints). Streamable HTTP works, streaming included; the older
+  two-endpoint shape does not yet, because its `endpoint` event hands the
+  client a URL to POST to and that URL has to be rewritten or the client
+  silently bypasses the proxy and nothing gets audited.
 - **HTTPS upstreams.** TLS is not wired up; `serve` refuses an `https://`
   upstream at startup rather than failing later. Remote servers therefore
   aren't reachable yet, which also means OAuth against a real provider is
@@ -342,6 +341,14 @@ reason real append-only transparency logs need an external
 checkpoint/witness mechanism, which is out of scope for a local single-user
 tool. In short: `auditmcp verify` proves nothing in the middle of the log was
 altered or removed, not that nothing was truncated off the end.
+
+**Very large responses are recorded only in part.** Over HTTP, response
+bodies stream through to the client untouched however large they are, but
+the copy kept for the log is capped at 1 MiB. A response past that is
+forwarded in full and its row records the size and says plainly that the
+content was not captured. The cap is on auditing, never on forwarding —
+buffering a response to finish auditing it would make the proxy a blocking
+dependency of the agent, which is the one thing it must not become.
 
 **Results delivered as tasks are not recorded.** When a server returns a
 handle from the `io.modelcontextprotocol/tasks` extension instead of a

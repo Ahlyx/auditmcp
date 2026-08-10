@@ -227,6 +227,34 @@ impl CallOutcome {
         }
     }
 
+    /// A response forwarded in full but captured only in part, because it
+    /// ran past the audit capture cap.
+    ///
+    /// The status reflects what actually happened to the call — the client
+    /// received a complete response — because claiming an error for a call
+    /// that succeeded would be its own kind of wrong record. What is
+    /// incomplete is our copy, and the stored payload says so in words
+    /// rather than leaving a truncated fragment that reads like the whole
+    /// thing. Forwarding is never sacrificed to capture: the alternative,
+    /// buffering until we had it all, would make the proxy a blocking
+    /// dependency of the agent it audits.
+    pub(crate) fn capture_truncated(succeeded: bool, bytes_out: i64) -> Self {
+        CallOutcome {
+            status: if succeeded {
+                CallStatus::Success
+            } else {
+                CallStatus::Error
+            },
+            result: Some(Payload::Raw(format!(
+                "[auditmcp: response was {bytes_out} bytes and exceeded the audit \
+                 capture limit; it was forwarded to the client in full but is not \
+                 recorded here]"
+            ))),
+            error: None,
+            bytes_out: Some(bytes_out),
+        }
+    }
+
     pub(crate) fn timed_out() -> Self {
         CallOutcome {
             status: CallStatus::Timeout,

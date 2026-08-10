@@ -16,14 +16,14 @@
 //! the client was given, so a proxy that only forwarded one path would
 //! break authorization before it began.
 //!
-//! # What this commit does not do yet
+//! # Streaming
 //!
-//! Responses are read to completion before being returned, so
-//! `Content-Type: text/event-stream` is not usable through it: an SSE
-//! stream would be buffered until the upstream closed it. Streaming, and
-//! the tee-with-cap that goes with it, land with SSE support. Until then a
-//! body larger than [`MAX_BODY_BYTES`] is refused rather than buffered
-//! without limit.
+//! Responses are forwarded frame by frame as the upstream produces them,
+//! with a bounded copy taken alongside for the audit log (see [`TeeBody`]).
+//! Nothing waits for a body to finish, so an event stream reaches the
+//! client live and a `subscriptions/listen` stream that stays open for
+//! hours costs constant memory. Auditing must never become a reason the
+//! agent waits.
 //!
 //! # Correlation scope
 //!
@@ -41,6 +41,7 @@ use crate::secrets::PatternSet;
 use crate::session::{PendingCall, Session};
 use crate::shutdown::{self, DRAIN_TIMEOUT};
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -56,12 +57,105 @@ use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-/// Cap on a single request or response body. Generous for JSON-RPC, which
-/// is what MCP bodies are, and bounded so a hostile or broken upstream
-/// cannot exhaust memory. Exceeding it is refused rather than silently
-/// truncated: forwarding half a body would corrupt the client's view of
-/// the protocol, which is worse than a clear failure.
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Cap on a request body, which must be buffered because it has to be
+/// re-sent upstream. Generous for JSON-RPC, which is what MCP request
+/// bodies are, and bounded so a hostile client cannot exhaust memory.
+/// Exceeding it is refused rather than truncated: forwarding half a request
+/// would corrupt the server's view of the protocol.
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// Cap on how much of a *response* is captured for the audit log.
+///
+/// Deliberately much smaller than the request cap, and deliberately not a
+/// limit on what is forwarded. Responses stream through untouched however
+/// large they are; this only bounds the copy kept for auditing, so a
+/// gigabyte download or a long-lived event stream costs constant memory.
+/// Going over it truncates the record and says so — it never delays or
+/// truncates what the client receives.
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
+/// Cap on a single un-terminated SSE event while parsing. An event that
+/// grows past this is abandoned and the parser resynchronises at the next
+/// event boundary, so a stream that never emits one cannot grow the buffer
+/// without bound.
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
+/// Incremental Server-Sent Events parser.
+///
+/// Hand-written rather than pulled from a crate because this stream is
+/// forwarded as well as read: the bytes go to the client untouched and a
+/// copy is parsed alongside, which a crate that consumes the stream would
+/// fight. It only needs what MCP puts on the wire — `data:` payloads,
+/// events terminated by a blank line — and must ignore the `:` keep-alive
+/// comments servers send during quiet periods on a `subscriptions/listen`
+/// stream.
+#[derive(Default)]
+struct SseParser {
+    buf: Vec<u8>,
+    /// Set when an event outgrew the cap: bytes are discarded until the
+    /// next boundary rather than parsed as a corrupt fragment.
+    resyncing: bool,
+}
+
+impl SseParser {
+    /// Feeds one chunk and returns every `data` payload completed by it.
+    fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+
+        while let Some(end) = find_event_end(&self.buf) {
+            let event: Vec<u8> = self.buf.drain(..end.0).collect();
+            self.buf.drain(..end.1);
+            if self.resyncing {
+                self.resyncing = false;
+                continue;
+            }
+            if let Some(data) = data_payload(&event) {
+                out.push(data);
+            }
+        }
+
+        if self.buf.len() > MAX_SSE_EVENT_BYTES {
+            self.buf.clear();
+            self.resyncing = true;
+        }
+        out
+    }
+}
+
+/// Offset of an event terminator and its length (`\n\n` or `\r\n\r\n`).
+fn find_event_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    let lf = buf.windows(2).position(|w| w == b"\n\n");
+    match (crlf, lf) {
+        (Some(c), Some(l)) if c <= l => Some((c, 4)),
+        (_, Some(l)) => Some((l, 2)),
+        (Some(c), None) => Some((c, 4)),
+        (None, None) => None,
+    }
+}
+
+/// The concatenated `data:` lines of one event, or `None` for an event
+/// that carries none (a comment-only keep-alive, or `event:`-only frames).
+fn data_payload(event: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(event).ok()?;
+    let mut data = String::new();
+    for line in text.lines() {
+        // Per the SSE spec a line starting with ':' is a comment. Servers
+        // emit bare ':' lines as keep-alives on idle streams.
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    (!data.is_empty()).then_some(data)
+}
+
+/// The body type returned to clients: either a streamed upstream response
+/// or a small locally-generated error.
+type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 /// Everything a listener needs to serve and audit. Immutable after
 /// construction apart from the session registry, which is per-listener.
@@ -107,7 +201,7 @@ impl SessionRegistry {
     async fn close(&self, key: u64) -> Vec<PendingCall> {
         let session = self.open.lock().await.remove(&key);
         match session {
-            Some(s) => s.drain_abandoned().await,
+            Some(s) => s.drain_abandoned(),
             None => Vec::new(),
         }
     }
@@ -115,6 +209,193 @@ impl SessionRegistry {
     /// Every session still open, for the shutdown drain.
     async fn take_all(&self) -> Vec<Arc<Session>> {
         self.open.lock().await.drain().map(|(_, s)| s).collect()
+    }
+}
+
+/// The response body handed back to the client: the upstream's own body,
+/// forwarded frame by frame, with a bounded copy taken on the way past.
+///
+/// **Forwarding never waits for auditing.** Each frame is passed on in the
+/// same poll that captures it, and capture is a bounded copy, so the client
+/// sees bytes at exactly the rate the upstream produces them. Reading the
+/// body to completion before returning it — which is what this replaces —
+/// would have made a slow upstream into a slow proxy and an event stream
+/// into a hang, i.e. would have made the audit tool a blocking dependency
+/// of the agent it audits. That is the one thing the design says it must
+/// never be.
+struct TeeBody {
+    inner: Incoming,
+    /// Taken when the stream ends, so the final audit runs exactly once.
+    tee: Option<Tee>,
+}
+
+struct Tee {
+    listener: Arc<Listener>,
+    session: Arc<Session>,
+    /// Correlation key from the request, used when the response body is
+    /// not parseable JSON-RPC and therefore carries no id of its own.
+    pending_key: Option<String>,
+    succeeded: bool,
+    bytes_out: i64,
+    mode: TeeMode,
+}
+
+enum TeeMode {
+    /// A single JSON body: accumulate up to the cap, audit when it ends.
+    Whole { captured: Vec<u8>, truncated: bool },
+    /// An event stream: audit each complete message as it goes by, and
+    /// never accumulate, so a stream that stays open for hours costs
+    /// nothing.
+    Events(SseParser),
+}
+
+impl TeeBody {
+    fn new(
+        inner: Incoming,
+        listener: Arc<Listener>,
+        session: Arc<Session>,
+        pending_key: Option<String>,
+        succeeded: bool,
+        is_event_stream: bool,
+    ) -> Self {
+        TeeBody {
+            inner,
+            tee: Some(Tee {
+                listener,
+                session,
+                pending_key,
+                succeeded,
+                bytes_out: 0,
+                mode: if is_event_stream {
+                    TeeMode::Events(SseParser::default())
+                } else {
+                    TeeMode::Whole {
+                        captured: Vec::new(),
+                        truncated: false,
+                    }
+                },
+            }),
+        }
+    }
+}
+
+impl hyper::body::Body for TeeBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+
+        match &polled {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(chunk) = frame.data_ref() {
+                    if let Some(tee) = this.tee.as_mut() {
+                        tee.observe(chunk);
+                    }
+                }
+            }
+            // End of stream, cleanly or otherwise: a body that failed
+            // partway is still evidence of a call that happened.
+            std::task::Poll::Ready(None) | std::task::Poll::Ready(Some(Err(_))) => {
+                if let Some(tee) = this.tee.take() {
+                    tee.finish();
+                }
+            }
+            std::task::Poll::Pending => {}
+        }
+        polled
+    }
+}
+
+/// Anything left unfinished when the client disconnects mid-response still
+/// gets recorded, rather than the call disappearing because nobody polled
+/// the body to its end.
+impl Drop for TeeBody {
+    fn drop(&mut self) {
+        if let Some(tee) = self.tee.take() {
+            tee.finish();
+        }
+    }
+}
+
+impl Tee {
+    /// Called with each frame *after* it has been handed onward. Bounded
+    /// work only: a copy for the whole-body case, an incremental parse for
+    /// the event-stream case.
+    fn observe(&mut self, chunk: &Bytes) {
+        self.bytes_out += chunk.len() as i64;
+        match &mut self.mode {
+            TeeMode::Whole {
+                captured,
+                truncated,
+            } => {
+                let room = MAX_CAPTURE_BYTES.saturating_sub(captured.len());
+                if room == 0 {
+                    *truncated = true;
+                } else if chunk.len() > room {
+                    captured.extend_from_slice(&chunk[..room]);
+                    *truncated = true;
+                } else {
+                    captured.extend_from_slice(chunk);
+                }
+            }
+            TeeMode::Events(parser) => {
+                for payload in parser.feed(chunk) {
+                    // Each event carries its own JSON-RPC message, so
+                    // correlation is per message rather than per stream --
+                    // which is what makes one response stream able to close
+                    // one call while notifications flow past unlogged.
+                    let Ok(msg) = serde_json::from_str::<RpcMessage>(&payload) else {
+                        continue;
+                    };
+                    let Some(id_key) = msg.id_key() else { continue };
+                    let Some(call) = self.session.resolve(&id_key) else {
+                        continue;
+                    };
+                    let outcome = CallOutcome::from_rpc(&msg, payload.len() as i64);
+                    log_entry(&self.listener, self.session.id(), call, outcome);
+                }
+            }
+        }
+    }
+
+    fn finish(self) {
+        let TeeMode::Whole {
+            captured,
+            truncated,
+        } = self.mode
+        else {
+            // Event streams audited as they went; anything still pending
+            // belongs to the connection, and is drained when it closes.
+            return;
+        };
+
+        let parsed = serde_json::from_slice::<RpcMessage>(&captured).ok();
+        let id_key = parsed
+            .as_ref()
+            .and_then(|m| m.id_key())
+            .or(self.pending_key);
+        let Some(call) = id_key.and_then(|k| self.session.resolve(&k)) else {
+            return;
+        };
+
+        let outcome = match (parsed, truncated) {
+            (Some(msg), false) => CallOutcome::from_rpc(&msg, self.bytes_out),
+            // Over the cap: the client got everything, our copy did not.
+            (_, true) => CallOutcome::capture_truncated(self.succeeded, self.bytes_out),
+            // Complete, and not JSON-RPC at all: a gateway error page or a
+            // wrong Content-Type. Kept as evidence and scanned like any
+            // other payload, because such pages echo request headers.
+            (None, false) => CallOutcome::non_json(
+                String::from_utf8_lossy(&captured).into_owned(),
+                self.bytes_out,
+            ),
+        };
+        log_entry(&self.listener, self.session.id(), call, outcome);
     }
 }
 
@@ -185,7 +466,7 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     // are recorded here rather than vanishing.
     for listener in &listeners {
         for session in listener.sessions.take_all().await {
-            for call in session.drain_abandoned().await {
+            for call in session.drain_abandoned() {
                 log_timeout(listener, session.id(), call);
             }
         }
@@ -325,7 +606,7 @@ async fn handle(
     req: Request<Incoming>,
     listener: Arc<Listener>,
     session: Arc<Session>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<ProxyBody>, hyper::Error> {
     match proxy_once(req, &listener, &session).await {
         Ok(resp) => Ok(resp),
         // Fail-closed only at the transport edge: if the upstream cannot be
@@ -346,9 +627,11 @@ async fn handle(
 
 async fn proxy_once(
     req: Request<Incoming>,
-    listener: &Listener,
-    session: &Session,
-) -> anyhow::Result<Response<Full<Bytes>>> {
+    listener_arc: &Arc<Listener>,
+    session_arc: &Arc<Session>,
+) -> anyhow::Result<Response<ProxyBody>> {
+    let listener: &Listener = listener_arc;
+    let session: &Session = session_arc;
     if let Some(origin) = req.headers().get(hyper::header::ORIGIN) {
         let origin = origin.to_str().unwrap_or("");
         if !origin_allowed(origin, &listener.allowed_origins) {
@@ -364,7 +647,7 @@ async fn proxy_once(
     }
 
     let (parts, body) = req.into_parts();
-    let body = match Limited::new(body, MAX_BODY_BYTES).collect().await {
+    let body = match Limited::new(body, MAX_REQUEST_BYTES).collect().await {
         Ok(c) => c.to_bytes(),
         Err(_) => {
             return Ok(error_response(
@@ -389,24 +672,31 @@ async fn proxy_once(
         .body(Full::new(body.clone()))?;
     *upstream_req.headers_mut() = parts.headers.clone();
 
-    let bytes_in = body.len() as i64;
     let upstream_resp = listener.client.request(upstream_req).await?;
     let (resp_parts, resp_body) = upstream_resp.into_parts();
-    let resp_body = match Limited::new(resp_body, MAX_BODY_BYTES).collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => {
-            return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                "auditmcp: upstream response exceeds the proxy's size limit",
-            ))
-        }
-    };
 
-    audit_response(listener, session, pending_key, bytes_in, &resp_body).await;
+    // Headers are returned to the client now, before a single body byte has
+    // been read. An event stream's first event therefore reaches the client
+    // when the upstream emits it, not when the stream ends.
+    let is_event_stream = resp_parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim_start().starts_with("text/event-stream"))
+        .unwrap_or(false);
+
+    let tee = TeeBody::new(
+        resp_body,
+        Arc::clone(listener_arc),
+        Arc::clone(session_arc),
+        pending_key,
+        resp_parts.status.is_success(),
+        is_event_stream,
+    );
 
     let mut out = Response::builder()
         .status(resp_parts.status)
-        .body(Full::new(resp_body))?;
+        .body(BoxBody::new(tee))?;
     *out.headers_mut() = resp_parts.headers;
     Ok(out)
 }
@@ -427,60 +717,30 @@ async fn register_if_tool_call(
         return None;
     }
     let (id_key, tool_name) = (msg.id_key()?, msg.tool_name()?);
-    session
-        .register(
-            id_key.clone(),
-            PendingCall {
-                tool_name,
-                args: msg.arguments().cloned(),
-                bytes_in: body.len() as i64,
-                started: Instant::now(),
-            },
-        )
-        .await;
+    session.register(
+        id_key.clone(),
+        PendingCall {
+            tool_name,
+            args: msg.arguments().cloned(),
+            bytes_in: body.len() as i64,
+            started: Instant::now(),
+        },
+    );
     Some(id_key)
 }
 
-async fn audit_response(
-    listener: &Listener,
-    session: &Session,
-    pending_key: Option<String>,
-    _bytes_in: i64,
-    body: &Bytes,
-) {
-    let Some(key) = pending_key else { return };
-    let Some(call) = session.resolve(&key).await else {
-        return;
-    };
+fn log_timeout(listener: &Listener, session_id: &str, call: PendingCall) {
+    log_entry(listener, session_id, call, CallOutcome::timed_out());
+}
 
-    let bytes_out = body.len() as i64;
-    // A body that is not JSON-RPC still belongs in the log. It means the
-    // call failed at the transport layer -- a gateway's HTML error page, a
-    // wrong Content-Type -- and such bodies can echo back a request header
-    // carrying a credential, which is why they are scanned and redacted
-    // like anything else rather than dropped.
-    let outcome = match serde_json::from_slice::<RpcMessage>(body) {
-        Ok(msg) => CallOutcome::from_rpc(&msg, bytes_out),
-        Err(_) => CallOutcome::non_json(String::from_utf8_lossy(body).into_owned(), bytes_out),
-    };
-
+/// The single place this transport turns a completed call into a row, so
+/// the tier lookup and the pipeline inputs cannot drift between the
+/// streaming path, the event path and the shutdown drain.
+fn log_entry(listener: &Listener, session_id: &str, call: PendingCall, outcome: CallOutcome) {
     let tier = listener.config.tier_for_tool(&call.tool_name);
     listener.db.log(audit::build_entry(
         call,
         outcome,
-        session.id(),
-        &listener.server_name,
-        tier,
-        &listener.patterns,
-        &listener.allowlist,
-    ));
-}
-
-fn log_timeout(listener: &Listener, session_id: &str, call: PendingCall) {
-    let tier = listener.config.tier_for_tool(&call.tool_name);
-    listener.db.log(audit::build_entry(
-        call,
-        CallOutcome::timed_out(),
         session_id,
         &listener.server_name,
         tier,
@@ -512,7 +772,7 @@ fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
     })
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
     // A JSON-RPC error with no id: the shape MCP specifies for a transport
     // level rejection, and one a client can parse rather than guess at.
     let body = serde_json::json!({
@@ -523,7 +783,9 @@ fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
+        .body(BoxBody::new(
+            Full::new(Bytes::from(body)).map_err(|never| match never {}),
+        ))
         .expect("static response is always valid")
 }
 
@@ -751,6 +1013,131 @@ mod tests {
             "a credential echoed in an error page must still be redacted: {err}"
         );
         assert_eq!(row.redaction_count, 1);
+        drop(conn);
+        remove_db_files(&db_path);
+    }
+
+    #[test]
+    fn sse_parser_splits_events_on_either_line_ending() {
+        let mut p = SseParser::default();
+        assert_eq!(p.feed(b"data: one\n\ndata: two\n\n"), vec!["one", "two"]);
+        let mut p = SseParser::default();
+        assert_eq!(
+            p.feed(b"data: one\r\n\r\ndata: two\r\n\r\n"),
+            vec!["one", "two"]
+        );
+    }
+
+    /// Frames arrive split wherever TCP happens to break them, so an event
+    /// must survive being delivered a byte at a time.
+    #[test]
+    fn sse_parser_reassembles_events_across_chunk_boundaries() {
+        let mut p = SseParser::default();
+        let mut got = Vec::new();
+        for byte in b"data: {\"id\":1}\n\n" {
+            got.extend(p.feed(&[*byte]));
+        }
+        assert_eq!(got, vec!["{\"id\":1}"]);
+    }
+
+    /// Servers emit bare `:` comments as keep-alives on idle streams; they
+    /// carry no data and must not be mistaken for messages.
+    #[test]
+    fn sse_parser_ignores_comments_and_non_data_fields() {
+        let mut p = SseParser::default();
+        assert!(p.feed(b":\n\n").is_empty());
+        assert!(p.feed(b": keep-alive\n\n").is_empty());
+        assert!(p.feed(b"event: ping\nid: 7\n\n").is_empty());
+        assert_eq!(p.feed(b"event: message\ndata: hi\n\n"), vec!["hi"]);
+    }
+
+    #[test]
+    fn sse_parser_joins_multiline_data_fields() {
+        let mut p = SseParser::default();
+        assert_eq!(p.feed(b"data: a\ndata: b\n\n"), vec!["a\nb"]);
+    }
+
+    /// An event that never terminates must not grow the buffer without
+    /// bound; the parser drops it and picks up at the next boundary.
+    #[test]
+    fn sse_parser_resyncs_after_an_oversized_event() {
+        let mut p = SseParser::default();
+        let huge = vec![b'x'; MAX_SSE_EVENT_BYTES + 1024];
+        assert!(p.feed(&huge).is_empty());
+        assert!(
+            p.buf.len() <= MAX_SSE_EVENT_BYTES,
+            "buffer must stay bounded"
+        );
+        // The remainder of the oversized event is discarded...
+        assert!(p.feed(b"trailing junk\n\n").is_empty());
+        // ...and the next event parses normally.
+        assert_eq!(p.feed(b"data: recovered\n\n"), vec!["recovered"]);
+    }
+
+    /// One SSE response stream carrying a progress notification and then
+    /// the final response: only the response closes the call, and it
+    /// produces exactly one row.
+    #[tokio::test]
+    async fn sse_response_stream_produces_one_row_for_the_final_response() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", tcp.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = tcp.accept().await {
+                tokio::spawn(async move {
+                    let svc = service_fn(|_req: Request<Incoming>| async move {
+                        let events = concat!(
+                            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n",
+                            ": keep-alive\n\n",
+                            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n\n",
+                        );
+                        Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .header(hyper::header::CONTENT_TYPE, "text/event-stream")
+                                .body(Full::new(Bytes::from(events)))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let db_path = temp_db_path("http_sse");
+        let config = test_config(&db_path);
+        let (db, writer) = db::spawn_writer(&db_path).unwrap();
+        let patterns = Arc::new(PatternSet::bundled().unwrap());
+        let allowlist = Arc::new(HashSet::new());
+        let sc: ServerConfig = toml::from_str(&format!(
+            "name = 'sse'\nupstream = '{upstream}'\nlisten = '127.0.0.1:0'\n"
+        ))
+        .unwrap();
+        let listener = Arc::new(build_listener(&sc, &config, &db, &patterns, &allowlist).unwrap());
+        let listeners = vec![Arc::clone(&listener)];
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", tcp.local_addr().unwrap());
+        let task = tokio::spawn(accept_loop(tcp, listener, stop_rx));
+
+        let client: Client<HttpConnector, Full<Bytes>> =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+        post_tool_call(&client, &base, 1, "streamer").await;
+
+        let _ = stop_tx.send(true);
+        let _ = task.await;
+        drop(listeners);
+        drop(db);
+        assert!(matches!(
+            writer.wait_for_drain(std::time::Duration::from_secs(30)),
+            db::DrainOutcome::Drained { dropped: 0 }
+        ));
+
+        let conn = db::open_readonly(&db_path).unwrap();
+        let rows = db::read_all_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "the notification must not produce a row");
+        assert_eq!(rows[0].entry.tool_name, "streamer");
+        assert_eq!(rows[0].entry.status, "success");
         drop(conn);
         remove_db_files(&db_path);
     }

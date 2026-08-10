@@ -29,8 +29,8 @@
 
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Instant;
-use tokio::sync::Mutex;
 
 /// A `tools/call` request seen on the wire, held until its response
 /// arrives. Captured at request time and completed at response time,
@@ -75,8 +75,8 @@ impl Session {
     /// `RpcMessage::id_key`, which renders the id as canonical JSON so a
     /// numeric `1` and a string `"1"` — both legal, distinct JSON-RPC ids —
     /// never collide.
-    pub(crate) async fn register(&self, id_key: String, call: PendingCall) {
-        self.pending.lock().await.insert(id_key, call);
+    pub(crate) fn register(&self, id_key: String, call: PendingCall) {
+        self.lock().insert(id_key, call);
     }
 
     /// Takes the pending call for `id_key`, if this session has one.
@@ -87,8 +87,8 @@ impl Session {
     /// replays from `Last-Event-ID` — finds nothing the second time and is
     /// ignored. Duplicate rows in a hash-chained audit log have no
     /// representation here rather than being deduplicated after the fact.
-    pub(crate) async fn resolve(&self, id_key: &str) -> Option<PendingCall> {
-        self.pending.lock().await.remove(id_key)
+    pub(crate) fn resolve(&self, id_key: &str) -> Option<PendingCall> {
+        self.lock().remove(id_key)
     }
 
     /// Takes every call still awaiting a response, leaving the session
@@ -105,8 +105,17 @@ impl Session {
     /// responsibility, and it is what rules out the converse race — a
     /// response arriving mid-drain and being logged twice, once by
     /// `resolve` and once here.
-    pub(crate) async fn drain_abandoned(&self) -> Vec<PendingCall> {
-        self.pending.lock().await.drain().map(|(_, c)| c).collect()
+    pub(crate) fn drain_abandoned(&self) -> Vec<PendingCall> {
+        self.lock().drain().map(|(_, c)| c).collect()
+    }
+
+    /// Recovers from a poisoned lock rather than propagating the panic.
+    /// Every critical section here is a single map operation that cannot
+    /// leave the map inconsistent, and refusing to correlate calls because
+    /// an unrelated thread panicked would turn one failure into a silent
+    /// audit gap.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingCall>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -124,63 +133,62 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn resolve_returns_the_registered_call_once() {
+    #[test]
+    fn resolve_returns_the_registered_call_once() {
         let s = Session::new("sess-1".to_string());
-        s.register("1".to_string(), call("echo")).await;
+        s.register("1".to_string(), call("echo"));
 
-        let first = s.resolve("1").await;
+        let first = s.resolve("1");
         assert_eq!(first.map(|c| c.tool_name), Some("echo".to_string()));
 
         assert!(
-            s.resolve("1").await.is_none(),
+            s.resolve("1").is_none(),
             "a second resolve of the same id must find nothing — this is what \
              makes a replayed response produce no duplicate row"
         );
     }
 
-    #[tokio::test]
-    async fn unknown_id_resolves_to_none() {
+    #[test]
+    fn unknown_id_resolves_to_none() {
         let s = Session::new("sess-1".to_string());
-        assert!(s.resolve("999").await.is_none());
+        assert!(s.resolve("999").is_none());
     }
 
     /// The property this module exists for: two sessions holding the same
     /// JSON-RPC id resolve to their own calls, never each other's.
-    #[tokio::test]
-    async fn sessions_with_colliding_ids_never_cross_attribute() {
+    #[test]
+    fn sessions_with_colliding_ids_never_cross_attribute() {
         let a = Session::new("sess-a".to_string());
         let b = Session::new("sess-b".to_string());
 
-        a.register("1".to_string(), call("delete_file")).await;
-        b.register("1".to_string(), call("echo")).await;
+        a.register("1".to_string(), call("delete_file"));
+        b.register("1".to_string(), call("echo"));
 
         // Resolved in the opposite order to registration, so a shared map
         // would surface the mix-up rather than hide it behind ordering.
         assert_eq!(
-            b.resolve("1").await.map(|c| c.tool_name),
+            b.resolve("1").map(|c| c.tool_name),
             Some("echo".to_string())
         );
         assert_eq!(
-            a.resolve("1").await.map(|c| c.tool_name),
+            a.resolve("1").map(|c| c.tool_name),
             Some("delete_file".to_string())
         );
     }
 
     /// The invariant the drain depends on: a call that got its response is
     /// already gone from the map, so it cannot also be reported abandoned.
-    #[tokio::test]
-    async fn drain_never_returns_a_call_that_was_resolved() {
+    #[test]
+    fn drain_never_returns_a_call_that_was_resolved() {
         let s = Session::new("sess-1".to_string());
-        s.register("1".to_string(), call("completed")).await;
-        s.register("2".to_string(), call("abandoned")).await;
+        s.register("1".to_string(), call("completed"));
+        s.register("2".to_string(), call("abandoned"));
 
-        let resolved = s.resolve("1").await;
+        let resolved = s.resolve("1");
         assert_eq!(resolved.map(|c| c.tool_name), Some("completed".to_string()));
 
         let drained: Vec<String> = s
             .drain_abandoned()
-            .await
             .into_iter()
             .map(|c| c.tool_name)
             .collect();
@@ -191,56 +199,55 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn drain_empties_the_session_so_it_cannot_double_report() {
+    #[test]
+    fn drain_empties_the_session_so_it_cannot_double_report() {
         let s = Session::new("sess-1".to_string());
-        s.register("1".to_string(), call("echo")).await;
+        s.register("1".to_string(), call("echo"));
 
-        assert_eq!(s.drain_abandoned().await.len(), 1);
+        assert_eq!(s.drain_abandoned().len(), 1);
         assert!(
-            s.drain_abandoned().await.is_empty(),
+            s.drain_abandoned().is_empty(),
             "draining twice must not produce the same call twice"
         );
     }
 
-    #[tokio::test]
-    async fn draining_with_nothing_in_flight_yields_nothing() {
+    #[test]
+    fn draining_with_nothing_in_flight_yields_nothing() {
         let s = Session::new("sess-1".to_string());
-        s.register("1".to_string(), call("echo")).await;
-        let _ = s.resolve("1").await;
-        assert!(s.drain_abandoned().await.is_empty());
+        s.register("1".to_string(), call("echo"));
+        let _ = s.resolve("1");
+        assert!(s.drain_abandoned().is_empty());
     }
 
-    #[tokio::test]
-    async fn drain_is_scoped_to_its_own_session() {
+    #[test]
+    fn drain_is_scoped_to_its_own_session() {
         let a = Session::new("sess-a".to_string());
         let b = Session::new("sess-b".to_string());
-        a.register("1".to_string(), call("a_tool")).await;
-        b.register("1".to_string(), call("b_tool")).await;
+        a.register("1".to_string(), call("a_tool"));
+        b.register("1".to_string(), call("b_tool"));
 
         let drained: Vec<String> = a
             .drain_abandoned()
-            .await
             .into_iter()
             .map(|c| c.tool_name)
             .collect();
         assert_eq!(drained, vec!["a_tool".to_string()]);
         assert!(
-            b.resolve("1").await.is_some(),
+            b.resolve("1").is_some(),
             "draining one session must not touch another's in-flight calls"
         );
     }
 
-    #[tokio::test]
-    async fn resolving_in_one_session_leaves_the_other_untouched() {
+    #[test]
+    fn resolving_in_one_session_leaves_the_other_untouched() {
         let a = Session::new("sess-a".to_string());
         let b = Session::new("sess-b".to_string());
-        a.register("1".to_string(), call("a_tool")).await;
-        b.register("1".to_string(), call("b_tool")).await;
+        a.register("1".to_string(), call("a_tool"));
+        b.register("1".to_string(), call("b_tool"));
 
-        let _ = a.resolve("1").await;
+        let _ = a.resolve("1");
         assert!(
-            b.resolve("1").await.is_some(),
+            b.resolve("1").is_some(),
             "one session resolving an id must not consume another session's \
              entry for the same id"
         );

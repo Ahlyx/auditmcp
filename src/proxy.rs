@@ -175,7 +175,7 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // would be wrong: the inbound pump is still live at that moment and
     // could register a fresh call after the drain, which would then never
     // be recorded at all.
-    let abandoned = session.drain_abandoned().await;
+    let abandoned = session.drain_abandoned();
     if !abandoned.is_empty() {
         tracing::warn!(
             "shutting down with {} tool call(s) still in flight; \
@@ -266,17 +266,15 @@ async fn pump_client_to_child(mut child_in: ChildStdin, session: Arc<Session>) {
         if let Some(msg) = parse_rpc_message(&buf) {
             if msg.is_tool_call_request() {
                 if let (Some(id_key), Some(tool_name)) = (msg.id_key(), msg.tool_name()) {
-                    session
-                        .register(
-                            id_key,
-                            PendingCall {
-                                tool_name,
-                                args: msg.arguments().cloned(),
-                                bytes_in: buf.len() as i64,
-                                started: Instant::now(),
-                            },
-                        )
-                        .await;
+                    session.register(
+                        id_key,
+                        PendingCall {
+                            tool_name,
+                            args: msg.arguments().cloned(),
+                            bytes_in: buf.len() as i64,
+                            started: Instant::now(),
+                        },
+                    );
                 }
             }
         }
@@ -330,7 +328,7 @@ async fn pump_child_to_client(
         // Response to something we didn't track (not a tools/call), or a
         // replay of one already resolved — either way there is nothing to
         // close out and nothing to log.
-        let Some(call) = session.resolve(&id_key).await else {
+        let Some(call) = session.resolve(&id_key) else {
             continue;
         };
 
