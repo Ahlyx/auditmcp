@@ -46,7 +46,6 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioIo;
 use std::collections::{HashMap, HashSet};
@@ -259,6 +258,12 @@ fn replace_event_data(raw: &[u8], new_data: &str) -> Vec<u8> {
 /// or a small locally-generated error.
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
+/// The outbound client: HTTP or HTTPS, chosen per upstream URL.
+type UpstreamClient = Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    Full<Bytes>,
+>;
+
 /// Everything a listener needs to serve and audit. Immutable after
 /// construction apart from the session registry, which is per-listener.
 struct Listener {
@@ -272,7 +277,7 @@ struct Listener {
     db: DbHandle,
     patterns: Arc<PatternSet>,
     allowlist: Arc<HashSet<String>>,
-    client: Client<HttpConnector, Full<Bytes>>,
+    client: UpstreamClient,
     sessions: SessionRegistry,
 }
 
@@ -772,10 +777,14 @@ fn build_listener(
     allowlist: &Arc<HashSet<String>>,
 ) -> anyhow::Result<Listener> {
     let upstream = s.upstream_uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut connector = HttpConnector::new();
-    // A proxy must not silently rewrite what it forwards; leaving hyper's
-    // defaults alone here keeps the connection behaviour boring on purpose.
-    connector.enforce_http(true);
+    // `https_or_http`, not `https_only`: an upstream on loopback in
+    // cleartext is a normal local setup, and refusing it would make TLS
+    // support a downgrade for everyone already using one.
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .build();
     Ok(Listener {
         server_name: s.name.clone(),
         upstream,
@@ -957,6 +966,17 @@ async fn proxy_once(
         .body(Full::new(body.clone()))?;
     *upstream_req.headers_mut() = parts.headers.clone();
 
+    // `Host` is addressing, not content: it names where the request is
+    // going, and the client's copy names this proxy. Forwarded as-is it
+    // sends the upstream a request addressed to somebody else -- against a
+    // real remote server that means being routed to a default virtual host
+    // instead of the MCP endpoint, which is invisible on a loopback
+    // upstream where both authorities happen to look alike. Removing it
+    // lets hyper regenerate it from the rewritten URI, which is the
+    // upstream's own authority and what a server validating `Host` against
+    // DNS rebinding expects to see.
+    upstream_req.headers_mut().remove(hyper::header::HOST);
+
     let upstream_resp = listener.client.request(upstream_req).await?;
     let (resp_parts, resp_body) = upstream_resp.into_parts();
 
@@ -1091,6 +1111,17 @@ mod tests {
     use super::*;
     use crate::db::test_support::{remove_db_files, temp_db_path};
 
+    /// Tests all talk to loopback fixtures over cleartext; the same
+    /// connector the proxy uses handles both schemes.
+    fn test_connector(
+    ) -> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
+        hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build()
+    }
+
     /// The `data` payloads of every event a chunk completed, which is what
     /// the parser tests care about.
     fn datas(events: Vec<SseEvent>) -> Vec<String> {
@@ -1159,12 +1190,7 @@ mod tests {
         )
     }
 
-    async fn post_tool_call(
-        client: &Client<HttpConnector, Full<Bytes>>,
-        base: &str,
-        id: i64,
-        tool: &str,
-    ) {
+    async fn post_tool_call(client: &UpstreamClient, base: &str, id: i64, tool: &str) {
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": "tools/call",
             "params": {"name": tool, "arguments": {}}
@@ -1214,8 +1240,8 @@ mod tests {
         }
         drop(stop_rx);
 
-        let client: Client<HttpConnector, Full<Bytes>> =
-            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+        let client: UpstreamClient =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(test_connector());
 
         // Same id on both listeners, different tools. Answered in the
         // opposite order to issue, so a shared map would surface the mix-up
@@ -1302,8 +1328,8 @@ mod tests {
         let base = format!("http://{addr}");
         let task = tokio::spawn(accept_loop(proxy_tcp, listener, stop_rx));
 
-        let client: Client<HttpConnector, Full<Bytes>> =
-            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+        let client: UpstreamClient =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(test_connector());
         post_tool_call(&client, &base, 1, "fetch_thing").await;
 
         let _ = stop_tx.send(true);
@@ -1442,8 +1468,8 @@ mod tests {
         let base = format!("http://{addr}");
         let task = tokio::spawn(accept_loop(proxy_tcp, listener, stop_rx));
 
-        let client: Client<HttpConnector, Full<Bytes>> =
-            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+        let client: UpstreamClient =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(test_connector());
         post_tool_call(&client, &base, 1, "streamer").await;
 
         let _ = stop_tx.send(true);
@@ -1596,8 +1622,8 @@ mod tests {
         let base = format!("http://{addr}");
         let task = tokio::spawn(accept_loop(proxy_tcp, listener, stop_rx));
 
-        let client: Client<HttpConnector, Full<Bytes>> =
-            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+        let client: UpstreamClient =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(test_connector());
         post_tool_call(&client, &base, 1, "acked").await;
 
         let _ = stop_tx.send(true);
@@ -1619,6 +1645,89 @@ mod tests {
         );
         drop(conn);
         remove_db_files(&db_path);
+    }
+
+    /// The upstream must be addressed by its own authority, not by the
+    /// proxy's. Forwarding the client's `Host` untouched sends a request
+    /// addressed to somebody else: against a real remote server that lands
+    /// on a default virtual host rather than the MCP endpoint. Two loopback
+    /// fixtures cannot show this — their authorities look alike — so the
+    /// upstream here reports back which `Host` it was given.
+    #[tokio::test]
+    async fn upstream_is_addressed_by_its_own_host_not_the_proxys() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = tcp.local_addr().unwrap();
+        let upstream = format!("http://{upstream_addr}");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = tcp.accept().await {
+                tokio::spawn(async move {
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let host = req
+                            .headers()
+                            .get(hyper::header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("<none>")
+                            .to_string();
+                        let body = serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "result": {"resultType": "complete",
+                                       "content": [{"type": "text", "text": host}],
+                                       "isError": false}
+                        })
+                        .to_string();
+                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(body))))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let db_path = temp_db_path("http_host_header");
+        let config = test_config(&db_path);
+        let (db, writer) = db::spawn_writer(&db_path).unwrap();
+        let patterns = Arc::new(PatternSet::bundled().unwrap());
+        let allowlist = Arc::new(HashSet::new());
+        let sc: ServerConfig = toml::from_str(&format!(
+            "name = 'h'\nupstream = '{upstream}'\nlisten = '127.0.0.1:0'\n"
+        ))
+        .unwrap();
+        let proxy_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_tcp.local_addr().unwrap();
+        let listener =
+            Arc::new(build_listener(&sc, proxy_addr, &config, &db, &patterns, &allowlist).unwrap());
+        let listeners = vec![Arc::clone(&listener)];
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let base = format!("http://{proxy_addr}");
+        let task = tokio::spawn(accept_loop(proxy_tcp, listener, stop_rx));
+
+        let client: UpstreamClient =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(test_connector());
+        post_tool_call(&client, &base, 1, "whoami").await;
+
+        let _ = stop_tx.send(true);
+        let _ = task.await;
+        drain_sessions(&listeners).await;
+        drop(listeners);
+        drop(db);
+        let _ = writer.wait_for_drain(std::time::Duration::from_secs(30));
+
+        let conn = db::open_readonly(&db_path).unwrap();
+        let rows = db::read_all_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        let seen = rows[0].entry.result_json.clone().unwrap_or_default();
+        drop(conn);
+        remove_db_files(&db_path);
+
+        assert!(
+            seen.contains(&upstream_addr.to_string()),
+            "upstream should have been addressed as {upstream_addr}, saw: {seen}"
+        );
+        assert!(
+            !seen.contains(&proxy_addr.to_string()),
+            "the proxy's own authority must not be forwarded as Host: {seen}"
+        );
     }
 
     #[test]

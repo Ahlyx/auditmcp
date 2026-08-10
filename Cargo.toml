@@ -29,6 +29,14 @@ anyhow = "1"
 # cross-compiled release binaries stay simple.
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+# TLS for outbound upstream connections only; auditmcp itself listens on
+# loopback in cleartext. rustls with compiled-in Mozilla roots rather than
+# native-tls: no OpenSSL, no C toolchain, and no dependency on a system
+# certificate store, which is what keeps cross-compiled release binaries
+# simple. The trade is that a corporate TLS-inspecting proxy's private CA is
+# not trusted -- see the README.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "webpki-tokio", "ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"

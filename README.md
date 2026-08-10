@@ -113,6 +113,21 @@ audience binding it exists to enforce.
 Servers authenticated with a token you supply as a header are unaffected,
 because that path never enters OAuth discovery.
 
+`https://` upstreams work; TLS is outbound only, since auditmcp itself
+listens on loopback. Certificates are verified against Mozilla's root set
+compiled into the binary rather than the system store — no OpenSSL and no C
+toolchain, which keeps release builds portable. The trade-off: if you are
+behind a TLS-inspecting corporate proxy, its private CA is not trusted and
+connections to it will fail.
+
+Two things about a forwarded request are not byte-identical to what the
+client sent, both deliberately. The `Host` header is replaced with the
+upstream's own authority, because `Host` names where a request is going and
+the client's copy names this proxy — forwarding it unchanged routes you to
+whatever default virtual host the upstream serves. And on the deprecated
+HTTP+SSE transport, the `endpoint` event's URI is rewritten, as described
+above. Nothing else is altered.
+
 Full write-up, including the mechanism, the SDK version and line, both
 clients tested, and the control run:
 **[docs/oauth-and-transparent-proxies.md](docs/oauth-and-transparent-proxies.md)**.
@@ -279,11 +294,7 @@ phased spec.
 
 ### Not yet built
 
-- **HTTPS upstreams.** TLS is not wired up; `serve` refuses an `https://`
-  upstream at startup rather than failing later, so remote servers aren't
-  reachable yet. This is about reaching them at all — it does not affect
-  the OAuth limitation above, which is a client-side check that TLS has no
-  bearing on.
+- **A user-updatable patterns file** — see above.
 - **Phase 3 — anomaly detection.** The `anomaly_score` / `anomaly_reasons`
   columns exist in the schema and are always `NULL`; they were added on day
   one specifically to avoid a migration later. `query --anomalous` and

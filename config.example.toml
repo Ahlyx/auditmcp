@@ -48,12 +48,12 @@ server_name = "fake_server"
 #
 # [[server]]
 # name     = "github"
-# upstream = "http://127.0.0.1:3000/mcp"
+# upstream = "https://mcp.example.com/mcp"   # http or https
 # listen   = "127.0.0.1:8787"
 #
 # [[server]]
 # name     = "vault"
-# upstream = "http://127.0.0.1:3001/mcp"
+# upstream = "http://127.0.0.1:3001/mcp"     # a local server in cleartext is fine
 # listen   = "127.0.0.1:8788"
 # # Origins accepted on inbound requests. Defaults to loopback only, which
 # # is what stops a page in your browser from driving your MCP servers.

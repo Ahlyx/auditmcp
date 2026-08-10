@@ -213,17 +213,10 @@ impl ServerConfig {
             )
         })?;
         match uri.scheme_str() {
-            Some("http") => {}
-            Some("https") => {
-                return Err(format!(
-                    "[[server]] '{}' has an https upstream, which this build cannot \
-                     reach yet -- TLS is not wired up. Use an http upstream for now.",
-                    self.name
-                ))
-            }
+            Some("http") | Some("https") => {}
             other => {
                 return Err(format!(
-                    "[[server]] '{}' upstream '{}' has scheme {:?}; expected http",
+                    "[[server]] '{}' upstream '{}' has scheme {:?}; expected http or https",
                     self.name, self.upstream, other
                 ))
             }
@@ -325,6 +318,18 @@ db_path = "./test.db"
         }
     }
 
+    /// Both schemes are usable: https for remote servers, http because an
+    /// upstream on loopback in cleartext is a normal local setup.
+    #[test]
+    fn http_and_https_upstreams_are_both_accepted() {
+        for upstream in ["http://a.test/mcp", "https://a.test/mcp"] {
+            servers_toml(&format!(
+                "[[server]]\nname='a'\nupstream='{upstream}'\nlisten='127.0.0.1:8787'"
+            ))
+            .unwrap_or_else(|e| panic!("{upstream} should be accepted: {e}"));
+        }
+    }
+
     #[test]
     fn loopback_listen_addresses_are_accepted() {
         for addr in ["127.0.0.1:8787", "[::1]:8787", "127.0.0.2:9000"] {
@@ -340,7 +345,6 @@ db_path = "./test.db"
         let cases = [
             ("not a url", "unparseable"),
             ("ftp://a.test", "expected http"),
-            ("https://a.test", "TLS is not wired up"),
             ("/just/a/path", "expected http"),
         ];
         for (upstream, expected) in cases {
