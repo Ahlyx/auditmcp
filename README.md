@@ -272,6 +272,21 @@ checkpoint/witness mechanism, which is out of scope for a local single-user
 tool. In short: `auditmcp verify` proves nothing in the middle of the log was
 altered or removed, not that nothing was truncated off the end.
 
+**Results delivered as tasks are not recorded.** When a server returns a
+handle from the `io.modelcontextprotocol/tasks` extension instead of a
+result — normal for long-running work — the real outcome arrives later via
+`tasks/get`. That is not a `tools/call`, so **auditmcp forwards it and does
+not log it.** Not because it can't see it: those messages cross the proxy
+like any others, and nothing today correlates them back to the call that
+started the task.
+
+Such calls are recorded with `status = "deferred"` rather than `success`,
+so this gap is visible in the data rather than only in this file — query
+them with `auditmcp query --status deferred`. The row keeps the full
+handle including its `taskId`, which is the thread back to the outcome if
+you need to chase it. Treat a `deferred` row as *this tool ran and its
+result is not in this log*.
+
 **Secrets detection is heuristic.** It defaults to over-redaction and will
 produce false positives; `unmask` is the escape hatch. It will also miss
 credential formats not in `patterns.toml` that don't clear the entropy bar.

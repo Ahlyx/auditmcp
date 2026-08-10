@@ -114,18 +114,24 @@ pub(crate) enum CallStatus {
     /// server exited or the stream died while the call was in flight. See
     /// `CallOutcome::timed_out`.
     Timeout,
-    /// The response was not the tool's result: the call returned a handle
-    /// (an `io.modelcontextprotocol/tasks` task handle) and the real result
-    /// is retrieved later by a separate request.
+    /// The response was a durable handle rather than the tool's result: a
+    /// `CreateTaskResult` from the `io.modelcontextprotocol/tasks`
+    /// extension. The work continues server-side and the real result is
+    /// retrieved later by `tasks/get`.
     ///
-    /// **This does not mean the result was unobservable.** If the client
-    /// polls for it, that result crosses this proxy like any other traffic
-    /// and is dropped on the floor, because it does not arrive as a
-    /// `tools/call` and nothing correlates it back to this row. "We saw it
-    /// and did not log it" is a different and weaker claim than "we could
-    /// not see it," and for a log people are trusting to be complete, the
-    /// difference is the whole point of recording this status at all.
-    #[allow(dead_code)]
+    /// **This does not mean the result was unobservable.** `tasks/get` and
+    /// its response cross this proxy like any other traffic. We forward
+    /// them and do not log them, because they are not `tools/call` messages
+    /// and nothing correlates them back to this row. *Saw it and did not
+    /// record it* is a weaker claim than *could not see it*, and for a log
+    /// people are trusting to be complete, that difference is the entire
+    /// reason this status exists rather than the row simply reading
+    /// `success`.
+    ///
+    /// What the row does carry: `Deferred` escalates to the `full` tier, so
+    /// `result_json` holds the whole handle including its `taskId`. Anyone
+    /// reconstructing the outcome later — or building the correlation this
+    /// version lacks — has the identifier to do it with.
     Deferred,
 }
 
@@ -167,8 +173,22 @@ impl CallOutcome {
     /// because a destructive tool call that ran and failed must never be
     /// under-logged by looking at only one of them.
     pub(crate) fn from_rpc(msg: &RpcMessage, bytes_out: i64) -> Self {
+        // Errors first: a failure is a failure whatever shape the result
+        // otherwise has.
+        //
+        // A task handle is deliberately NOT `Success`, while an MRTR
+        // `input_required` interim result deliberately is. The difference
+        // is whether the outcome ever reaches the log. An MRTR retry is a
+        // new `tools/call`, so it produces its own row and the final result
+        // is recorded there; nothing is lost, the story is just told across
+        // two rows. A task's result arrives via `tasks/get`, which is not a
+        // `tools/call` and is never logged — so without this status the row
+        // would claim a plain success for a call whose outcome this log
+        // does not contain.
         let status = if msg.is_error_response() || msg.is_mcp_tool_error() {
             CallStatus::Error
+        } else if msg.is_task_handle() {
+            CallStatus::Deferred
         } else {
             CallStatus::Success
         };
@@ -529,6 +549,69 @@ mod tests {
         let ok: RpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#).unwrap();
         assert_eq!(CallOutcome::from_rpc(&ok, 10).status, CallStatus::Success);
+    }
+
+    #[test]
+    fn task_handle_response_is_classified_deferred() {
+        let msg: RpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"task","taskId":"t-42","status":"working"}}"#,
+        )
+        .unwrap();
+        assert_eq!(CallOutcome::from_rpc(&msg, 10).status, CallStatus::Deferred);
+    }
+
+    /// An MRTR interim result is a plain success: the client retries as a
+    /// new `tools/call`, which produces its own row carrying the final
+    /// outcome. Nothing is missing from the log, so nothing needs flagging.
+    #[test]
+    fn mrtr_interim_result_is_not_deferred() {
+        let msg: RpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"input_required",
+                 "inputRequests":{"k":{"method":"elicitation/create"}},"requestState":"blob"}}"#,
+        )
+        .unwrap();
+        assert_eq!(CallOutcome::from_rpc(&msg, 10).status, CallStatus::Success);
+    }
+
+    /// A failing task-creating call is an error, not a deferral — there is
+    /// no outcome still to come.
+    #[test]
+    fn an_error_wins_over_a_task_handle() {
+        let msg: RpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603},"result":{"resultType":"task"}}"#,
+        )
+        .unwrap();
+        assert_eq!(CallOutcome::from_rpc(&msg, 10).status, CallStatus::Error);
+    }
+
+    /// The taskId must survive into the stored row: it is the only thread
+    /// back to an outcome this log does not otherwise contain. `Deferred`
+    /// escalates to `full`, so the handle is stored whole even under a
+    /// `minimal` configuration.
+    #[test]
+    fn deferred_row_retains_the_task_id_despite_a_minimal_tier() {
+        let patterns = PatternSet::bundled().unwrap();
+        let msg: RpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"task","taskId":"t-abc-123",
+                 "status":"working","ttlMs":600000,"pollIntervalMs":1000}}"#,
+        )
+        .unwrap();
+        let e = build_entry(
+            pending(long_args()),
+            CallOutcome::from_rpc(&msg, 120),
+            "sess-1",
+            "srv",
+            Tier::Minimal,
+            &patterns,
+            &HashSet::new(),
+        );
+        assert_eq!(e.status, "deferred");
+        let result = e.result_json.unwrap();
+        assert!(
+            result.contains("t-abc-123"),
+            "taskId must be stored: {result}"
+        );
+        assert!(!result.contains("[truncated"));
     }
 
     #[test]

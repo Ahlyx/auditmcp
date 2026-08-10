@@ -65,6 +65,25 @@ impl RpcMessage {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     }
+
+    /// True when the response is a `CreateTaskResult` from the
+    /// `io.modelcontextprotocol/tasks` extension — a durable handle
+    /// (`taskId`, `status`, `ttlMs`, `pollIntervalMs`) returned in place of
+    /// the result, for work the server expects to be long-running.
+    ///
+    /// MCP 2026-07-28 requires a `resultType` on every result, so this is a
+    /// one-field check against a stable discriminator rather than a guess
+    /// at the handle's shape. The core values are `"complete"` and
+    /// `"input_required"`; the tasks extension adds `"task"`. Earlier
+    /// protocol revisions omit the field entirely and are to be treated as
+    /// complete, which falls out of comparing against `"task"`.
+    pub fn is_task_handle(&self) -> bool {
+        self.result
+            .as_ref()
+            .and_then(|r| r.get("resultType"))
+            .and_then(|v| v.as_str())
+            == Some("task")
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +220,45 @@ mod tests {
             !parse(r#"{"jsonrpc":"2.0","id":1,"result":{"isError":"true"}}"#).is_mcp_tool_error(),
             "a non-boolean isError must not be coerced to true"
         );
+    }
+
+    #[test]
+    fn task_handle_is_detected_by_result_type() {
+        let msg = parse(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"task","taskId":"t-42",
+                 "status":"working","ttlMs":600000,"pollIntervalMs":1000}}"#,
+        );
+        assert!(msg.is_task_handle());
+        assert!(!msg.is_error_response());
+        assert!(!msg.is_mcp_tool_error());
+    }
+
+    /// The other two `resultType` values are ordinary results as far as the
+    /// audit log is concerned. `input_required` in particular must NOT read
+    /// as a task handle: an MRTR retry is a new `tools/call` that gets its
+    /// own row, so its outcome does reach the log.
+    #[test]
+    fn other_result_types_are_not_task_handles() {
+        for rt in ["complete", "input_required"] {
+            let raw = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"resultType":"{rt}"}}}}"#);
+            assert!(
+                !parse(&raw).is_task_handle(),
+                "resultType {rt} must not be treated as a task handle"
+            );
+        }
+    }
+
+    /// Protocol revisions before 2026-07-28 have no `resultType` at all,
+    /// and are to be treated as complete.
+    #[test]
+    fn absent_or_malformed_result_type_is_not_a_task_handle() {
+        assert!(!parse(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#).is_task_handle());
+        assert!(!parse(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).is_task_handle());
+        assert!(
+            !parse(r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":7}}"#).is_task_handle(),
+            "a non-string resultType must not be coerced"
+        );
+        assert!(!parse(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1}}"#).is_task_handle());
     }
 
     /// Unknown fields must be ignored, not rejected. The envelope is the

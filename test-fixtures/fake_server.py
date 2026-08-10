@@ -5,11 +5,14 @@ Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout -- just enough of the
 MCP shape (initialize, tools/list, tools/call) to be a useful proxy target.
 Not a spec-complete MCP server; it exists purely as a test fixture.
 
-Exposes 3 tools:
+Exposes 5 tools:
   - echo(text): returns text unchanged
   - delete_file(path): simulates a destructive action, never touches disk
   - leak_secret(): returns a string containing a fake API key, for
     exercising secrets-detection later (Phase 2)
+  - simulate_tool_failure(): a success response carrying "isError": true
+  - start_long_task(): returns a tasks-extension task handle instead of a
+    result, for exercising the `deferred` status
 """
 import json
 import sys
@@ -48,6 +51,17 @@ TOOLS = [
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "start_long_task",
+        "description": (
+            "Returns a CreateTaskResult from the io.modelcontextprotocol/tasks "
+            "extension (resultType: \"task\") instead of a result, as a server "
+            "does for long-running work. The real result would arrive via a "
+            "later tasks/get, which is not a tools/call and so is never logged "
+            "-- this exercises the `deferred` status that records that gap."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 FAKE_API_KEY = "sk-FAKE1234567890abcdefFAKEKEYFAKE00"
@@ -78,6 +92,17 @@ def handle_tool_call(params):
         return result
     if name == "simulate_tool_failure":
         return text_result("simulated failure: target resource not found", is_error=True)
+    if name == "start_long_task":
+        # A CreateTaskResult, not a tool result: no "content", no "isError".
+        # The discriminator is resultType, which MCP 2026-07-28 requires on
+        # every result.
+        return {
+            "resultType": "task",
+            "taskId": "task-fake-0001",
+            "status": "working",
+            "ttlMs": 600000,
+            "pollIntervalMs": 1000,
+        }
 
     return text_result(f"unknown tool: {name}", is_error=True)
 
