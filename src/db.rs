@@ -232,9 +232,11 @@ fn is_busy(e: &rusqlite::Error) -> bool {
 /// the chain.
 fn last_hash(conn: &Connection) -> anyhow::Result<String> {
     let hash: Option<String> = conn
-        .query_row("SELECT hash FROM tool_calls ORDER BY id DESC LIMIT 1", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT hash FROM tool_calls ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(|e| anyhow::anyhow!("failed to read last hash: {e}"))?;
 
@@ -373,7 +375,10 @@ fn insert_redaction_rows(conn: &Connection, flags_json: &str) {
 
     let tool_call_id = conn.last_insert_rowid();
     for r in records {
-        if let Err(e) = conn.execute(INSERT_REDACTION_SQL, params![tool_call_id, r.pattern, r.severity, r.sha256]) {
+        if let Err(e) = conn.execute(
+            INSERT_REDACTION_SQL,
+            params![tool_call_id, r.pattern, r.severity, r.sha256],
+        ) {
             tracing::warn!(
                 "redactions index drift: failed to insert index row for tool_call {tool_call_id} \
                  (the audit row itself is committed and intact, but `unmask` will not resolve this hash; \
@@ -493,7 +498,8 @@ pub fn find_secret_hashes_by_prefix(
 
     let mut samples = Vec::new();
     for r in rows {
-        samples.push(r.map_err(|e| anyhow::anyhow!("failed to read matching secret hash row: {e}"))?);
+        samples
+            .push(r.map_err(|e| anyhow::anyhow!("failed to read matching secret hash row: {e}"))?);
     }
 
     Ok((count as usize, samples))
@@ -521,7 +527,11 @@ pub fn check_redaction_consistency(conn: &Connection) -> anyhow::Result<Vec<Reda
     let mut drift = std::mem::take(&mut state.unparseable);
 
     for id in state.all_ids() {
-        let exp = state.expected.get(&id).map(Vec::as_slice).unwrap_or_default();
+        let exp = state
+            .expected
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let act = state.actual.get(&id).map(Vec::as_slice).unwrap_or_default();
         let (missing, extra) = diff_triples(exp, act);
 
@@ -530,16 +540,27 @@ pub fn check_redaction_consistency(conn: &Connection) -> anyhow::Result<Vec<Reda
             if !missing.is_empty() {
                 parts.push(format!(
                     "missing from index: {}",
-                    missing.iter().map(short_triple).collect::<Vec<_>>().join(", ")
+                    missing
+                        .iter()
+                        .map(short_triple)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
             if !extra.is_empty() {
                 parts.push(format!(
                     "in index but not in redaction_flags: {}",
-                    extra.iter().map(short_triple).collect::<Vec<_>>().join(", ")
+                    extra
+                        .iter()
+                        .map(short_triple)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
-            drift.push(RedactionDrift { tool_call_id: id, detail: parts.join("; ") });
+            drift.push(RedactionDrift {
+                tool_call_id: id,
+                detail: parts.join("; "),
+            });
         }
     }
 
@@ -569,7 +590,12 @@ struct RedactionState {
 impl RedactionState {
     /// Every tool_call id present on either side, sorted, deduplicated.
     fn all_ids(&self) -> Vec<i64> {
-        let mut ids: Vec<i64> = self.expected.keys().chain(self.actual.keys()).copied().collect();
+        let mut ids: Vec<i64> = self
+            .expected
+            .keys()
+            .chain(self.actual.keys())
+            .copied()
+            .collect();
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -584,20 +610,31 @@ fn load_redaction_state(conn: &Connection) -> anyhow::Result<RedactionState> {
             .prepare("SELECT id, redaction_flags FROM tool_calls WHERE redaction_flags IS NOT NULL")
             .map_err(|e| anyhow::anyhow!("failed to prepare redaction_flags scan: {e}"))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| anyhow::anyhow!("failed to scan redaction_flags: {e}"))?;
         for r in rows {
-            let (id, raw) = r.map_err(|e| anyhow::anyhow!("failed to read redaction_flags row: {e}"))?;
+            let (id, raw) =
+                r.map_err(|e| anyhow::anyhow!("failed to read redaction_flags row: {e}"))?;
             match serde_json::from_str::<Vec<RedactionEntry>>(&raw) {
                 Ok(records) => {
-                    expected.insert(id, records.into_iter().map(|e| (e.pattern, e.severity, e.sha256)).collect());
+                    expected.insert(
+                        id,
+                        records
+                            .into_iter()
+                            .map(|e| (e.pattern, e.severity, e.sha256))
+                            .collect(),
+                    );
                 }
                 // Unparseable source JSON is itself reportable drift: the
                 // index can't be verified against it, and the write path
                 // couldn't have projected it either.
                 Err(e) => unparseable.push(RedactionDrift {
                     tool_call_id: id,
-                    detail: format!("redaction_flags is not parseable JSON ({e}); index cannot be verified"),
+                    detail: format!(
+                        "redaction_flags is not parseable JSON ({e}); index cannot be verified"
+                    ),
                 }),
             }
         }
@@ -612,17 +649,26 @@ fn load_redaction_state(conn: &Connection) -> anyhow::Result<RedactionState> {
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    (row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?),
+                    (
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ),
                 ))
             })
             .map_err(|e| anyhow::anyhow!("failed to scan redactions: {e}"))?;
         for r in rows {
-            let (id, triple) = r.map_err(|e| anyhow::anyhow!("failed to read redactions row: {e}"))?;
+            let (id, triple) =
+                r.map_err(|e| anyhow::anyhow!("failed to read redactions row: {e}"))?;
             actual.entry(id).or_default().push(triple);
         }
     }
 
-    Ok(RedactionState { expected, actual, unparseable })
+    Ok(RedactionState {
+        expected,
+        actual,
+        unparseable,
+    })
 }
 
 /// Multiset difference for one tool call: `.0` is what's missing from the
@@ -631,7 +677,10 @@ fn load_redaction_state(conn: &Connection) -> anyhow::Result<RedactionState> {
 /// duplicated within args, or appearing in both args and result — so
 /// duplicates are counted, never deduplicated away (2 expected vs. 2 found
 /// is consistent; 2 expected vs. 1 found is drift).
-fn diff_triples(expected: &[RedactionTriple], actual: &[RedactionTriple]) -> (Vec<RedactionTriple>, Vec<RedactionTriple>) {
+fn diff_triples(
+    expected: &[RedactionTriple],
+    actual: &[RedactionTriple],
+) -> (Vec<RedactionTriple>, Vec<RedactionTriple>) {
     let mut remaining = actual.to_vec();
     let mut missing = Vec::new();
     for e in expected {
@@ -677,15 +726,26 @@ pub fn plan_redaction_repair(conn: &Connection) -> anyhow::Result<RepairPlan> {
     let mut actions = Vec::new();
 
     for id in state.all_ids() {
-        let exp = state.expected.get(&id).map(Vec::as_slice).unwrap_or_default();
+        let exp = state
+            .expected
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let act = state.actual.get(&id).map(Vec::as_slice).unwrap_or_default();
         let (missing, extra) = diff_triples(exp, act);
         if !missing.is_empty() || !extra.is_empty() {
-            actions.push(RepairAction { tool_call_id: id, add: missing, remove: extra });
+            actions.push(RepairAction {
+                tool_call_id: id,
+                add: missing,
+                remove: extra,
+            });
         }
     }
 
-    Ok(RepairPlan { actions, unrepairable: state.unparseable })
+    Ok(RepairPlan {
+        actions,
+        unrepairable: state.unparseable,
+    })
 }
 
 /// Applies the repair plan in ONE transaction, touching ONLY the derived
@@ -718,11 +778,24 @@ pub fn apply_redaction_repair(conn: &Connection) -> anyhow::Result<RepairPlan> {
                    LIMIT 1)",
                 params![action.tool_call_id, t.0, t.1, t.2],
             )
-            .map_err(|e| anyhow::anyhow!("failed to delete stray index row for tool_call {}: {e}", action.tool_call_id))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to delete stray index row for tool_call {}: {e}",
+                    action.tool_call_id
+                )
+            })?;
         }
         for t in &action.add {
-            tx.execute(INSERT_REDACTION_SQL, params![action.tool_call_id, t.0, t.1, t.2])
-                .map_err(|e| anyhow::anyhow!("failed to insert index row for tool_call {}: {e}", action.tool_call_id))?;
+            tx.execute(
+                INSERT_REDACTION_SQL,
+                params![action.tool_call_id, t.0, t.1, t.2],
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to insert index row for tool_call {}: {e}",
+                    action.tool_call_id
+                )
+            })?;
         }
     }
 
@@ -806,16 +879,29 @@ pub enum ChainIssue {
     /// correctly against its own stored `prev_hash` — the chain only
     /// breaks in the sense that a link is now *missing*, not that any
     /// remaining row's own hash is wrong.
-    RowMissing { after_id: i64, expected_id: i64, found_id: i64 },
+    RowMissing {
+        after_id: i64,
+        expected_id: i64,
+        found_id: i64,
+    },
     /// A row's stored `prev_hash` doesn't equal the hash actually produced
     /// by the row immediately before it in the chain we've walked so far.
     /// Catches reordering and direct tampering with the `prev_hash`
     /// column itself.
-    LinkBroken { id: i64, expected_prev_hash: String, stored_prev_hash: String },
+    LinkBroken {
+        id: i64,
+        expected_prev_hash: String,
+        stored_prev_hash: String,
+    },
     /// A row's own hash doesn't match what its stored content (hashed
     /// against its own, valid, prev_hash) recomputes to — i.e. some other
     /// column was edited after the row was written.
-    ContentTampered { id: i64, tool_name: String, expected_hash: String, stored_hash: String },
+    ContentTampered {
+        id: i64,
+        tool_name: String,
+        expected_hash: String,
+        stored_hash: String,
+    },
 }
 
 impl std::fmt::Display for ChainIssue {
@@ -917,7 +1003,10 @@ impl DbHandle {
                         "audit log queue full (capacity {CHANNEL_CAPACITY}); entries are being dropped until the writer catches up"
                     );
                 } else if (prev + 1).is_multiple_of(1000) {
-                    tracing::warn!("audit log queue still full; {} entries dropped so far", prev + 1);
+                    tracing::warn!(
+                        "audit log queue still full; {} entries dropped so far",
+                        prev + 1
+                    );
                 }
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -946,7 +1035,10 @@ pub fn spawn_writer(db_path: &Path) -> DbHandle {
 
     std::thread::spawn(move || writer_loop(&path, rx));
 
-    DbHandle { sender: tx, dropped: Arc::new(AtomicU64::new(0)) }
+    DbHandle {
+        sender: tx,
+        dropped: Arc::new(AtomicU64::new(0)),
+    }
 }
 
 /// Runs on the dedicated writer thread. Every failure mode here is
@@ -1112,7 +1204,10 @@ mod tests {
 
         let h2 = insert_row(&mut conn, &sample_entry()).unwrap();
         assert_eq!(last_hash(&conn).unwrap(), h2);
-        assert_ne!(h1, h2, "identical entries chained after a different prev_hash must differ");
+        assert_ne!(
+            h1, h2,
+            "identical entries chained after a different prev_hash must differ"
+        );
 
         // First row's prev_hash column is NULL, not the "GENESIS" sentinel text.
         let stored_prev: Option<String> = conn
@@ -1146,7 +1241,11 @@ mod tests {
             entry.tool_name = format!("tool_{i}");
             insert_row(conn, &entry).unwrap();
             let id: i64 = conn
-                .query_row("SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+                .query_row(
+                    "SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap();
             ids.push(id);
         }
@@ -1255,7 +1354,11 @@ mod tests {
 
         let drift = check_redaction_consistency(&conn).unwrap();
         assert_eq!(drift.len(), 1);
-        assert!(drift[0].detail.contains("missing from index"), "got: {}", drift[0].detail);
+        assert!(
+            drift[0].detail.contains("missing from index"),
+            "got: {}",
+            drift[0].detail
+        );
         cleanup(conn, &path);
     }
 
@@ -1276,7 +1379,13 @@ mod tests {
         let drift = check_redaction_consistency(&conn).unwrap();
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].tool_call_id, id);
-        assert!(drift[0].detail.contains("in index but not in redaction_flags"), "got: {}", drift[0].detail);
+        assert!(
+            drift[0]
+                .detail
+                .contains("in index but not in redaction_flags"),
+            "got: {}",
+            drift[0].detail
+        );
         cleanup(conn, &path);
     }
 
@@ -1288,15 +1397,23 @@ mod tests {
         // Primary insert must still succeed (fail-open) even though the
         // projection can't parse this...
         insert_row(&mut conn, &entry_with_flags("not valid json")).unwrap();
-        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM tool_calls", [], |r| r.get(0)).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(rows, 1);
-        let idx: i64 = conn.query_row("SELECT COUNT(*) FROM redactions", [], |r| r.get(0)).unwrap();
+        let idx: i64 = conn
+            .query_row("SELECT COUNT(*) FROM redactions", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(idx, 0);
 
         // ...and the resulting drift must be visible to the check.
         let drift = check_redaction_consistency(&conn).unwrap();
         assert_eq!(drift.len(), 1);
-        assert!(drift[0].detail.contains("not parseable"), "got: {}", drift[0].detail);
+        assert!(
+            drift[0].detail.contains("not parseable"),
+            "got: {}",
+            drift[0].detail
+        );
         cleanup(conn, &path);
     }
 
@@ -1317,8 +1434,16 @@ mod tests {
         let hits = crate::secrets::scan_and_redact_json(&mut args, &patterns, &HashSet::new());
 
         let active: Vec<_> = hits.iter().filter(|h| !h.allowlisted).collect();
-        assert_eq!(active.len(), 2, "two occurrences must be two hits, got {}", active.len());
-        assert_eq!(active[0].secret_sha256, active[1].secret_sha256, "same value must hash identically");
+        assert_eq!(
+            active.len(),
+            2,
+            "two occurrences must be two hits, got {}",
+            active.len()
+        );
+        assert_eq!(
+            active[0].secret_sha256, active[1].secret_sha256,
+            "same value must hash identically"
+        );
 
         // Mirror proxy.rs's RedactionRecord shape when building the flags.
         let records: Vec<serde_json::Value> = active
@@ -1333,7 +1458,9 @@ mod tests {
         entry.redaction_count = active.len() as i64;
         insert_row(&mut conn, &entry).unwrap();
 
-        let indexed: i64 = conn.query_row("SELECT COUNT(*) FROM redactions", [], |r| r.get(0)).unwrap();
+        let indexed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM redactions", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(indexed, 2, "index must hold one row per occurrence");
         assert!(
             check_redaction_consistency(&conn).unwrap().is_empty(),
@@ -1342,11 +1469,18 @@ mod tests {
 
         // And prove it's counting, not deduplicating: with one of the two
         // identical index rows gone, "2 expected, 1 found" IS drift.
-        conn.execute("DELETE FROM redactions WHERE id = (SELECT MIN(id) FROM redactions)", [])
-            .unwrap();
+        conn.execute(
+            "DELETE FROM redactions WHERE id = (SELECT MIN(id) FROM redactions)",
+            [],
+        )
+        .unwrap();
         let drift = check_redaction_consistency(&conn).unwrap();
         assert_eq!(drift.len(), 1);
-        assert!(drift[0].detail.contains("missing from index"), "got: {}", drift[0].detail);
+        assert!(
+            drift[0].detail.contains("missing from index"),
+            "got: {}",
+            drift[0].detail
+        );
 
         cleanup(conn, &path);
     }
@@ -1454,14 +1588,19 @@ mod tests {
         insert_row(&mut conn, &entry).unwrap();
 
         let (stored_result, stored_flags): (String, String) = conn
-            .query_row("SELECT result_json, redaction_flags FROM tool_calls", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT result_json, redaction_flags FROM tool_calls",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
 
         // BOTH sides, from the same stored row: the metadata records the
         // hit AND the content actually reflects the redaction.
-        assert!(stored_flags.contains("openai_api_key"), "flags must record the hit: {stored_flags}");
+        assert!(
+            stored_flags.contains("openai_api_key"),
+            "flags must record the hit: {stored_flags}"
+        );
         assert!(
             stored_result.contains("[REDACTED:openai_api_key]"),
             "stored result_json must contain the redaction marker: {stored_result}"
@@ -1653,7 +1792,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(cross_links, 7, "every non-genesis row must chain to the other server's row");
+        assert_eq!(
+            cross_links, 7,
+            "every non-genesis row must chain to the other server's row"
+        );
 
         // Tampering one server's row is still caught on the mixed chain.
         conn_a

@@ -174,7 +174,14 @@ pub fn run(
     let rows = db::read_all_rows(&conn)?;
 
     let since_cutoff = since.as_deref().map(parse_since).transpose()?;
-    let filtered = filter_rows(rows, tool.as_deref(), None, server.as_deref(), since_cutoff, status.as_deref());
+    let filtered = filter_rows(
+        rows,
+        tool.as_deref(),
+        None,
+        server.as_deref(),
+        since_cutoff,
+        status.as_deref(),
+    );
 
     match output {
         None => {
@@ -186,7 +193,8 @@ pub fn run(
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
             write_rows(&mut lock, &filtered)?;
-            lock.flush().map_err(|e| anyhow::anyhow!("failed to flush export output: {e}"))?;
+            lock.flush()
+                .map_err(|e| anyhow::anyhow!("failed to flush export output: {e}"))?;
             Ok(())
         }
         Some(path) => write_atomic(&path, &filtered),
@@ -201,7 +209,8 @@ fn write_rows(writer: &mut dyn Write, rows: &[StoredRow]) -> anyhow::Result<()> 
         let export_row = ExportRow::from_stored(row)?;
         let line = serde_json::to_string(&export_row)
             .map_err(|e| anyhow::anyhow!("failed to serialize row id {}: {e}", row.id))?;
-        writeln!(writer, "{line}").map_err(|e| anyhow::anyhow!("failed to write export output: {e}"))?;
+        writeln!(writer, "{line}")
+            .map_err(|e| anyhow::anyhow!("failed to write export output: {e}"))?;
     }
     Ok(())
 }
@@ -216,23 +225,40 @@ fn write_rows(writer: &mut dyn Write, rows: &[StoredRow]) -> anyhow::Result<()> 
 /// to anything that doesn't check the exit code — exactly the quiet
 /// failure the loud abort in `ExportRow::from_stored` exists to prevent.
 fn write_atomic(path: &Path, rows: &[StoredRow]) -> anyhow::Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("export");
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("export");
     let temp_path = dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
 
     let write_result = File::create(&temp_path)
-        .map_err(|e| anyhow::anyhow!("failed to create temp output file {}: {e}", temp_path.display()))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create temp output file {}: {e}",
+                temp_path.display()
+            )
+        })
         .and_then(|file| {
             let mut writer = BufWriter::new(file);
             write_rows(&mut writer, rows)?;
-            writer
-                .flush()
-                .map_err(|e| anyhow::anyhow!("failed to flush temp output file {}: {e}", temp_path.display()))
+            writer.flush().map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to flush temp output file {}: {e}",
+                    temp_path.display()
+                )
+            })
         });
 
     match write_result {
         Ok(()) => std::fs::rename(&temp_path, path).map_err(|e| {
-            anyhow::anyhow!("failed to move completed export into place at {}: {e}", path.display())
+            anyhow::anyhow!(
+                "failed to move completed export into place at {}: {e}",
+                path.display()
+            )
         }),
         Err(e) => {
             // Best-effort cleanup: if even removing the temp file fails,
@@ -251,7 +277,10 @@ mod tests {
     use crate::db::ToolCallEntry;
 
     fn temp_test_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("auditmcp_export_test_{label}_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "auditmcp_export_test_{label}_{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -300,7 +329,11 @@ mod tests {
     }
 
     fn read_lines(path: &Path) -> Vec<String> {
-        std::fs::read_to_string(path).unwrap().lines().map(str::to_string).collect()
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     #[test]
@@ -312,9 +345,21 @@ mod tests {
         let config_path = write_config(&dir, &db_path);
         let output_path = dir.join("out.jsonl");
 
-        run(&config_path, ExportFormat::Jsonl, None, None, None, None, Some(output_path.clone())).unwrap();
+        run(
+            &config_path,
+            ExportFormat::Jsonl,
+            None,
+            None,
+            None,
+            None,
+            Some(output_path.clone()),
+        )
+        .unwrap();
 
-        assert!(output_path.exists(), "export should still create the output file for zero rows");
+        assert!(
+            output_path.exists(),
+            "export should still create the output file for zero rows"
+        );
         let content = std::fs::read_to_string(&output_path).unwrap();
         assert_eq!(content, "", "zero rows must mean zero lines, not an error");
 
@@ -351,7 +396,11 @@ mod tests {
         .unwrap();
 
         let lines = read_lines(&output_path);
-        assert_eq!(lines.len(), 1, "only the delete_file+error row should match both filters together");
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the delete_file+error row should match both filters together"
+        );
         let row: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(row["tool_name"], "delete_file");
         assert_eq!(row["status"], "error");
@@ -374,22 +423,34 @@ mod tests {
             r#"{"content":[{"type":"text","text":"api_key=[REDACTED:openai_api_key]"}],"isError":false}"#
                 .to_string(),
         );
-        entry.redaction_flags =
-            Some(r#"[{"pattern":"openai_api_key","severity":"high","sha256":"aaaa1111"}]"#.to_string());
+        entry.redaction_flags = Some(
+            r#"[{"pattern":"openai_api_key","severity":"high","sha256":"aaaa1111"}]"#.to_string(),
+        );
         entry.redaction_count = 1;
         seed(&db_path, &[entry]);
 
         let conn = db::open_readonly(&db_path).unwrap();
         let (raw_args, raw_result): (String, String) = conn
-            .query_row("SELECT args_json, result_json FROM tool_calls WHERE id = 1", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT args_json, result_json FROM tool_calls WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         drop(conn);
 
         let config_path = write_config(&dir, &db_path);
         let output_path = dir.join("out.jsonl");
-        run(&config_path, ExportFormat::Jsonl, None, None, None, None, Some(output_path.clone())).unwrap();
+        run(
+            &config_path,
+            ExportFormat::Jsonl,
+            None,
+            None,
+            None,
+            None,
+            Some(output_path.clone()),
+        )
+        .unwrap();
 
         let lines = read_lines(&output_path);
         assert_eq!(lines.len(), 1);
@@ -436,7 +497,11 @@ mod tests {
         .unwrap();
 
         let lines = read_lines(&output_path);
-        assert_eq!(lines.len(), 1, "only the vault_reader row should be exported");
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the vault_reader row should be exported"
+        );
         let row: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(row["server_name"], "vault_reader");
         assert_eq!(row["tool_name"], "read_note");
@@ -499,9 +564,23 @@ mod tests {
         let output_path = dir.join("out.jsonl");
         assert!(!output_path.exists());
 
-        let result = run(&config_path, ExportFormat::Jsonl, None, None, None, None, Some(output_path.clone()));
-        assert!(result.is_err(), "unparseable redaction_flags must abort the export");
-        assert!(!output_path.exists(), "destination must not spring into existence on an aborted export");
+        let result = run(
+            &config_path,
+            ExportFormat::Jsonl,
+            None,
+            None,
+            None,
+            None,
+            Some(output_path.clone()),
+        );
+        assert!(
+            result.is_err(),
+            "unparseable redaction_flags must abort the export"
+        );
+        assert!(
+            !output_path.exists(),
+            "destination must not spring into existence on an aborted export"
+        );
 
         let leftover: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -509,7 +588,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|name| name.contains(".tmp-"))
             .collect();
-        assert!(leftover.is_empty(), "no temp file should survive an aborted export, found: {leftover:?}");
+        assert!(
+            leftover.is_empty(),
+            "no temp file should survive an aborted export, found: {leftover:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -531,7 +613,15 @@ mod tests {
         let output_path = dir.join("out.jsonl");
         std::fs::write(&output_path, "pre-existing content\n").unwrap();
 
-        let result = run(&config_path, ExportFormat::Jsonl, None, None, None, None, Some(output_path.clone()));
+        let result = run(
+            &config_path,
+            ExportFormat::Jsonl,
+            None,
+            None,
+            None,
+            None,
+            Some(output_path.clone()),
+        );
         assert!(result.is_err());
 
         let content = std::fs::read_to_string(&output_path).unwrap();

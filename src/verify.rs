@@ -89,19 +89,25 @@ pub fn run(config_path: &Path, repair_index: bool, yes: bool) -> anyhow::Result<
         let plan = db::plan_redaction_repair(&conn)?;
         println!("Repair plan (dry run — only the derived redactions index would change, never tool_calls/hashes):");
         print_plan(&plan, "would add", "would remove");
-        println!("Dry run: no changes were made. Re-run with `verify --repair-index --yes` to apply.");
+        println!(
+            "Dry run: no changes were made. Re-run with `verify --repair-index --yes` to apply."
+        );
         std::process::exit(EXIT_DRIFT);
     }
 
     let plan = db::apply_redaction_repair(&conn)?;
-    println!("Repair applied (only the derived redactions index changed; tool_calls/hashes untouched):");
+    println!(
+        "Repair applied (only the derived redactions index changed; tool_calls/hashes untouched):"
+    );
     print_plan(&plan, "added", "removed");
 
     // Re-check from the database, not from what we think we just did, and
     // say so — the whole point of the repair is a provably consistent index.
     let remaining = db::check_redaction_consistency(&conn)?;
     if remaining.is_empty() {
-        println!("OK: re-checked after repair — redactions index now consistent with redaction_flags.");
+        println!(
+            "OK: re-checked after repair — redactions index now consistent with redaction_flags."
+        );
         Ok(())
     } else {
         eprintln!(
@@ -125,6 +131,9 @@ fn print_plan(plan: &db::RepairPlan, add_verb: &str, remove_verb: &str) {
         );
     }
     for u in &plan.unrepairable {
-        println!("  tool_call id {}: cannot repair — {}", u.tool_call_id, u.detail);
+        println!(
+            "  tool_call id {}: cannot repair — {}",
+            u.tool_call_id, u.detail
+        );
     }
 }

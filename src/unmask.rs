@@ -25,7 +25,10 @@ pub fn run(config_path: &Path, hash: &str, note: &str) -> anyhow::Result<()> {
     println!("Allowlisted secret hash: {}", resolved.sha256);
     println!(
         "  pattern: {}",
-        resolved.pattern.as_deref().unwrap_or("(not seen in any logged row yet)")
+        resolved
+            .pattern
+            .as_deref()
+            .unwrap_or("(not seen in any logged row yet)")
     );
     println!("  note:    {note}");
     println!("  added:   {added_at}");
@@ -73,10 +76,14 @@ fn resolve_hash(conn: &Connection, input: &str) -> anyhow::Result<Resolved> {
 
     if input.len() == 64 {
         let pattern = db::find_secret_hash_exact(conn, &input)?;
-        return Ok(Resolved { sha256: input, pattern });
+        return Ok(Resolved {
+            sha256: input,
+            pattern,
+        });
     }
 
-    let (count, samples) = db::find_secret_hashes_by_prefix(conn, &input, AMBIGUOUS_MATCH_SAMPLE_LIMIT)?;
+    let (count, samples) =
+        db::find_secret_hashes_by_prefix(conn, &input, AMBIGUOUS_MATCH_SAMPLE_LIMIT)?;
     match count {
         0 => Err(anyhow::anyhow!(
             "no known secret hash starts with '{input}' -- run `query --verbose` to see recorded hashes"
@@ -101,7 +108,8 @@ mod tests {
     use rusqlite::params;
 
     fn temp_db() -> (Connection, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("auditmcp_unmask_test_{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("auditmcp_unmask_test_{}.db", uuid::Uuid::new_v4()));
         let conn = db::open_for_write(&path).unwrap();
         (conn, path)
     }

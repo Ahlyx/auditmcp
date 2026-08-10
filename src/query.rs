@@ -25,10 +25,21 @@ pub fn run(
     let config = Config::load(config_path)?;
     let conn = db::open_readonly(Path::new(&config.logging.db_path))?;
     let rows = db::read_all_rows(&conn)?;
-    let allowlist = if verbose { db::load_allowlist(&conn)? } else { HashSet::new() };
+    let allowlist = if verbose {
+        db::load_allowlist(&conn)?
+    } else {
+        HashSet::new()
+    };
 
     let since_cutoff = since.as_deref().map(parse_since).transpose()?;
-    let filtered = filter_rows(rows, tool.as_deref(), session.as_deref(), None, since_cutoff, status.as_deref());
+    let filtered = filter_rows(
+        rows,
+        tool.as_deref(),
+        session.as_deref(),
+        None,
+        since_cutoff,
+        status.as_deref(),
+    );
 
     if filtered.is_empty() {
         println!("No matching tool calls.");
@@ -63,7 +74,9 @@ pub fn run(
         );
 
         if verbose {
-            if let Some(summary) = redaction_summary(row.entry.redaction_flags.as_deref(), &allowlist) {
+            if let Some(summary) =
+                redaction_summary(row.entry.redaction_flags.as_deref(), &allowlist)
+            {
                 println!("      {summary}");
             }
         }
@@ -134,7 +147,10 @@ fn redaction_summary(redaction_flags: Option<&str>, allowlist: &HashSet<String>)
         .iter()
         .map(|r| {
             if allowlist.contains(&r.sha256) {
-                format!("{}({}, future occurrences not redacted)", r.pattern, r.severity)
+                format!(
+                    "{}({}, future occurrences not redacted)",
+                    r.pattern, r.severity
+                )
             } else {
                 format!("{}({})", r.pattern, r.severity)
             }
@@ -164,9 +180,9 @@ pub(crate) fn parse_since(input: &str) -> anyhow::Result<DateTime<Utc>> {
     let input = input.trim();
     let (number_part, unit) = input.split_at(input.len().saturating_sub(1));
 
-    let amount: i64 = number_part
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid --since value '{input}': expected e.g. 30m, 2h, 1d, 45s"))?;
+    let amount: i64 = number_part.parse().map_err(|_| {
+        anyhow::anyhow!("invalid --since value '{input}': expected e.g. 30m, 2h, 1d, 45s")
+    })?;
 
     let duration = match unit {
         "s" => chrono::Duration::seconds(amount),
@@ -253,6 +269,9 @@ mod tests {
         let mut allowlist = HashSet::new();
         allowlist.insert("abc123".to_string());
         let summary = redaction_summary(Some(flags), &allowlist).unwrap();
-        assert_eq!(summary, "[secrets: openai_api_key(high, future occurrences not redacted)]");
+        assert_eq!(
+            summary,
+            "[secrets: openai_api_key(high, future occurrences not redacted)]"
+        );
     }
 }

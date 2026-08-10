@@ -13,7 +13,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "auditmcp", version, about = "Local-first audit logging proxy for MCP tool calls")]
+#[command(
+    name = "auditmcp",
+    version,
+    about = "Local-first audit logging proxy for MCP tool calls"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -120,13 +124,28 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Run { config, target } => proxy::run(&config, target).await,
-        Command::Query { config, tool, session, since, status, verbose } => {
-            query::run(&config, tool, session, since, status, verbose)
-        }
-        Command::Verify { config, repair_index, yes } => verify::run(&config, repair_index, yes),
-        Command::Export { config, format, tool, since, status, server, output } => {
-            export::run(&config, format, tool, since, status, server, output)
-        }
+        Command::Query {
+            config,
+            tool,
+            session,
+            since,
+            status,
+            verbose,
+        } => query::run(&config, tool, session, since, status, verbose),
+        Command::Verify {
+            config,
+            repair_index,
+            yes,
+        } => verify::run(&config, repair_index, yes),
+        Command::Export {
+            config,
+            format,
+            tool,
+            since,
+            status,
+            server,
+            output,
+        } => export::run(&config, format, tool, since, status, server, output),
         Command::Unmask { config, hash, note } => unmask::run(&config, &hash, &note),
     }
 }

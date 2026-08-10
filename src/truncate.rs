@@ -65,7 +65,11 @@ fn truncate_array(arr: &[Value]) -> Vec<Value> {
     // result valid, ordinary JSON with no new value-kind for downstream
     // readers (query output, export) to special-case.
     out.push(Value::String(format!("... {omitted} items omitted ...")));
-    out.extend(arr[arr.len() - ARRAY_KEEP_TAIL..].iter().map(truncate_json_semantic));
+    out.extend(
+        arr[arr.len() - ARRAY_KEEP_TAIL..]
+            .iter()
+            .map(truncate_json_semantic),
+    );
     out
 }
 
@@ -208,7 +212,12 @@ mod tests {
     fn long_raw_text_samples_head_middle_and_tail() {
         // Three equal-sized blocks so the true midpoint of `text` falls
         // inside the middle block regardless of window sizing.
-        let text = format!("{}{}{}", "H".repeat(1400), "M".repeat(1400), "T".repeat(1400));
+        let text = format!(
+            "{}{}{}",
+            "H".repeat(1400),
+            "M".repeat(1400),
+            "T".repeat(1400)
+        );
         let result = truncate_raw_sampled(&text);
         assert!(result.len() < text.len());
         assert!(result.starts_with('H'));

@@ -73,7 +73,11 @@ impl PatternSet {
                 name: p.name,
                 severity: p.severity,
                 requires_entropy_check: p.requires_entropy_check,
-                key_name_hints: p.key_name_hints.into_iter().map(|h| h.to_lowercase()).collect(),
+                key_name_hints: p
+                    .key_name_hints
+                    .into_iter()
+                    .map(|h| h.to_lowercase())
+                    .collect(),
                 regex,
             });
         }
@@ -86,7 +90,12 @@ impl PatternSet {
     /// is the enclosing JSON object key this string was the value of, if
     /// known — `None` when scanning a JSON array element or raw/non-JSON
     /// text, where no such context exists.
-    fn scan_str(&self, value: &str, key_name: Option<&str>, allowlist: &HashSet<String>) -> Vec<Hit> {
+    fn scan_str(
+        &self,
+        value: &str,
+        key_name: Option<&str>,
+        allowlist: &HashSet<String>,
+    ) -> Vec<Hit> {
         let key_lower = key_name.map(|k| k.to_lowercase());
         let mut hits = Vec::new();
 
@@ -237,7 +246,12 @@ fn passes_entropy_gate(pattern: &Pattern, candidate: &str, key_lower: Option<&st
     }
 
     let key_matches_hint = key_lower
-        .map(|k| pattern.key_name_hints.iter().any(|hint| k.contains(hint.as_str())))
+        .map(|k| {
+            pattern
+                .key_name_hints
+                .iter()
+                .any(|hint| k.contains(hint.as_str()))
+        })
         .unwrap_or(false);
 
     if key_matches_hint {
@@ -309,7 +323,8 @@ fn looks_structured_identifier(s: &str) -> bool {
     }
     // Windows drive prefix: "C:/" or "C:\".
     let b = s.as_bytes();
-    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\') {
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
+    {
         return true;
     }
     // URL scheme anywhere ("https://", "postgres://", ...).
@@ -352,10 +367,13 @@ pub fn shannon_entropy(s: &str) -> f64 {
     }
 
     let len = chars.len() as f64;
-    -counts.values().map(|&count| {
-        let p = count as f64 / len;
-        p * p.log2()
-    }).sum::<f64>()
+    -counts
+        .values()
+        .map(|&count| {
+            let p = count as f64 / len;
+            p * p.log2()
+        })
+        .sum::<f64>()
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -549,7 +567,9 @@ mod tests {
             Some("api_key"),
             &empty_allowlist(),
         );
-        assert!(hits.iter().any(|h| h.pattern_name == "generic_high_entropy_near_keyword"));
+        assert!(hits
+            .iter()
+            .any(|h| h.pattern_name == "generic_high_entropy_near_keyword"));
     }
 
     #[test]
@@ -571,7 +591,10 @@ mod tests {
             None,
             &empty_allowlist(),
         );
-        assert!(hits.is_empty(), "prose should not be flagged as a bare token: {hits:?}");
+        assert!(
+            hits.is_empty(),
+            "prose should not be flagged as a bare token: {hits:?}"
+        );
     }
 
     /// Regression test for a real false-positive class found in vault
@@ -602,7 +625,10 @@ mod tests {
 
         let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
 
-        assert!(hits.is_empty(), "vault paths must not be detected as secrets: {hits:?}");
+        assert!(
+            hits.is_empty(),
+            "vault paths must not be detected as secrets: {hits:?}"
+        );
         assert_eq!(value, original, "no path may be redacted or altered");
     }
 
@@ -621,10 +647,14 @@ mod tests {
         let (redacted, hits) = scan_and_redact_text(secret, &patterns, &empty_allowlist());
 
         assert!(
-            hits.iter().any(|h| h.pattern_name == "generic_high_entropy_near_keyword"),
+            hits.iter()
+                .any(|h| h.pattern_name == "generic_high_entropy_near_keyword"),
             "raw high-entropy secret must still fire with no key context: {hits:?}"
         );
-        assert!(!redacted.contains("wJalrXUtnFEMI"), "secret must be redacted: {redacted}");
+        assert!(
+            !redacted.contains("wJalrXUtnFEMI"),
+            "secret must be redacted: {redacted}"
+        );
     }
 
     #[test]
@@ -652,7 +682,10 @@ mod tests {
             "ghp_123456789012345678901234567890123456",
             "abc.defghijklmnopqrstuvwx", // final dot-segment too long for an extension
         ] {
-            assert!(!looks_structured_identifier(s), "should stay a candidate: {s}");
+            assert!(
+                !looks_structured_identifier(s),
+                "should stay a candidate: {s}"
+            );
         }
     }
 
@@ -677,7 +710,11 @@ mod tests {
     fn same_secret_hashes_identically_for_correlation() {
         let patterns = PatternSet::bundled().unwrap();
         let a = patterns.scan_str("AKIAABCDEFGHIJKLMNOP", None, &empty_allowlist());
-        let b = patterns.scan_str("prefix AKIAABCDEFGHIJKLMNOP suffix", None, &empty_allowlist());
+        let b = patterns.scan_str(
+            "prefix AKIAABCDEFGHIJKLMNOP suffix",
+            None,
+            &empty_allowlist(),
+        );
         assert_eq!(a[0].secret_sha256, b[0].secret_sha256);
     }
 
@@ -731,8 +768,15 @@ mod tests {
 
         let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
 
-        assert_eq!(hits.len(), 1, "overlapping hits on the same span must merge into one: {hits:?}");
-        assert_eq!(hits[0].pattern_name, "aws_access_key_id", "specific pattern should win over the generic heuristic");
+        assert_eq!(
+            hits.len(),
+            1,
+            "overlapping hits on the same span must merge into one: {hits:?}"
+        );
+        assert_eq!(
+            hits[0].pattern_name, "aws_access_key_id",
+            "specific pattern should win over the generic heuristic"
+        );
         assert_eq!(value["api_key"], "[REDACTED:aws_access_key_id]");
     }
 
@@ -763,8 +807,16 @@ requires_entropy_check = false
         let text = "AAAA12345BBBB";
         let (redacted, hits) = scan_and_redact_text(text, &patterns, &empty_allowlist());
 
-        assert_eq!(hits.len(), 1, "partially overlapping hits must merge into one: {hits:?}");
-        assert_eq!(hits[0].matched_range, (0, 13), "merged range must be the full union");
+        assert_eq!(
+            hits.len(),
+            1,
+            "partially overlapping hits must merge into one: {hits:?}"
+        );
+        assert_eq!(
+            hits[0].matched_range,
+            (0, 13),
+            "merged range must be the full union"
+        );
         assert_eq!(redacted, format!("[REDACTED:{}]", hits[0].pattern_name));
     }
 
@@ -795,10 +847,17 @@ key_name_hints = ["token"]
 
         let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
 
-        assert_eq!(hits.len(), 1, "containing ranges must merge into one: {hits:?}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "containing ranges must merge into one: {hits:?}"
+        );
         assert_eq!(hits[0].pattern_name, "specific_inner");
         let redacted = value["token"].as_str().unwrap();
-        assert!(!redacted.contains("AKIA"), "no fragment of the secret should survive: {redacted}");
+        assert!(
+            !redacted.contains("AKIA"),
+            "no fragment of the secret should survive: {redacted}"
+        );
     }
 
     /// Transitive three-hit overlap chain: A=(0,10), B=(5,15), C=(12,20).
@@ -841,11 +900,22 @@ requires_entropy_check = false
 
         let (redacted, hits) = scan_and_redact_text(text, &patterns, &empty_allowlist());
 
-        assert_eq!(hits.len(), 1, "the bridging hit must merge all three into one group: {hits:?}");
-        assert_eq!(hits[0].matched_range, (0, 20), "merged range must be the full union of all three");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the bridging hit must merge all three into one group: {hits:?}"
+        );
+        assert_eq!(
+            hits[0].matched_range,
+            (0, 20),
+            "merged range must be the full union of all three"
+        );
         assert_eq!(redacted, format!("[REDACTED:{}]", hits[0].pattern_name));
         for fragment in ["ppppp", "qqqqq", "rr", "sss", "ttttt"] {
-            assert!(!redacted.contains(fragment), "fragment '{fragment}' survived redaction: {redacted}");
+            assert!(
+                !redacted.contains(fragment),
+                "fragment '{fragment}' survived redaction: {redacted}"
+            );
         }
     }
 }

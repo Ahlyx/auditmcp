@@ -28,7 +28,11 @@ impl RpcMessage {
     }
 
     pub fn tool_name(&self) -> Option<String> {
-        self.params.as_ref()?.get("name")?.as_str().map(|s| s.to_string())
+        self.params
+            .as_ref()?
+            .get("name")?
+            .as_str()
+            .map(|s| s.to_string())
     }
 
     pub fn arguments(&self) -> Option<&Value> {

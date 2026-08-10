@@ -97,7 +97,9 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         db::open_readonly(Path::new(&config.logging.db_path))
             .and_then(|conn| db::load_allowlist(&conn))
             .unwrap_or_else(|e| {
-                tracing::warn!("failed to load secret allowlist ({e}); starting with an empty allowlist");
+                tracing::warn!(
+                    "failed to load secret allowlist ({e}); starting with an empty allowlist"
+                );
                 HashSet::new()
             }),
     );
@@ -338,7 +340,11 @@ pub(crate) fn build_entry(
     // fired anywhere in this call or the call errored. Anomalies (a
     // leaked secret, a failing tool call) must never be hidden by
     // truncation, regardless of what the user configured for this tool.
-    let effective_tier = if secrets_fired || is_error { Tier::Full } else { configured_tier };
+    let effective_tier = if secrets_fired || is_error {
+        Tier::Full
+    } else {
+        configured_tier
+    };
 
     // Truncation runs AFTER redaction, on the already-redacted values,
     // so it can never slice a secret in half before detection catches
