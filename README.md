@@ -86,10 +86,36 @@ auditmcp serve --config config.toml
 
 Then point each MCP client at `http://127.0.0.1:8787` instead of the
 upstream. Each listener mirrors exactly one upstream at the origin level —
-every path and method forwarded, only scheme and host swapped — which is
-what keeps OAuth discovery (`/.well-known/...`) working through the proxy.
-Headers pass through untouched, including `Authorization`, and **no header
-is ever captured or stored**; only bodies are logged.
+every path and method forwarded, only scheme and host swapped. Headers pass
+through untouched, including `Authorization`, and **no header is ever
+captured or stored**; only bodies are logged.
+
+### Which servers can be proxied
+
+| Server authentication | Through auditmcp |
+|---|---|
+| None | Works |
+| Static header / personal access token | Works — header forwarded untouched, never stored |
+| Interactive OAuth | **Not supported** — see below |
+
+**Interactive OAuth cannot be transparently proxied, by anyone.** A local
+proxy makes the client's URL and the server's advertised canonical identity
+disagree by construction, and MCP clients validate that those agree before
+requesting a token — so the session fails during discovery, before any token
+exists. A transparent proxy and a metadata-spoofing attacker look identical
+from the client's side; the check exists to stop the attack and cannot tell
+the two apart. Neither side is wrong, and no choice of provider changes it.
+
+auditmcp will not work around this by rewriting the challenge or the
+resource metadata: that would make discovery succeed by defeating the
+audience binding it exists to enforce.
+
+Servers authenticated with a token you supply as a header are unaffected,
+because that path never enters OAuth discovery.
+
+Full write-up, including the mechanism, the SDK version and line, both
+clients tested, and the control run:
+**[docs/oauth-and-transparent-proxies.md](docs/oauth-and-transparent-proxies.md)**.
 
 Listeners are independent: correlation state is never shared between them,
 so two servers using the same JSON-RPC ids cannot be confused for each
@@ -254,9 +280,10 @@ phased spec.
 ### Not yet built
 
 - **HTTPS upstreams.** TLS is not wired up; `serve` refuses an `https://`
-  upstream at startup rather than failing later.
-  Remote servers therefore aren't reachable yet, which also means OAuth
-  against a real provider is untested.
+  upstream at startup rather than failing later, so remote servers aren't
+  reachable yet. This is about reaching them at all — it does not affect
+  the OAuth limitation above, which is a client-side check that TLS has no
+  bearing on.
 - **Phase 3 — anomaly detection.** The `anomaly_score` / `anomaly_reasons`
   columns exist in the schema and are always `NULL`; they were added on day
   one specifically to avoid a migration later. `query --anomalous` and
