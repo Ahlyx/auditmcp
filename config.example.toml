@@ -34,6 +34,31 @@ command = ["python", "test-fixtures/fake_server.py"]
 # rows indistinguishable.
 server_name = "fake_server"
 
+# HTTP MCP servers, for `auditmcp serve`. One entry per upstream; each gets
+# its own loopback port that mirrors that upstream at the origin level (every
+# path and method forwarded, only scheme and host swapped). Point your MCP
+# client at the `listen` address instead of the upstream.
+#
+# Convention is to start at 8787 and count upward. `listen` is required
+# rather than defaulted so two servers can never silently share a port.
+# Binding anywhere but loopback is refused: auditmcp has no authentication,
+# so a wider bind would be an open proxy to your MCP servers.
+#
+# Ignored by `run`, exactly as [target] is ignored by `serve`.
+#
+# [[server]]
+# name     = "github"
+# upstream = "http://127.0.0.1:3000/mcp"
+# listen   = "127.0.0.1:8787"
+#
+# [[server]]
+# name     = "vault"
+# upstream = "http://127.0.0.1:3001/mcp"
+# listen   = "127.0.0.1:8788"
+# # Origins accepted on inbound requests. Defaults to loopback only, which
+# # is what stops a page in your browser from driving your MCP servers.
+# # allowed_origins = ["http://localhost"]
+
 [logging]
 # Point every server's config at the same file (see note above). Prefer an
 # absolute path when sharing, so configs run from different directories

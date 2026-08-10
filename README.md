@@ -63,6 +63,39 @@ MCP config. A Claude Code `.mcp.json` entry looks like:
 }
 ```
 
+### HTTP servers
+
+For MCP servers that speak HTTP rather than stdio, `serve` runs one loopback
+listener per upstream out of a single process:
+
+```toml
+[[server]]
+name     = "github"
+upstream = "http://127.0.0.1:3000/mcp"
+listen   = "127.0.0.1:8787"
+
+[[server]]
+name     = "vault"
+upstream = "http://127.0.0.1:3001/mcp"
+listen   = "127.0.0.1:8788"
+```
+
+```bash
+auditmcp serve --config config.toml
+```
+
+Then point each MCP client at `http://127.0.0.1:8787` instead of the
+upstream. Each listener mirrors exactly one upstream at the origin level —
+every path and method forwarded, only scheme and host swapped — which is
+what keeps OAuth discovery (`/.well-known/...`) working through the proxy.
+Headers pass through untouched, including `Authorization`, and **no header
+is ever captured or stored**; only bodies are logged.
+
+Listeners are independent: correlation state is never shared between them,
+so two servers using the same JSON-RPC ids cannot be confused for each
+other. Binding anywhere but loopback is refused, since auditmcp has no
+authentication of its own.
+
 Then read the log back:
 
 ```bash
@@ -205,8 +238,16 @@ phased spec.
 
 ### Not yet built
 
-- **HTTP/SSE transport** (the one remaining Phase 2 item). Only stdio servers
-  can be proxied today.
+- **SSE responses.** `serve` reads each response to completion before
+  returning it, so a `text/event-stream` response would be buffered until
+  the upstream closed the stream. Streaming — and with it the legacy
+  HTTP+SSE transport, whose `endpoint` event needs rewriting so clients
+  don't bypass the proxy — is the next piece of work. Non-streaming
+  Streamable HTTP servers work today.
+- **HTTPS upstreams.** TLS is not wired up; `serve` refuses an `https://`
+  upstream at startup rather than failing later. Remote servers therefore
+  aren't reachable yet, which also means OAuth against a real provider is
+  untested.
 - **Phase 3 — anomaly detection.** The `anomaly_score` / `anomaly_reasons`
   columns exist in the schema and are always `NULL`; they were added on day
   one specifically to avoid a migration later. `query --anomalous` and

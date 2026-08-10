@@ -2,11 +2,13 @@ mod audit;
 mod config;
 mod db;
 mod export;
+mod http;
 mod jsonrpc;
 mod proxy;
 mod query;
 mod secrets;
 mod session;
+mod shutdown;
 mod truncate;
 mod unmask;
 mod verify;
@@ -36,6 +38,13 @@ enum Command {
         /// config file is used instead.
         #[arg(trailing_var_arg = true)]
         target: Vec<String>,
+    },
+    /// Reverse-proxy one or more HTTP MCP servers, logging every tool call.
+    /// Binds one loopback port per `[[server]]` in the config; each mirrors
+    /// exactly one upstream. Runs until stopped.
+    Serve {
+        #[arg(long)]
+        config: PathBuf,
     },
     /// Read logged tool calls back in a table format
     Query {
@@ -135,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Run { config, target } => proxy::run(&config, target).await,
+        Command::Serve { config } => http::serve(&config).await,
         Command::Query {
             config,
             tool,

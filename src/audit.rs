@@ -51,12 +51,6 @@ const PREVIEW_BYTES: usize = 200;
 /// error page can echo back a request header carrying a bearer token.
 pub(crate) enum Payload {
     Json(Value),
-    // Not constructed outside tests until an HTTP transport lands. The
-    // variant exists now so `build_entry` dispatches over both payload
-    // shapes from the start — adding the second shape later would mean
-    // reworking the pipeline's core with the transports already depending
-    // on it. Its behavior is covered by this module's tests.
-    #[allow(dead_code)]
     Raw(String),
 }
 
@@ -214,6 +208,25 @@ impl CallOutcome {
     /// captured when the request went out and are still recorded, which is
     /// the point of writing this row at all. `Timeout` escalates to the
     /// `full` tier, so those args are stored untruncated.
+    /// A response body that is not JSON-RPC at all: a gateway's HTML error
+    /// page, a wrong `Content-Type`, a body cut short. Only HTTP can
+    /// produce this — stdio MCP is JSON-RPC end to end.
+    ///
+    /// Classified `Error` because a tool call whose response could not be
+    /// parsed did not return a result, whatever the HTTP status said. The
+    /// body is kept rather than discarded: it is the only evidence of what
+    /// went wrong, and it goes through the same detection and redaction as
+    /// any other payload, because error pages echo request headers and
+    /// those carry credentials.
+    pub(crate) fn non_json(body: String, bytes_out: i64) -> Self {
+        CallOutcome {
+            status: CallStatus::Error,
+            result: None,
+            error: Some(Payload::Raw(body)),
+            bytes_out: Some(bytes_out),
+        }
+    }
+
     pub(crate) fn timed_out() -> Self {
         CallOutcome {
             status: CallStatus::Timeout,

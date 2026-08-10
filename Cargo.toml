@@ -21,6 +21,17 @@ clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
+# HTTP transport. hyper directly rather than a framework: this proxy's value
+# is that it does not alter traffic, and higher-level clients default to
+# following redirects, decompressing bodies and normalizing headers -- all
+# wrong here, and doubly so since MCP 2026-07-28 has servers reject requests
+# whose headers disagree with their body. Pure Rust, no C dependency, so
+# cross-compiled release binaries stay simple.
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
