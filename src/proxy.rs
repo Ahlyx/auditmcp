@@ -17,6 +17,11 @@
 //! Truncating at capture time, like Phase 1 did, would make that ordering
 //! impossible: you can't retroactively un-truncate a value to redact a
 //! secret that only got cut off by the earlier preview.
+//!
+//! If the target server exits with calls still in flight, those calls are
+//! logged as `timeout` rows rather than vanishing — a tool call that was
+//! issued and never answered is exactly the kind of gap an audit log is
+//! supposed to show. See the drain at the end of `run`.
 
 use crate::audit::{self, CallOutcome};
 use crate::config::Config;
@@ -44,7 +49,7 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // unambiguous. See `session.rs` for why the scope has to exist anyway.
     let session = Arc::new(Session::new(uuid::Uuid::new_v4().to_string()));
     let server_name = config.server_name_for(program);
-    let db = db::spawn_writer(Path::new(&config.logging.db_path));
+    let (db, writer) = db::spawn_writer(Path::new(&config.logging.db_path));
 
     // Fail-open: a corrupt/unparseable bundled patterns file must not take
     // the whole proxy down. Falling back to an empty pattern set (which
@@ -99,11 +104,11 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     let outbound = tokio::spawn(pump_child_to_client(
         child_stdout,
         Arc::clone(&session),
-        db,
-        server_name,
+        db.clone(),
+        server_name.clone(),
         Arc::clone(&config),
-        patterns,
-        allowlist,
+        Arc::clone(&patterns),
+        Arc::clone(&allowlist),
     ));
 
     let status = child
@@ -121,9 +126,49 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     inbound.abort();
     let _ = outbound.await;
 
+    // Both pumps have now stopped, which is what makes this safe to do
+    // here and nowhere else. Nothing can still be registering a call
+    // (inbound is aborted) and nothing can still be resolving one
+    // (outbound has run to completion, and it processes each message to
+    // its `db.log` before reading the next). So the map holds exactly the
+    // calls that never got a response, with no window in which a landing
+    // response could be logged twice — once by `resolve` and again here.
+    //
+    // Draining inside the outbound pump at EOF would look more natural and
+    // would be wrong: the inbound pump is still live at that moment and
+    // could register a fresh call after the drain, which would then never
+    // be recorded at all.
+    let abandoned = session.drain_abandoned().await;
+    if !abandoned.is_empty() {
+        tracing::warn!(
+            "target server exited with {} tool call(s) still in flight; \
+             logging them as timeouts",
+            abandoned.len()
+        );
+        for call in abandoned {
+            let configured_tier = config.tier_for_tool(&call.tool_name);
+            db.log(audit::build_entry(
+                call,
+                CallOutcome::timed_out(),
+                session.id(),
+                &server_name,
+                configured_tier,
+                &patterns,
+                &allowlist,
+            ));
+        }
+    }
+
     if !status.success() {
         tracing::warn!("target command exited with status {status}");
     }
+
+    // Drop the last sender so the writer's channel closes, then wait for it
+    // to finish. Without this the queue is discarded when the process
+    // exits — see `DbWriter`. The drop must come first: joining with a live
+    // sender would hang forever.
+    drop(db);
+    writer.join();
 
     Ok(())
 }

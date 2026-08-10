@@ -110,12 +110,9 @@ pub(crate) enum CallStatus {
     /// tool's own failure inside an otherwise-successful response via
     /// `isError: true`. Both are tool-call failures for the audit log.
     Error,
-    /// No response ever arrived and the call was abandoned. Written by the
-    /// pending-call sweeper.
-    // Not constructed outside tests until the sweeper lands; the variant
-    // exists now so the escalation rule below covers its full input domain
-    // from the start rather than gaining untested branches later.
-    #[allow(dead_code)]
+    /// No complete response ever arrived and the call was abandoned — the
+    /// server exited or the stream died while the call was in flight. See
+    /// `CallOutcome::timed_out`.
     Timeout,
     /// The response was not the tool's result: the call returned a handle
     /// (an `io.modelcontextprotocol/tasks` task handle) and the real result
@@ -180,6 +177,29 @@ impl CallOutcome {
             result: msg.result.clone().map(Payload::Json),
             error: msg.error.clone().map(Payload::Json),
             bytes_out: Some(bytes_out),
+        }
+    }
+
+    /// A call that never completed. Every response-side field is `None`,
+    /// including `bytes_out`: no response message closed this call, so
+    /// there is no message whose size could be reported.
+    ///
+    /// That holds even when some bytes were forwarded. If a server dies
+    /// mid-response, the partial bytes reach the client but never parse,
+    /// which means we never read an `id` from them — so those bytes cannot
+    /// be attributed to this call or any other. Recording them against a
+    /// guess would be inventing evidence in an audit log.
+    ///
+    /// The request side is untouched: `args_json` and `bytes_in` were
+    /// captured when the request went out and are still recorded, which is
+    /// the point of writing this row at all. `Timeout` escalates to the
+    /// `full` tier, so those args are stored untruncated.
+    pub(crate) fn timed_out() -> Self {
+        CallOutcome {
+            status: CallStatus::Timeout,
+            result: None,
+            error: None,
+            bytes_out: None,
         }
     }
 }

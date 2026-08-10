@@ -90,6 +90,24 @@ impl Session {
     pub(crate) async fn resolve(&self, id_key: &str) -> Option<PendingCall> {
         self.pending.lock().await.remove(id_key)
     }
+
+    /// Takes every call still awaiting a response, leaving the session
+    /// empty. Called when no further response can arrive — for stdio, once
+    /// the child has exited and both pumps have stopped.
+    ///
+    /// **A completed call can never appear here.** `resolve` removes on
+    /// success, so a call that got its response is already out of the map
+    /// by the time anything drains it; there is no flag to check and no
+    /// window to get wrong. Whatever this returns is, by construction,
+    /// exactly the set of calls that never completed.
+    ///
+    /// Ordering the drain after the readers have stopped is the caller's
+    /// responsibility, and it is what rules out the converse race — a
+    /// response arriving mid-drain and being logged twice, once by
+    /// `resolve` and once here.
+    pub(crate) async fn drain_abandoned(&self) -> Vec<PendingCall> {
+        self.pending.lock().await.drain().map(|(_, c)| c).collect()
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +164,70 @@ mod tests {
         assert_eq!(
             a.resolve("1").await.map(|c| c.tool_name),
             Some("delete_file".to_string())
+        );
+    }
+
+    /// The invariant the drain depends on: a call that got its response is
+    /// already gone from the map, so it cannot also be reported abandoned.
+    #[tokio::test]
+    async fn drain_never_returns_a_call_that_was_resolved() {
+        let s = Session::new("sess-1".to_string());
+        s.register("1".to_string(), call("completed")).await;
+        s.register("2".to_string(), call("abandoned")).await;
+
+        let resolved = s.resolve("1").await;
+        assert_eq!(resolved.map(|c| c.tool_name), Some("completed".to_string()));
+
+        let drained: Vec<String> = s
+            .drain_abandoned()
+            .await
+            .into_iter()
+            .map(|c| c.tool_name)
+            .collect();
+        assert_eq!(
+            drained,
+            vec!["abandoned".to_string()],
+            "a completed call must never be swept into a timeout row"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_empties_the_session_so_it_cannot_double_report() {
+        let s = Session::new("sess-1".to_string());
+        s.register("1".to_string(), call("echo")).await;
+
+        assert_eq!(s.drain_abandoned().await.len(), 1);
+        assert!(
+            s.drain_abandoned().await.is_empty(),
+            "draining twice must not produce the same call twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_with_nothing_in_flight_yields_nothing() {
+        let s = Session::new("sess-1".to_string());
+        s.register("1".to_string(), call("echo")).await;
+        let _ = s.resolve("1").await;
+        assert!(s.drain_abandoned().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_is_scoped_to_its_own_session() {
+        let a = Session::new("sess-a".to_string());
+        let b = Session::new("sess-b".to_string());
+        a.register("1".to_string(), call("a_tool")).await;
+        b.register("1".to_string(), call("b_tool")).await;
+
+        let drained: Vec<String> = a
+            .drain_abandoned()
+            .await
+            .into_iter()
+            .map(|c| c.tool_name)
+            .collect();
+        assert_eq!(drained, vec!["a_tool".to_string()]);
+        assert!(
+            b.resolve("1").await.is_some(),
+            "draining one session must not touch another's in-flight calls"
         );
     }
 
