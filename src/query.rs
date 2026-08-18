@@ -15,12 +15,14 @@ use std::collections::HashSet;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config_path: &Path,
     tool: Option<String>,
     session: Option<String>,
     since: Option<String>,
     status: Option<String>,
+    anomalous: bool,
     verbose: bool,
 ) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
@@ -40,6 +42,7 @@ pub fn run(
         None,
         since_cutoff,
         status.as_deref(),
+        anomalous,
     );
 
     if filtered.is_empty() {
@@ -85,6 +88,14 @@ pub fn run(
             row.id, row.entry.timestamp, row.entry.tool_name, row.entry.status, duration, preview
         );
 
+        if anomalous {
+            if let Some(summary) = anomaly_summary(
+                row.entry.anomaly_score,
+                row.entry.anomaly_reasons.as_deref(),
+            ) {
+                let _ = writeln!(out, "      {summary}");
+            }
+        }
         if verbose {
             if let Some(summary) =
                 redaction_summary(row.entry.redaction_flags.as_deref(), &allowlist)
@@ -106,6 +117,12 @@ pub fn run(
 /// so the two commands can never quietly diverge on what e.g. `--status
 /// error` means. `export` is the only caller that passes `server` (query
 /// has no `--server` flag), so it's always `None` from `query::run`.
+///
+/// `anomalous_only` maps to `WHERE anomaly_score IS NOT NULL`, the shape
+/// documented at the anomaly module: rows with no rule fired have both
+/// score and reasons columns NULL, so absence and presence are the exact
+/// filter contract, not a comparison against zero.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn filter_rows(
     rows: Vec<StoredRow>,
     tool: Option<&str>,
@@ -113,12 +130,14 @@ pub(crate) fn filter_rows(
     server: Option<&str>,
     since_cutoff: Option<DateTime<Utc>>,
     status: Option<&str>,
+    anomalous_only: bool,
 ) -> Vec<StoredRow> {
     rows.into_iter()
         .filter(|r| tool.is_none() || tool == Some(r.entry.tool_name.as_str()))
         .filter(|r| session.is_none() || session == Some(r.entry.session_id.as_str()))
         .filter(|r| server.is_none() || server == r.entry.server_name.as_deref())
         .filter(|r| status.is_none() || status == Some(r.entry.status.as_str()))
+        .filter(|r| !anomalous_only || r.entry.anomaly_score.is_some())
         .filter(|r| match since_cutoff {
             None => true,
             Some(cutoff) => match DateTime::parse_from_rfc3339(&r.entry.timestamp) {
@@ -174,6 +193,36 @@ fn redaction_summary(redaction_flags: Option<&str>, allowlist: &HashSet<String>)
         .collect();
 
     Some(format!("[secrets: {}]", parts.join(", ")))
+}
+
+/// Row shape stored in `anomaly_reasons`, mirroring
+/// `anomaly::Reason`. Deserialized here rather than shared as a type
+/// because the anomaly module writes `&'static str` rule names, while
+/// the read side must own its strings.
+#[derive(serde::Deserialize)]
+struct StoredReason {
+    rule: String,
+    #[allow(dead_code)]
+    detail: String,
+}
+
+/// Renders `--anomalous`'s per-row summary, e.g.
+/// `[anomaly: 2.0 -- size_spike, novel_destination]`. Returns `None` when
+/// the score is absent (the row wasn't flagged) or when the reasons
+/// column fails to parse -- best-effort display, never fatal to the rest
+/// of the query. A score with unparseable reasons still renders the
+/// score, since the score alone is a documented column.
+fn anomaly_summary(score: Option<f64>, reasons: Option<&str>) -> Option<String> {
+    let score = score?;
+    let rules: Vec<String> = reasons
+        .and_then(|raw| serde_json::from_str::<Vec<StoredReason>>(raw).ok())
+        .map(|records| records.into_iter().map(|r| r.rule).collect())
+        .unwrap_or_default();
+    if rules.is_empty() {
+        Some(format!("[anomaly: {score:.1}]"))
+    } else {
+        Some(format!("[anomaly: {:.1} -- {}]", score, rules.join(", ")))
+    }
 }
 
 /// Truncates a string to at most `max_chars` characters for display,
@@ -289,5 +338,85 @@ mod tests {
             summary,
             "[secrets: openai_api_key(high, future occurrences not redacted)]"
         );
+    }
+
+    #[test]
+    fn anomaly_summary_is_none_when_score_is_missing() {
+        // The contract query --anomalous relies on: absent score means the
+        // row wasn't flagged, and no rendering happens.
+        assert_eq!(anomaly_summary(None, None), None);
+        assert_eq!(anomaly_summary(None, Some("irrelevant")), None);
+    }
+
+    #[test]
+    fn anomaly_summary_renders_score_and_rule_names() {
+        let reasons = r#"[
+            {"rule":"size_spike","detail":"bytes_out=1000 exceeds 5× mean (100)"},
+            {"rule":"novel_destination","detail":"destination 'x' not seen"}
+        ]"#;
+        let summary = anomaly_summary(Some(2.0), Some(reasons)).unwrap();
+        assert_eq!(summary, "[anomaly: 2.0 -- size_spike, novel_destination]");
+    }
+
+    /// If the reasons column somehow fails to parse, the score is still a
+    /// column and worth reporting — better to say "flagged, details lost"
+    /// than to omit the whole row's annotation and read as unflagged.
+    #[test]
+    fn anomaly_summary_falls_back_to_score_alone_on_bad_reasons_json() {
+        let summary = anomaly_summary(Some(1.0), Some("not json")).unwrap();
+        assert_eq!(summary, "[anomaly: 1.0]");
+    }
+
+    fn stored_row(id: i64, anomaly_score: Option<f64>) -> StoredRow {
+        StoredRow {
+            id,
+            entry: crate::db::ToolCallEntry {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                session_id: "s".to_string(),
+                agent_id: None,
+                tool_name: "echo".to_string(),
+                server_name: Some("srv".to_string()),
+                args_json: None,
+                result_json: None,
+                status: "success".to_string(),
+                error_message: None,
+                duration_ms: Some(1),
+                bytes_in: Some(0),
+                bytes_out: Some(0),
+                source: None,
+                destination: None,
+                redaction_flags: None,
+                redaction_count: 0,
+                anomaly_score,
+                anomaly_reasons: None,
+            },
+            hash: String::new(),
+            prev_hash: None,
+        }
+    }
+
+    /// The one filter the anomalous flag adds: rows with a non-NULL
+    /// anomaly_score survive, rows without one are dropped.
+    #[test]
+    fn anomalous_only_filters_to_flagged_rows() {
+        let rows = vec![
+            stored_row(1, None),
+            stored_row(2, Some(1.0)),
+            stored_row(3, None),
+            stored_row(4, Some(3.0)),
+        ];
+        let filtered = filter_rows(rows, None, None, None, None, None, true);
+        let ids: Vec<i64> = filtered.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![2, 4]);
+    }
+
+    /// The pre-Phase-3 behavior: `anomalous_only=false` keeps every row
+    /// regardless of anomaly state, so callers that don't want the filter
+    /// (default query, default export) behave exactly as before.
+    #[test]
+    fn anomalous_only_false_preserves_pre_phase_3_behavior() {
+        let rows = vec![stored_row(1, None), stored_row(2, Some(1.0))];
+        let filtered = filter_rows(rows, None, None, None, None, None, false);
+        assert_eq!(filtered.len(), 2);
     }
 }

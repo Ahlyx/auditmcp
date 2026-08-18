@@ -157,6 +157,7 @@ Then read the log back:
 ```bash
 auditmcp query  --config config.toml                    # table of tool calls
 auditmcp query  --config config.toml --verbose          # + what was redacted and why
+auditmcp query  --config config.toml --anomalous        # only rows the Phase 3 rules flagged
 auditmcp query  --config config.toml --tool delete_file --since 2h --status error
 auditmcp verify --config config.toml                    # walk the hash chain
 auditmcp export --config config.toml --format jsonl --output audit.jsonl
@@ -289,14 +290,33 @@ Phases 1 and 2 are complete. Phases 3 and 4 are unstarted.
   touches the derived index, never `tool_calls` or any hash. Refuses to run
   at all if chain verification failed.
 - **Multi-server support** — see below.
+- **Anomaly detection (Phase 3)** — three session-scoped rules, all
+  rule-based and explainable. `size_spike` fires when `bytes_out` for a
+  tool exceeds 5× its running mean once at least five prior samples have
+  armed the baseline (Welford's for the mean). `novel_destination` fires
+  the second time a session sees a distinct destination that isn't in
+  its prior set (the first destination establishes the baseline).
+  `rapid_repeats` fires when the last five calls to the same tool land
+  inside a 10-second window. Anomaly state is per session, held on the
+  `Session` itself, and scoring runs at write time so `query --anomalous`
+  reduces to a `WHERE anomaly_score IS NOT NULL` filter — same filter
+  available on `export --anomalous`. Populates the `anomaly_score` and
+  `anomaly_reasons` columns that were in the schema from day one.
+- **Best-effort destination extraction.** Populates the `destination`
+  column from top-level string args under `path`, `url`, `host`, `file`,
+  `target`, or `uri`. Runs after redaction, so a path that contained a
+  secret cannot leak plaintext through this column. Nested keys aren't
+  walked and array-valued destinations aren't extracted — both would
+  trade quiet false positives for more coverage — so tools like
+  `read_multiple_notes` don't populate `destination` and rule 2 is
+  documented to miss those.
 
 ### Not yet built
 
-- **A user-updatable patterns file** — see above.
-- **Phase 3 — anomaly detection.** The `anomaly_score` / `anomaly_reasons`
-  columns exist in the schema and are always `NULL`; they were added on day
-  one specifically to avoid a migration later. `query --anomalous` and
-  `watch` do not exist.
+- **`auditmcp watch`** — a live tail of tool calls as they happen, with
+  anomalies highlighted, as suggested in the phased spec alongside
+  `query --anomalous`. `query --anomalous` and `export --anomalous`
+  cover the read-side story today.
 - **A user-updatable patterns file.** The spec calls for one; `patterns.toml`
   is currently compiled into the binary with `include_str!` and there is no
   config key pointing at a user copy. Editing `patterns.toml` and rebuilding

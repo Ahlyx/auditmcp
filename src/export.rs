@@ -153,6 +153,7 @@ impl ExportRow {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config_path: &Path,
     format: ExportFormat,
@@ -160,6 +161,7 @@ pub fn run(
     since: Option<String>,
     status: Option<String>,
     server: Option<String>,
+    anomalous: bool,
     output: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     // Exhaustive match on purpose, even with one variant today: adding a
@@ -181,6 +183,7 @@ pub fn run(
         server.as_deref(),
         since_cutoff,
         status.as_deref(),
+        anomalous,
     );
 
     match output {
@@ -352,6 +355,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             Some(output_path.clone()),
         )
         .unwrap();
@@ -391,6 +395,7 @@ mod tests {
             None,
             Some("error".to_string()),
             None,
+            false,
             Some(output_path.clone()),
         )
         .unwrap();
@@ -448,6 +453,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             Some(output_path.clone()),
         )
         .unwrap();
@@ -492,6 +498,7 @@ mod tests {
             None,
             None,
             Some("vault_reader".to_string()),
+            false,
             Some(output_path.clone()),
         )
         .unwrap();
@@ -571,6 +578,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             Some(output_path.clone()),
         );
         assert!(
@@ -620,6 +628,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             Some(output_path.clone()),
         );
         assert!(result.is_err());

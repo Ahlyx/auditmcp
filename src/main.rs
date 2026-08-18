@@ -60,6 +60,12 @@ enum Command {
         since: Option<String>,
         #[arg(long)]
         status: Option<String>,
+        /// Show only rows that Phase 3's anomaly rules flagged (i.e. rows
+        /// with a non-NULL `anomaly_score`). Each matching row is annotated
+        /// with the score and the rule names that fired; --verbose still
+        /// controls whether the secrets summary appears.
+        #[arg(long)]
+        anomalous: bool,
         /// Show a compact per-row secrets-detection summary (pattern,
         /// severity) for rows with redactions. Default output never shows
         /// this -- it stays clean and safe to glance at or paste elsewhere.
@@ -100,6 +106,11 @@ enum Command {
         status: Option<String>,
         #[arg(long)]
         server: Option<String>,
+        /// Restrict to rows Phase 3's anomaly rules flagged. Same
+        /// contract as `query --anomalous`, kept parallel so the two
+        /// commands can never quietly filter to different sets.
+        #[arg(long)]
+        anomalous: bool,
         /// Write to this file instead of stdout. Written atomically: a
         /// temp file in the same directory is renamed into place only on
         /// success, so an aborted export never leaves a truncated file
@@ -153,8 +164,9 @@ async fn main() -> anyhow::Result<()> {
             session,
             since,
             status,
+            anomalous,
             verbose,
-        } => query::run(&config, tool, session, since, status, verbose),
+        } => query::run(&config, tool, session, since, status, anomalous, verbose),
         Command::Verify {
             config,
             repair_index,
@@ -177,8 +189,11 @@ async fn main() -> anyhow::Result<()> {
             since,
             status,
             server,
+            anomalous,
             output,
-        } => export::run(&config, format, tool, since, status, server, output),
+        } => export::run(
+            &config, format, tool, since, status, server, anomalous, output,
+        ),
         Command::Unmask { config, hash, note } => unmask::run(&config, &hash, &note),
     }
 }
