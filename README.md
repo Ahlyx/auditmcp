@@ -305,13 +305,11 @@ Phases 1 and 2 are complete. Phases 3 and 4 are unstarted.
   failure can only mean a broken build today, not a user's typo.
 - **Phase 4 — Lua policy layer.** No `mlua` dependency yet, by design.
 
-Two functions — `truncate::truncate_raw_sampled` and
-`secrets::scan_and_redact_text` — are written and unit-tested but not yet
-called anywhere. They are the non-JSON payload paths, and stdio MCP is
-JSON-RPC end to end, so nothing reaches them under the current transport.
-They become live when HTTP/SSE lands, where a response body genuinely can be
-non-JSON. They are marked `#[allow(dead_code)]` with that reason at each
-site rather than left as a silent surprise.
+The non-JSON payload path — `truncate::truncate_raw_sampled` and
+`secrets::scan_and_redact_text` — handles HTTP response bodies that aren't
+JSON (an upstream 502 HTML page, a stack trace, an unexpected content
+type). Stdio MCP is JSON-RPC end to end so it never exercises this path;
+`serve` does, whenever the upstream returns non-JSON.
 
 ### How it has been verified
 
