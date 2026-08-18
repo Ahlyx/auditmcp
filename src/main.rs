@@ -1,3 +1,4 @@
+mod anomaly;
 mod audit;
 mod config;
 mod db;

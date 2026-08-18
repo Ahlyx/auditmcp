@@ -184,7 +184,7 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         );
         for call in abandoned {
             let configured_tier = config.tier_for_tool(&call.tool_name);
-            db.log(audit::build_entry(
+            let mut entry = audit::build_entry(
                 call,
                 CallOutcome::timed_out(),
                 session.id(),
@@ -192,7 +192,9 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
                 configured_tier,
                 &patterns,
                 &allowlist,
-            ));
+            );
+            session.attach_anomaly(&mut entry, std::time::Instant::now());
+            db.log(entry);
         }
     }
 
@@ -333,7 +335,7 @@ async fn pump_child_to_client(
         };
 
         let configured_tier = config.tier_for_tool(&call.tool_name);
-        let entry = audit::build_entry(
+        let mut entry = audit::build_entry(
             call,
             CallOutcome::from_rpc(&msg, buf.len() as i64),
             session.id(),
@@ -342,7 +344,7 @@ async fn pump_child_to_client(
             &patterns,
             &allowlist,
         );
-
+        session.attach_anomaly(&mut entry, std::time::Instant::now());
         db.log(entry);
     }
 }

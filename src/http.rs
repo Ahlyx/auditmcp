@@ -563,7 +563,7 @@ impl Tee {
             if let Ok(msg) = serde_json::from_str::<RpcMessage>(payload) {
                 if let Some(call) = msg.id_key().and_then(|k| self.session.resolve(&k)) {
                     let outcome = CallOutcome::from_rpc(&msg, payload.len() as i64);
-                    log_entry(&self.listener, self.session.id(), call, outcome);
+                    log_entry(&self.listener, &self.session, call, outcome);
                 }
             }
         }
@@ -627,7 +627,7 @@ impl Tee {
             tokio::spawn(async move {
                 if listener.sessions.unbind_endpoint(&key).await.is_some() {
                     for call in session.drain_abandoned() {
-                        log_timeout(&listener, session.id(), call);
+                        log_timeout(&listener, &session, call);
                     }
                 }
             });
@@ -664,7 +664,7 @@ impl Tee {
                 self.bytes_out,
             ),
         };
-        log_entry(&self.listener, self.session.id(), call, outcome);
+        log_entry(&self.listener, &self.session, call, outcome);
     }
 }
 
@@ -738,7 +738,7 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     for listener in &listeners {
         for session in listener.sessions.take_all().await {
             for call in session.drain_abandoned() {
-                log_timeout(listener, session.id(), call);
+                log_timeout(listener, &session, call);
             }
         }
     }
@@ -868,7 +868,7 @@ async fn accept_loop(
             // went away mid-request. Those calls happened and were never
             // answered, which is exactly what `timeout` records.
             for call in listener.sessions.close(key).await {
-                log_timeout(&listener, session.id(), call);
+                log_timeout(&listener, &session, call);
             }
         });
     }
@@ -1046,24 +1046,27 @@ fn register_if_tool_call(
     Some(id_key)
 }
 
-fn log_timeout(listener: &Listener, session_id: &str, call: PendingCall) {
-    log_entry(listener, session_id, call, CallOutcome::timed_out());
+fn log_timeout(listener: &Listener, session: &Session, call: PendingCall) {
+    log_entry(listener, session, call, CallOutcome::timed_out());
 }
 
 /// The single place this transport turns a completed call into a row, so
-/// the tier lookup and the pipeline inputs cannot drift between the
-/// streaming path, the event path and the shutdown drain.
-fn log_entry(listener: &Listener, session_id: &str, call: PendingCall, outcome: CallOutcome) {
+/// the tier lookup, the pipeline inputs, and the anomaly attachment
+/// cannot drift between the streaming path, the event path and the
+/// shutdown drain.
+fn log_entry(listener: &Listener, session: &Session, call: PendingCall, outcome: CallOutcome) {
     let tier = listener.config.tier_for_tool(&call.tool_name);
-    listener.db.log(audit::build_entry(
+    let mut entry = audit::build_entry(
         call,
         outcome,
-        session_id,
+        session.id(),
         &listener.server_name,
         tier,
         &listener.patterns,
         &listener.allowlist,
-    ));
+    );
+    session.attach_anomaly(&mut entry, Instant::now());
+    listener.db.log(entry);
 }
 
 /// Swaps scheme and authority for the upstream's, keeping path and query
@@ -1136,7 +1139,7 @@ mod tests {
         for listener in listeners {
             for session in listener.sessions.take_all().await {
                 for call in session.drain_abandoned() {
-                    log_timeout(listener, session.id(), call);
+                    log_timeout(listener, &session, call);
                 }
             }
         }

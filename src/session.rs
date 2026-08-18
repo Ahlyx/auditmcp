@@ -27,6 +27,8 @@
 //! the composite key returning as infrastructure. Design it deliberately
 //! instead.
 
+use crate::anomaly::SessionStats;
+use crate::db::ToolCallEntry;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -57,6 +59,12 @@ pub(crate) struct PendingCall {
 pub(crate) struct Session {
     id: String,
     pending: Mutex<HashMap<String, PendingCall>>,
+    /// Per-session anomaly baseline. Lives here rather than in a
+    /// process-wide registry for the same reason `pending` does — see the
+    /// module doc: state that is per-session must be owned by its session,
+    /// or a baseline built by one caller starts flagging another caller's
+    /// traffic against it.
+    stats: Mutex<SessionStats>,
 }
 
 impl Session {
@@ -64,11 +72,36 @@ impl Session {
         Session {
             id,
             pending: Mutex::new(HashMap::new()),
+            stats: Mutex::new(SessionStats::new()),
         }
     }
 
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Runs the session's anomaly rules against a built entry and, if any
+    /// rule fired, writes the score and reasons back into the entry
+    /// before it is persisted. Silent otherwise: no rule fired means both
+    /// columns stay NULL, which is what `query --anomalous` filters on.
+    ///
+    /// Serialization of the reasons uses `.ok()` deliberately: if it ever
+    /// failed (it cannot, for this shape, but a future refactor might),
+    /// the audit row still gets written — losing the anomaly annotation
+    /// on one row is strictly better than blocking the audit pipeline on
+    /// a JSON error, which is the fail-open contract this codebase runs
+    /// on end to end.
+    pub(crate) fn attach_anomaly(&self, entry: &mut ToolCallEntry, now: Instant) {
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(report) = stats.observe(
+            &entry.tool_name,
+            entry.bytes_out,
+            entry.destination.as_deref(),
+            now,
+        ) {
+            entry.anomaly_score = Some(report.score);
+            entry.anomaly_reasons = serde_json::to_string(&report.reasons).ok();
+        }
     }
 
     /// Starts tracking a request. `id_key` comes from
