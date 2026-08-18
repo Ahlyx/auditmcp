@@ -8,3 +8,5 @@ config.mcp-*.toml
 
 # Personal standing instructions (not project-specific)
 ENGINEERING-GUARDRAILS.md
+auditmcp-claude-code-prompt.md
+auditmcp-claude-code-prompt.md

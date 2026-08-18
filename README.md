@@ -249,9 +249,7 @@ unsigned initially, so SmartScreen may warn on first run.
 
 ## What state is it in?
 
-Phase 1 is complete. Phase 2 is complete except for HTTP/SSE transport.
-Phases 3 and 4 are unstarted. `auditmcp-claude-code-prompt.md` holds the full
-phased spec.
+Phases 1 and 2 are complete. Phases 3 and 4 are unstarted.
 
 ### Working
 
@@ -317,10 +315,15 @@ site rather than left as a silent surprise.
 
 ### How it has been verified
 
-`cargo test` runs 87 tests covering the hash chain (including concurrent
+`cargo test` runs 168 tests covering the hash chain (including concurrent
 writers against a shared DB and interleaved multi-server chains), secrets
 detection and its false-positive cases, truncation UTF-8 boundary safety,
-export fidelity, and unmask hash resolution.
+export fidelity, unmask hash resolution, `verify` exit codes and
+`--repair-index` semantics, and the HTTP transport — SSE parser
+resynchronization after an oversized event, per-listener id isolation so
+two upstreams reusing the same JSON-RPC ids never cross-attribute,
+`Host`-header rewriting to the upstream authority, and non-JSON upstream
+responses being logged as errors with their body.
 
 Beyond unit tests, the proxy has been exercised end to end on **native
 Windows** (Git Bash + PowerShell) and on an **Ubuntu VM**. The Linux run
