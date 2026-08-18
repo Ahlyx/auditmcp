@@ -291,25 +291,32 @@ Phases 1 and 2 are complete. Phases 3 and 4 are unstarted.
   at all if chain verification failed.
 - **Multi-server support** — see below.
 - **Anomaly detection (Phase 3)** — three session-scoped rules, all
-  rule-based and explainable. `size_spike` fires when `bytes_out` for a
-  tool exceeds 5× its running mean once at least five prior samples have
-  armed the baseline (Welford's for the mean). `novel_destination` fires
-  the second time a session sees a distinct destination that isn't in
-  its prior set (the first destination establishes the baseline).
-  `rapid_repeats` fires when the last five calls to the same tool land
-  inside a 10-second window. Anomaly state is per session, held on the
-  `Session` itself, and scoring runs at write time so `query --anomalous`
+  rule-based and explainable, tuned against real vault dogfood.
+  `size_spike` fires when `bytes_out` for a tool exceeds 5× its running
+  mean once at least five prior samples have armed the baseline
+  (Welford's for the mean). `novel_destination` fires when a
+  **network-shaped** destination (`url`, `host`, `uri`, `target`) not
+  seen in this session appears after a non-empty baseline — filesystem
+  destinations (`path`, `file`) are deliberately excluded because
+  writing a new note is the primary use case of a note-taking tool, and
+  firing on every new file path produced a 100% false-positive rate in
+  dogfood. `rapid_repeats` fires when the last five calls to the same
+  tool land inside a 10-second window, and then **cools down** for that
+  tool for the same window — one burst produces one flag, not one per
+  call from the fifth onward. Anomaly state is per session, held on the
+  `Session` itself; scoring runs at write time so `query --anomalous`
   reduces to a `WHERE anomaly_score IS NOT NULL` filter — same filter
   available on `export --anomalous`. Populates the `anomaly_score` and
   `anomaly_reasons` columns that were in the schema from day one.
 - **Best-effort destination extraction.** Populates the `destination`
   column from top-level string args under `path`, `url`, `host`, `file`,
-  `target`, or `uri`. Runs after redaction, so a path that contained a
-  secret cannot leak plaintext through this column. Nested keys aren't
-  walked and array-valued destinations aren't extracted — both would
-  trade quiet false positives for more coverage — so tools like
-  `read_multiple_notes` don't populate `destination` and rule 2 is
-  documented to miss those.
+  `target`, or `uri`, and tags each with a *kind* (filesystem or
+  network) that rule 2 above consults. Runs after redaction, so a path
+  that contained a secret cannot leak plaintext through this column.
+  Nested keys aren't walked and array-valued destinations aren't
+  extracted — both would trade quiet false positives for more coverage —
+  so tools like `read_multiple_notes` don't populate `destination` and
+  rule 2 is documented to miss those.
 
 ### Not yet built
 
@@ -333,15 +340,18 @@ type). Stdio MCP is JSON-RPC end to end so it never exercises this path;
 
 ### How it has been verified
 
-`cargo test` runs 168 tests covering the hash chain (including concurrent
+`cargo test` runs 206 tests covering the hash chain (including concurrent
 writers against a shared DB and interleaved multi-server chains), secrets
 detection and its false-positive cases, truncation UTF-8 boundary safety,
 export fidelity, unmask hash resolution, `verify` exit codes and
-`--repair-index` semantics, and the HTTP transport — SSE parser
+`--repair-index` semantics, the HTTP transport — SSE parser
 resynchronization after an oversized event, per-listener id isolation so
 two upstreams reusing the same JSON-RPC ids never cross-attribute,
 `Host`-header rewriting to the upstream authority, and non-JSON upstream
-responses being logged as errors with their body.
+responses being logged as errors with their body — and Phase 3's
+anomaly detection: destination extraction and kind tagging, all three
+rules' arm/fire/silent cases, and rule 3's cooldown (one burst yields
+one flag, with a second burst after the window firing again).
 
 Beyond unit tests, the proxy has been exercised end to end on **native
 Windows** (Git Bash + PowerShell) and on an **Ubuntu VM**. The Linux run

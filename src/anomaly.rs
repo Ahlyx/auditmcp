@@ -21,6 +21,13 @@
 //! 3. **Rapid repeats** — `RAPID_REPEAT_COUNT` calls to the same tool
 //!    landed within `RAPID_REPEAT_WINDOW`. Ordinary bursts of a few calls
 //!    stay quiet; a chunked exfiltration or an injection loop trips it.
+//!    **Fires at most once per burst.** Once the rule fires for a tool,
+//!    subsequent calls to that tool inside `RAPID_REPEAT_WINDOW` are
+//!    suppressed — a 24-call burst issued in one batch should surface
+//!    as one flag, not twenty. When the tool goes quiet for the window
+//!    and starts up again, the next burst is eligible to fire once.
+//!    (Dogfood-driven: an early real-vault session tripped rule 3 on
+//!    20 of 24 rows in one burst, drowning the actual signal.)
 //!
 //! Anomaly state is per session. There is one `SessionStats` per session
 //! id, held for the lifetime of that session, and it is neither serialized
@@ -116,6 +123,12 @@ pub struct SessionStats {
     /// non-empty). Filesystem destinations are never inserted or checked
     /// here — they'd be pure noise for this rule.
     seen_network_destinations: HashSet<String>,
+    /// Per-tool timestamp of the last time rule 3 fired. Enforces a
+    /// per-tool cooldown of `RAPID_REPEAT_WINDOW` so one burst surfaces
+    /// as one flag rather than one per call from the fifth onward. Not
+    /// updated on suppressed events, so a still-hot burst can't extend
+    /// its own cooldown indefinitely.
+    last_rapid_fire: HashMap<String, Instant>,
 }
 
 impl SessionStats {
@@ -184,7 +197,8 @@ impl SessionStats {
         }
 
         // Rule 3: rapid repeats. Push, trim to the last N, then check
-        // whether the whole ring fits in the window.
+        // whether the whole ring fits in the window and the tool isn't
+        // still cooling down from a previous fire.
         let ring = self
             .tool_timestamps
             .entry(tool_name.to_string())
@@ -196,16 +210,27 @@ impl SessionStats {
         if ring.len() == RAPID_REPEAT_COUNT {
             let span = now.saturating_duration_since(*ring.front().unwrap());
             if span <= RAPID_REPEAT_WINDOW {
-                reasons.push(Reason {
-                    rule: "rapid_repeats",
-                    detail: format!(
-                        "{} calls to {} within {:.1}s (window: {}s)",
-                        RAPID_REPEAT_COUNT,
-                        tool_name,
-                        span.as_secs_f64(),
-                        RAPID_REPEAT_WINDOW.as_secs()
-                    ),
-                });
+                // Suppress if we already fired for this tool inside the
+                // cooldown window. `last_rapid_fire` is only updated on
+                // an actual fire, so a hot burst can't extend its own
+                // cooldown by triggering the check repeatedly.
+                let cooling_down = self
+                    .last_rapid_fire
+                    .get(tool_name)
+                    .is_some_and(|last| now.saturating_duration_since(*last) < RAPID_REPEAT_WINDOW);
+                if !cooling_down {
+                    reasons.push(Reason {
+                        rule: "rapid_repeats",
+                        detail: format!(
+                            "{} calls to {} within {:.1}s (window: {}s)",
+                            RAPID_REPEAT_COUNT,
+                            tool_name,
+                            span.as_secs_f64(),
+                            RAPID_REPEAT_WINDOW.as_secs()
+                        ),
+                    });
+                    self.last_rapid_fire.insert(tool_name.to_string(), now);
+                }
             }
         }
 
@@ -466,6 +491,90 @@ mod tests {
         assert_eq!(r.reasons[0].rule, "rapid_repeats");
     }
 
+    /// The dogfood-driven cooldown: a single 24-call burst produces
+    /// exactly one flag, not twenty. Calls 5 through 24 all satisfy
+    /// "last 5 within 10s," but the cooldown suppresses everything after
+    /// the first fire.
+    #[test]
+    fn rapid_repeats_only_fires_once_per_burst() {
+        let mut s = SessionStats::new();
+        let t = t0();
+        let mut fire_count = 0;
+        for i in 0..24 {
+            // 24 calls spread over 8s (~300ms apart), well inside the
+            // 10s window from call 5 onward.
+            let call_t = t + Duration::from_millis(i * 350);
+            if let Some(r) = s.observe("read_note", None, None, call_t) {
+                assert_eq!(r.reasons.len(), 1, "expected only rapid_repeats");
+                assert_eq!(r.reasons[0].rule, "rapid_repeats");
+                fire_count += 1;
+            }
+        }
+        assert_eq!(
+            fire_count, 1,
+            "one 24-call burst should surface as exactly one flag"
+        );
+    }
+
+    /// After the cooldown expires and a fresh burst starts, the rule
+    /// fires again. This is the "still-a-useful-alarm" side of the
+    /// cooldown — one burst, one flag; two bursts, two flags.
+    #[test]
+    fn rapid_repeats_fires_on_a_second_burst_after_cooldown() {
+        let mut s = SessionStats::new();
+        let t = t0();
+        // First burst at t..t+4s → fires once at t+4s.
+        for i in 0..5 {
+            s.observe("read_note", None, None, t + Duration::from_secs(i));
+        }
+        // Long gap, then a second burst at t+30s..t+34s.
+        // The cooldown started at t+4s; by t+30s it's 26s > 10s, expired.
+        // The ring is refilled by the new burst.
+        let mut fire_count = 0;
+        for i in 0..5 {
+            if s.observe("read_note", None, None, t + Duration::from_secs(30 + i))
+                .is_some()
+            {
+                fire_count += 1;
+            }
+        }
+        assert_eq!(
+            fire_count, 1,
+            "a second burst after cooldown should fire once"
+        );
+    }
+
+    /// Cooldown is per-tool: one burst on tool A doesn't suppress a
+    /// simultaneous burst on tool B. Otherwise a compromised agent could
+    /// hide one tool's burst behind another's alert.
+    #[test]
+    fn rapid_repeats_cooldown_is_per_tool() {
+        let mut s = SessionStats::new();
+        let t = t0();
+        // Fill tool A's burst so it fires.
+        for i in 0..5 {
+            s.observe("read_note", None, None, t + Duration::from_millis(i * 200));
+        }
+        // Immediately fill tool B's burst inside A's cooldown window.
+        let mut b_fires = 0;
+        for i in 0..5 {
+            if s.observe(
+                "search_notes",
+                None,
+                None,
+                t + Duration::from_millis(1500 + i * 200),
+            )
+            .is_some()
+            {
+                b_fires += 1;
+            }
+        }
+        assert_eq!(
+            b_fires, 1,
+            "tool B's burst must not be masked by A's cooldown"
+        );
+    }
+
     /// Five calls spread across a window wider than 10s do not fire —
     /// steady-state usage of a tool at a slower cadence shouldn't trip it.
     #[test]
@@ -497,33 +606,48 @@ mod tests {
 
     /// All three rules firing on one call: score = 3.0, three reasons.
     /// Uses network destinations (a hypothetical http_fetch tool),
-    /// because Rule 2 now only fires on those — filesystem destinations
-    /// would leave this test at score 2.0 and no longer prove all three
-    /// rules can co-fire.
+    /// because Rule 2 now only fires on those. Also has to arm the size
+    /// baseline slowly (so the ring buffer clears) — since rule 3's
+    /// cooldown, only the *first* burst can fire, so a fast arm-then-
+    /// trigger would spend the fire on the arming and leave the trigger
+    /// call cooling down.
     #[test]
     fn score_is_the_number_of_fired_reasons() {
         let mut s = SessionStats::new();
         let t = t0();
-        // Arm the size baseline for `http_fetch` at 100 bytes over 5 quick
-        // calls to one seen network destination — no rule fires here.
+        // Arm the size baseline at 100 bytes over 5 SLOW calls (60s
+        // apart) so the ring buffer clears out between them: rule 3
+        // shouldn't fire during arming, or its cooldown suppresses the
+        // real trigger below.
         for i in 0..5 {
             s.observe(
                 "http_fetch",
                 Some(100),
                 Some(&net("https://baseline.test")),
-                t + Duration::from_secs(i as u64),
+                t + Duration::from_secs(i as u64 * 60),
             );
         }
-        // The trigger call, which:
-        //   - is a size spike (10_000 vs mean ~100),
-        //   - hits a novel network destination,
-        //   - is the 6th call to this tool in <10s → rapid_repeats.
+        // Four quick calls to refill the ring right before the trigger —
+        // still under the 5-in-10s threshold, so no fire yet.
+        let base = t + Duration::from_secs(600);
+        for i in 0..4 {
+            s.observe(
+                "http_fetch",
+                Some(100),
+                Some(&net("https://baseline.test")),
+                base + Duration::from_secs(i),
+            );
+        }
+        // The trigger — 5th quick call, all three rules qualify:
+        //   - size spike (10_000 vs mean ~100),
+        //   - novel network destination (distinct from baseline),
+        //   - rapid_repeats (5 calls in ~4s, cooldown clear).
         let r = s
             .observe(
                 "http_fetch",
                 Some(10_000),
                 Some(&net("https://exfil.test")),
-                t + Duration::from_secs(5),
+                base + Duration::from_secs(4),
             )
             .expect("all three rules should have fired");
         assert_eq!(r.reasons.len(), 3, "reasons: {:?}", r.reasons);
