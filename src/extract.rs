@@ -26,25 +26,77 @@
 //!
 //! Called on the **post-redaction** args value, so a path that contained a
 //! secret cannot leak plaintext through this column.
+//!
+//! ## Destination kind, and why it matters for Rule 2
+//!
+//! The extractor also reports **what shape of destination** it found —
+//! filesystem or network — because Rule 2 (`novel_destination`) only
+//! makes sense against network-shaped destinations under the tool's
+//! threat model. Filesystem destinations are noise: writing a new note
+//! in a note-taking session is the *primary use case*, and firing an
+//! anomaly on every one produces 100% false positives (verified against
+//! real vault traffic — see the Phase 3 dogfood in the git log). Network
+//! destinations are the shape the exfiltration threat model actually
+//! covers: an unexpected URL, host, or endpoint is where "data left the
+//! machine" shows up.
+//!
+//! `target` is bucketed with network. It's genuinely ambiguous — a tool
+//! could use it for either — and the tradeoff is: bucketing it with
+//! filesystem silently suppresses a real signal; bucketing it with
+//! network at worst produces one extra flag on an ambiguous field. Signal
+//! bias over noise bias when the cost of each direction is asymmetric.
 
 use serde_json::Value;
 
-/// Top-level arg keys read as a destination, in the order they are checked.
-/// First hit wins, which matters when a tool carries more than one of these:
-/// `path` is preferred over `url` etc., because file-oriented tools are the
-/// larger share of realistic MCP traffic and read cleaner in `query` output.
-const DESTINATION_KEYS: &[&str] = &["path", "url", "host", "file", "target", "uri"];
+/// How a destination should be interpreted by the anomaly rules. Rule 2
+/// treats these two categories differently; see this module's doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationKind {
+    /// A filesystem path — `path`, `file`. A "new" one in a session is
+    /// ordinary use of a file-oriented tool and should not fire Rule 2.
+    Filesystem,
+    /// A network endpoint — `url`, `host`, `uri`, `target`. A "new" one
+    /// mid-session is what the exfiltration threat model actually flags.
+    Network,
+}
+
+/// One extraction result: the value plus what shape of destination it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Destination {
+    pub value: String,
+    pub kind: DestinationKind,
+}
+
+/// Top-level arg keys read as a destination, in the order they are
+/// checked. First hit wins, which matters when a tool carries more than
+/// one: `path` is preferred over `url` etc., because file-oriented tools
+/// are the larger share of realistic MCP traffic and read cleaner in
+/// `query` output. Each key is paired with the `DestinationKind` that
+/// Rule 2 should apply to values read from it.
+const DESTINATION_KEYS: &[(&str, DestinationKind)] = &[
+    ("path", DestinationKind::Filesystem),
+    ("file", DestinationKind::Filesystem),
+    ("url", DestinationKind::Network),
+    ("host", DestinationKind::Network),
+    ("uri", DestinationKind::Network),
+    ("target", DestinationKind::Network),
+];
 
 /// Returns the tool call's destination if the args carry one at a
-/// recognized top-level key. Returns `None` for anything else -- the audit
-/// row simply keeps `destination` NULL, which is the correct signal to Rule
-/// 2 that this call has no destination to compare against a baseline.
-pub fn destination_from_args(args: &Value) -> Option<String> {
+/// recognized top-level key, together with the kind (filesystem vs
+/// network) Rule 2 should apply to it. Returns `None` for anything else
+/// -- the audit row simply keeps `destination` NULL, which is the
+/// correct signal to Rule 2 that this call has no destination to compare
+/// against a baseline.
+pub fn destination_from_args(args: &Value) -> Option<Destination> {
     let obj = args.as_object()?;
-    for key in DESTINATION_KEYS {
+    for (key, kind) in DESTINATION_KEYS {
         if let Some(Value::String(s)) = obj.get(*key) {
             if !s.is_empty() {
-                return Some(s.clone());
+                return Some(Destination {
+                    value: s.clone(),
+                    kind: *kind,
+                });
             }
         }
     }
@@ -61,7 +113,10 @@ mod tests {
         let args = json!({"path": "notes/stress_test_1.md"});
         assert_eq!(
             destination_from_args(&args),
-            Some("notes/stress_test_1.md".to_string())
+            Some(Destination {
+                value: "notes/stress_test_1.md".to_string(),
+                kind: DestinationKind::Filesystem,
+            })
         );
     }
 
@@ -70,7 +125,10 @@ mod tests {
         let args = json!({"url": "https://example.com/api"});
         assert_eq!(
             destination_from_args(&args),
-            Some("https://example.com/api".to_string())
+            Some(Destination {
+                value: "https://example.com/api".to_string(),
+                kind: DestinationKind::Network,
+            })
         );
     }
 
@@ -80,7 +138,13 @@ mod tests {
     #[test]
     fn path_beats_url_when_both_present() {
         let args = json!({"url": "https://x.test", "path": "notes/a.md"});
-        assert_eq!(destination_from_args(&args), Some("notes/a.md".to_string()));
+        assert_eq!(
+            destination_from_args(&args),
+            Some(Destination {
+                value: "notes/a.md".to_string(),
+                kind: DestinationKind::Filesystem,
+            })
+        );
     }
 
     #[test]
@@ -94,7 +158,10 @@ mod tests {
         });
         assert_eq!(
             destination_from_args(&args),
-            Some("stress_test_1.md".to_string())
+            Some(Destination {
+                value: "stress_test_1.md".to_string(),
+                kind: DestinationKind::Filesystem,
+            })
         );
     }
 
@@ -159,5 +226,37 @@ mod tests {
     fn key_matching_is_case_sensitive() {
         assert_eq!(destination_from_args(&json!({"Path": "x.md"})), None);
         assert_eq!(destination_from_args(&json!({"URL": "https://x"})), None);
+    }
+
+    /// Filesystem keys are bucketed as filesystem: `path`, `file`. These
+    /// are what Rule 2 will *not* fire on, because a new file in a
+    /// file-oriented session is ordinary use.
+    #[test]
+    fn path_and_file_are_filesystem_kind() {
+        for key in ["path", "file"] {
+            let args = json!({ key: "x.md" });
+            assert_eq!(
+                destination_from_args(&args).unwrap().kind,
+                DestinationKind::Filesystem,
+                "{key} should be filesystem-shaped"
+            );
+        }
+    }
+
+    /// Network keys are bucketed as network: `url`, `host`, `uri`,
+    /// `target`. `target` is ambiguous by nature -- some tools use it
+    /// for a filesystem target, some for a network one -- and it lands
+    /// with network deliberately, so that Rule 2 gets a chance on the
+    /// exfiltration case rather than silently missing it.
+    #[test]
+    fn url_host_uri_target_are_network_kind() {
+        for key in ["url", "host", "uri", "target"] {
+            let args = json!({ key: "x" });
+            assert_eq!(
+                destination_from_args(&args).unwrap().kind,
+                DestinationKind::Network,
+                "{key} should be network-shaped"
+            );
+        }
     }
 }

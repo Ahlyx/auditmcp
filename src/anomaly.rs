@@ -7,10 +7,17 @@
 //!    `SIZE_SPIKE_MULTIPLIER × running_mean` for the same tool in the same
 //!    session. Immune to the first `MIN_SAMPLES_FOR_SIZE_RULE - 1` calls
 //!    per tool, so a session's opening samples don't flag each other.
-//! 2. **Novel destination** — the call's destination was never seen in
-//!    this session before. Deliberately requires a non-empty prior
-//!    baseline: the very first destination in a session establishes the
-//!    baseline rather than firing this rule against nothing.
+//! 2. **Novel destination** — a **network-shaped** destination
+//!    (`url`, `host`, `uri`, `target`) was never seen in this session
+//!    before. Filesystem destinations are deliberately excluded: writing
+//!    a new note in a note-taking session is the primary use case, so
+//!    firing an anomaly on every one produces a 100% false-positive rate
+//!    (verified against real vault traffic — see Phase 3 dogfood). The
+//!    threat model that motivates this rule is exfiltration, which shows
+//!    up as an unexpected network endpoint, not as a new file in a
+//!    local vault. Also requires a non-empty prior baseline, so the very
+//!    first network destination in a session establishes the set rather
+//!    than firing this rule against nothing.
 //! 3. **Rapid repeats** — `RAPID_REPEAT_COUNT` calls to the same tool
 //!    landed within `RAPID_REPEAT_WINDOW`. Ordinary bursts of a few calls
 //!    stay quiet; a chunked exfiltration or an injection loop trips it.
@@ -25,6 +32,7 @@
 //! rather than blocking the audit): fail-open, same contract as everything
 //! else in this pipeline.
 
+use crate::extract::{Destination, DestinationKind};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -103,9 +111,11 @@ pub struct SessionStats {
     /// oldest of the last `RAPID_REPEAT_COUNT` sits inside
     /// `RAPID_REPEAT_WINDOW`.
     tool_timestamps: HashMap<String, VecDeque<Instant>>,
-    /// Every destination this session has seen. Rule 2 flags a call whose
-    /// destination is not in this set (once the set is non-empty).
-    seen_destinations: HashSet<String>,
+    /// Every **network-shaped** destination this session has seen. Rule 2
+    /// flags a network destination not in this set (once the set is
+    /// non-empty). Filesystem destinations are never inserted or checked
+    /// here — they'd be pure noise for this rule.
+    seen_network_destinations: HashSet<String>,
 }
 
 impl SessionStats {
@@ -118,15 +128,15 @@ impl SessionStats {
     /// `now` is threaded through rather than read from `Instant::now()`
     /// inside so tests can drive time deterministically and so callers
     /// that already have a timestamp (the audit path has one) don't
-    /// double-source it. `destination` is the value the audit path pulled
-    /// from `extract::destination_from_args`; `None` means the tool had no
-    /// destination to record, not that it had a destination equal to
-    /// empty-string.
+    /// double-source it. `destination` is what the audit path pulled from
+    /// `extract::destination_from_args`, kind and all; `None` means the
+    /// tool had no destination to record, not that it had a destination
+    /// equal to empty-string.
     pub fn observe(
         &mut self,
         tool_name: &str,
         bytes_out: Option<i64>,
-        destination: Option<&str>,
+        destination: Option<&Destination>,
         now: Instant,
     ) -> Option<AnomalyReport> {
         let mut reasons = Vec::new();
@@ -150,19 +160,24 @@ impl SessionStats {
             }
         }
 
-        // Rule 2: novel destination. Also checked BEFORE the insert below,
+        // Rule 2: novel network destination. Filesystem destinations
+        // never reach the baseline set and never fire (see the module
+        // doc); network destinations do. Checked BEFORE the insert below,
         // so we can tell "this destination is new" from "this destination
         // is the one we just recorded." Skipped on the empty-baseline
-        // case: the first destination in a session establishes the set
-        // rather than flagging against nothing.
+        // case: the first network destination in a session establishes
+        // the set rather than flagging against nothing.
         if let Some(dest) = destination {
-            if !self.seen_destinations.is_empty() && !self.seen_destinations.contains(dest) {
+            if dest.kind == DestinationKind::Network
+                && !self.seen_network_destinations.is_empty()
+                && !self.seen_network_destinations.contains(&dest.value)
+            {
                 reasons.push(Reason {
                     rule: "novel_destination",
                     detail: format!(
-                        "destination '{}' not seen in this session ({} prior distinct destinations)",
-                        dest,
-                        self.seen_destinations.len()
+                        "network destination '{}' not seen in this session ({} prior distinct network destinations)",
+                        dest.value,
+                        self.seen_network_destinations.len()
                     ),
                 });
             }
@@ -205,7 +220,9 @@ impl SessionStats {
                 .observe(bytes as f64);
         }
         if let Some(dest) = destination {
-            self.seen_destinations.insert(dest.to_string());
+            if dest.kind == DestinationKind::Network {
+                self.seen_network_destinations.insert(dest.value.clone());
+            }
         }
 
         if reasons.is_empty() {
@@ -225,6 +242,20 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    fn net(s: &str) -> Destination {
+        Destination {
+            value: s.to_string(),
+            kind: DestinationKind::Network,
+        }
+    }
+
+    fn fs(s: &str) -> Destination {
+        Destination {
+            value: s.to_string(),
+            kind: DestinationKind::Filesystem,
+        }
     }
 
     /// A steady baseline that never varies has no anomalies to report.
@@ -297,28 +328,28 @@ mod tests {
         assert!(r.is_none(), "new tool's first call was flagged as a spike");
     }
 
-    /// The very first destination in a session establishes the baseline
-    /// rather than firing against an empty set. If the *first* call were
-    /// flagged, every session would flag its first call and the rule
-    /// would carry no signal.
+    /// The very first network destination in a session establishes the
+    /// baseline rather than firing against an empty set. If the *first*
+    /// call were flagged, every session would flag its first call and
+    /// the rule would carry no signal.
     #[test]
-    fn first_destination_in_a_session_does_not_fire() {
+    fn first_network_destination_in_a_session_does_not_fire() {
         let mut s = SessionStats::new();
-        let r = s.observe("read_note", None, Some("notes/a.md"), t0());
+        let r = s.observe("http_fetch", None, Some(&net("https://a.test")), t0());
         assert!(r.is_none());
     }
 
-    /// Second destination in a session that differs from the first: fire.
+    /// A second, different network destination in the same session fires.
     #[test]
-    fn second_distinct_destination_fires_novel_destination() {
+    fn second_distinct_network_destination_fires_novel_destination() {
         let mut s = SessionStats::new();
         let t = t0();
-        s.observe("read_note", None, Some("notes/a.md"), t);
+        s.observe("http_fetch", None, Some(&net("https://a.test")), t);
         let r = s
             .observe(
-                "read_note",
+                "http_fetch",
                 None,
-                Some("notes/b.md"),
+                Some(&net("https://b.test")),
                 t + Duration::from_secs(60),
             )
             .expect("expected novel_destination");
@@ -326,23 +357,72 @@ mod tests {
         assert_eq!(r.reasons[0].rule, "novel_destination");
     }
 
-    /// A destination the session has already seen is not novel, even the
-    /// tenth time.
+    /// The dogfood-driven fix: writing 24 new notes with novel paths is
+    /// ordinary use of a file-oriented tool. Filesystem destinations must
+    /// never fire Rule 2, even when every single one is unique.
     #[test]
-    fn seen_destination_does_not_fire_again() {
+    fn filesystem_destinations_never_fire_novel_destination() {
         let mut s = SessionStats::new();
         let t = t0();
-        s.observe("read_note", None, Some("notes/a.md"), t);
+        for i in 0..24 {
+            let path = format!("notes/n{i}.md");
+            let r = s.observe(
+                "write_note",
+                None,
+                Some(&fs(&path)),
+                t + Duration::from_secs(i * 30),
+            );
+            assert!(
+                r.is_none(),
+                "novel filesystem path {path} incorrectly fired Rule 2"
+            );
+        }
+    }
+
+    /// Filesystem destinations also don't *arm* the baseline for network
+    /// ones: an all-filesystem session followed by one network destination
+    /// still treats the network destination as first-of-its-kind, not novel.
+    #[test]
+    fn filesystem_destinations_do_not_arm_the_network_baseline() {
+        let mut s = SessionStats::new();
+        let t = t0();
+        for i in 0..5 {
+            s.observe(
+                "write_note",
+                None,
+                Some(&fs(&format!("n{i}.md"))),
+                t + Duration::from_secs(i),
+            );
+        }
+        let r = s.observe(
+            "http_fetch",
+            None,
+            Some(&net("https://a.test")),
+            t + Duration::from_secs(60),
+        );
+        assert!(
+            r.is_none(),
+            "first network destination fired against a filesystem-only baseline"
+        );
+    }
+
+    /// A network destination the session has already seen is not novel,
+    /// even the tenth time.
+    #[test]
+    fn seen_network_destination_does_not_fire_again() {
+        let mut s = SessionStats::new();
+        let t = t0();
+        s.observe("http_fetch", None, Some(&net("https://a.test")), t);
         for i in 1..10 {
             let r = s.observe(
-                "read_note",
+                "http_fetch",
                 None,
-                Some("notes/a.md"),
+                Some(&net("https://a.test")),
                 t + Duration::from_secs(i * 60),
             );
             assert!(
                 r.is_none(),
-                "repeat call {i} to the same destination flagged"
+                "repeat call {i} to the same network destination flagged"
             );
         }
     }
@@ -354,8 +434,13 @@ mod tests {
         let mut s = SessionStats::new();
         let t = t0();
         s.observe("echo", None, None, t);
-        // The baseline is still empty, so a later destination is not novel.
-        let r = s.observe("echo", None, Some("first"), t + Duration::from_secs(60));
+        // The baseline is still empty, so a later network destination is not novel.
+        let r = s.observe(
+            "echo",
+            None,
+            Some(&net("first")),
+            t + Duration::from_secs(60),
+        );
         assert!(
             r.is_none(),
             "None destination arm-ed the baseline it shouldn't have"
@@ -411,32 +496,33 @@ mod tests {
     }
 
     /// All three rules firing on one call: score = 3.0, three reasons.
+    /// Uses network destinations (a hypothetical http_fetch tool),
+    /// because Rule 2 now only fires on those — filesystem destinations
+    /// would leave this test at score 2.0 and no longer prove all three
+    /// rules can co-fire.
     #[test]
     fn score_is_the_number_of_fired_reasons() {
         let mut s = SessionStats::new();
         let t = t0();
-        // Arm the size baseline for `write_note` at 100 bytes over 5 quick
-        // calls to distinct destinations — this doesn't fire rule 2
-        // (destinations are all novel *after* the first, and yes those
-        // will trip novel_destination, but we're arming here so we
-        // deliberately look at the report from the sixth call below).
+        // Arm the size baseline for `http_fetch` at 100 bytes over 5 quick
+        // calls to one seen network destination — no rule fires here.
         for i in 0..5 {
             s.observe(
-                "write_note",
+                "http_fetch",
                 Some(100),
-                Some(&format!("baseline_{i}.md")),
+                Some(&net("https://baseline.test")),
                 t + Duration::from_secs(i as u64),
             );
         }
-        // Now the trigger call, which:
+        // The trigger call, which:
         //   - is a size spike (10_000 vs mean ~100),
-        //   - has a novel destination (distinct from all 5 baselines),
+        //   - hits a novel network destination,
         //   - is the 6th call to this tool in <10s → rapid_repeats.
         let r = s
             .observe(
-                "write_note",
+                "http_fetch",
                 Some(10_000),
-                Some("trigger.md"),
+                Some(&net("https://exfil.test")),
                 t + Duration::from_secs(5),
             )
             .expect("all three rules should have fired");

@@ -29,6 +29,7 @@
 
 use crate::anomaly::SessionStats;
 use crate::db::ToolCallEntry;
+use crate::extract::Destination;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -91,14 +92,14 @@ impl Session {
     /// on one row is strictly better than blocking the audit pipeline on
     /// a JSON error, which is the fail-open contract this codebase runs
     /// on end to end.
-    pub(crate) fn attach_anomaly(&self, entry: &mut ToolCallEntry, now: Instant) {
+    pub(crate) fn attach_anomaly(
+        &self,
+        entry: &mut ToolCallEntry,
+        destination: Option<&Destination>,
+        now: Instant,
+    ) {
         let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(report) = stats.observe(
-            &entry.tool_name,
-            entry.bytes_out,
-            entry.destination.as_deref(),
-            now,
-        ) {
+        if let Some(report) = stats.observe(&entry.tool_name, entry.bytes_out, destination, now) {
             entry.anomaly_score = Some(report.score);
             entry.anomaly_reasons = serde_json::to_string(&report.reasons).ok();
         }

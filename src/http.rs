@@ -1056,7 +1056,7 @@ fn log_timeout(listener: &Listener, session: &Session, call: PendingCall) {
 /// shutdown drain.
 fn log_entry(listener: &Listener, session: &Session, call: PendingCall, outcome: CallOutcome) {
     let tier = listener.config.tier_for_tool(&call.tool_name);
-    let mut entry = audit::build_entry(
+    let (mut entry, dest) = audit::build_entry(
         call,
         outcome,
         session.id(),
@@ -1065,7 +1065,7 @@ fn log_entry(listener: &Listener, session: &Session, call: PendingCall, outcome:
         &listener.patterns,
         &listener.allowlist,
     );
-    session.attach_anomaly(&mut entry, Instant::now());
+    session.attach_anomaly(&mut entry, dest.as_ref(), Instant::now());
     listener.db.log(entry);
 }
 

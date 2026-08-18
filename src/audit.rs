@@ -279,8 +279,13 @@ struct RedactionRecord<'a> {
     sha256: &'a str,
 }
 
-/// Builds the `ToolCallEntry` for one completed tool call. See the module
-/// doc comment for why the step order here cannot be rearranged.
+/// Builds the `ToolCallEntry` for one completed tool call, and returns
+/// the extracted `Destination` alongside it so the caller can hand it to
+/// `Session::attach_anomaly` without re-extracting. See the module doc
+/// comment for why the step order here cannot be rearranged; the
+/// extracted destination is returned rather than folded into the entry's
+/// row shape because Rule 2 needs the destination's *kind* (filesystem
+/// vs network) and that is not stored in the row.
 pub(crate) fn build_entry(
     call: PendingCall,
     outcome: CallOutcome,
@@ -289,7 +294,7 @@ pub(crate) fn build_entry(
     configured_tier: Tier,
     patterns: &PatternSet,
     allowlist: &HashSet<String>,
-) -> ToolCallEntry {
+) -> (ToolCallEntry, Option<extract::Destination>) {
     let duration_ms = call.started.elapsed().as_millis() as i64;
 
     // Step 1: detect and redact, on the full untruncated values. Args are
@@ -313,6 +318,10 @@ pub(crate) fn build_entry(
     // Extract the destination from the post-redaction args, so a path that
     // happened to contain a secret cannot leak plaintext through this
     // column. Best-effort by design — see `extract` for the exact scope.
+    // The `kind` (filesystem vs network) is what Rule 2 reads to decide
+    // whether to fire; only the value is stored on the row, since a caller
+    // reading a raw destination string can tell filesystem from network
+    // themselves.
     let destination = args.as_ref().and_then(|p| match p {
         Payload::Json(v) => extract::destination_from_args(v),
         Payload::Raw(_) => None,
@@ -351,7 +360,7 @@ pub(crate) fn build_entry(
         None
     };
 
-    ToolCallEntry {
+    let entry = ToolCallEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         session_id: session_id.to_string(),
         agent_id: None,
@@ -365,12 +374,13 @@ pub(crate) fn build_entry(
         bytes_in: Some(call.bytes_in),
         bytes_out: outcome.bytes_out,
         source: None,
-        destination,
+        destination: destination.as_ref().map(|d| d.value.clone()),
         redaction_flags,
         redaction_count: active_hit_count as i64,
         anomaly_score: None,
         anomaly_reasons: None,
-    }
+    };
+    (entry, destination)
 }
 
 /// Truncates to at most `PREVIEW_BYTES` bytes, snapping back to the
@@ -423,7 +433,7 @@ mod tests {
         result: Value,
     ) -> ToolCallEntry {
         let patterns = PatternSet::bundled().unwrap();
-        build_entry(
+        let (entry, _dest) = build_entry(
             pending(args),
             outcome(status, result),
             "sess-1",
@@ -431,7 +441,8 @@ mod tests {
             configured,
             &patterns,
             &HashSet::new(),
-        )
+        );
+        entry
     }
 
     #[test]
@@ -646,7 +657,7 @@ mod tests {
                  "status":"working","ttlMs":600000,"pollIntervalMs":1000}}"#,
         )
         .unwrap();
-        let e = build_entry(
+        let (e, _dest) = build_entry(
             pending(long_args()),
             CallOutcome::from_rpc(&msg, 120),
             "sess-1",
@@ -667,7 +678,7 @@ mod tests {
     #[test]
     fn timeout_outcome_records_no_response_bytes() {
         let patterns = PatternSet::bundled().unwrap();
-        let e = build_entry(
+        let (e, _dest) = build_entry(
             pending(json!({"a": 1})),
             CallOutcome {
                 status: CallStatus::Timeout,
