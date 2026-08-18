@@ -26,6 +26,7 @@
 
 use crate::config::Tier;
 use crate::db::ToolCallEntry;
+use crate::extract;
 use crate::jsonrpc::RpcMessage;
 use crate::secrets::{self, Hit, PatternSet, Severity};
 use crate::session::PendingCall;
@@ -309,6 +310,14 @@ pub(crate) fn build_entry(
     let active_hit_count = hits.iter().filter(|h| !h.allowlisted).count();
     let secrets_fired = active_hit_count > 0;
 
+    // Extract the destination from the post-redaction args, so a path that
+    // happened to contain a secret cannot leak plaintext through this
+    // column. Best-effort by design — see `extract` for the exact scope.
+    let destination = args.as_ref().and_then(|p| match p {
+        Payload::Json(v) => extract::destination_from_args(v),
+        Payload::Raw(_) => None,
+    });
+
     // Step 2: decide the tier, now that detection has run.
     let effective_tier = if secrets_fired || outcome.status.escalates() {
         Tier::Full
@@ -356,7 +365,7 @@ pub(crate) fn build_entry(
         bytes_in: Some(call.bytes_in),
         bytes_out: outcome.bytes_out,
         source: None,
-        destination: None,
+        destination,
         redaction_flags,
         redaction_count: active_hit_count as i64,
         anomaly_score: None,
@@ -679,6 +688,35 @@ mod tests {
         // Args were captured at request time and are still recorded.
         assert!(e.args_json.is_some());
         assert_eq!(e.bytes_in, Some(42));
+    }
+
+    /// Wiring test, distinct from `extract::tests`: the extractor is unit-
+    /// tested in isolation there, but the *pipeline* must actually call it
+    /// and hand the result to the stored row. This is the check that a
+    /// regression which drops the extract step surfaces here rather than
+    /// only in production data drifting silently back to NULL.
+    #[test]
+    fn destination_is_extracted_from_args_into_the_stored_entry() {
+        let e = entry_for(
+            CallStatus::Success,
+            Tier::Minimal,
+            json!({"path": "notes/a.md", "content": "hi"}),
+            json!({}),
+        );
+        assert_eq!(e.destination.as_deref(), Some("notes/a.md"));
+    }
+
+    /// Args that carries no recognized destination key keeps `destination`
+    /// NULL, so Rule 2 sees "no destination" rather than a synthetic one.
+    #[test]
+    fn no_destination_key_leaves_destination_null() {
+        let e = entry_for(
+            CallStatus::Success,
+            Tier::Minimal,
+            json!({"query": "stress test", "limit": 20}),
+            json!({}),
+        );
+        assert_eq!(e.destination, None);
     }
 
     #[test]

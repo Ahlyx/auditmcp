@@ -2,6 +2,7 @@ mod audit;
 mod config;
 mod db;
 mod export;
+mod extract;
 mod http;
 mod jsonrpc;
 mod proxy;
