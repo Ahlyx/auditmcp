@@ -459,7 +459,7 @@ fn walk_json(
 fn redact_ranges(s: &str, hits: &[Hit]) -> String {
     let mut out = s.to_string();
     let mut sorted: Vec<&Hit> = hits.iter().collect();
-    sorted.sort_by(|a, b| b.matched_range.0.cmp(&a.matched_range.0));
+    sorted.sort_by_key(|h| std::cmp::Reverse(h.matched_range.0));
     for hit in sorted {
         if hit.allowlisted {
             continue;
