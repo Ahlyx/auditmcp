@@ -158,10 +158,13 @@ Then read the log back:
 auditmcp query  --config config.toml                    # table of tool calls
 auditmcp query  --config config.toml --verbose          # + what was redacted and why
 auditmcp query  --config config.toml --anomalous        # only rows the Phase 3 rules flagged
+auditmcp query  --config config.toml --include-synthetic # + heartbeat/session-boundary rows
 auditmcp query  --config config.toml --tool delete_file --since 2h --status error
-auditmcp verify --config config.toml                    # walk the hash chain
+auditmcp verify --config config.toml                    # walk the hash chain (+ heartbeats, anchor)
 auditmcp export --config config.toml --format jsonl --output audit.jsonl
 auditmcp unmask --config config.toml <sha256> --note "confirmed false positive"
+auditmcp key    fingerprint --config config.toml        # sha256(root_key)[:16], safe to share
+auditmcp reset  --config config.toml --yes --keep-old    # archive the chain and start fresh
 ```
 
 `--since` takes a duration with a required unit: `45s`, `30m`, `2h`, `1d`.
@@ -217,14 +220,17 @@ a configuration problem — the pattern set is compiled into the binary.
 
 ### Exit codes
 
-`verify` has two distinct nonzero codes so a monitoring script can tell
-tampering apart from an internal index going stale, without parsing output:
+`verify` uses six distinct codes so a monitoring script can tell these
+apart without parsing output:
 
 | Code | Meaning |
 |---|---|
-| 0 | Chain intact and redactions index consistent |
-| 1 | Hash-chain verification failed — a row was altered, deleted, or reordered |
-| 2 | Chain intact, but the derived redactions index drifted (fix with `--repair-index [--yes]`) |
+| 0 | Chain intact, redactions index consistent, every enabled check passed |
+| 1 | Hash-chain / HMAC verification failed — a row was altered, deleted, or reordered |
+| 2 | Chain intact, but EITHER the redactions index drifted (fix with `--repair-index [--yes]`), OR this is an HMAC-protected chain and the chain key is missing/unloadable/unrecognized |
+| 3 | A heartbeat gap within a session exceeded the expected cadence — likely tail truncation |
+| 4 | The anchor file's own internal HMAC chain is broken |
+| 5 | The anchor references chain rows that are missing or have a different hash than it recorded |
 
 Every other subcommand uses plain 0/1.
 
@@ -250,7 +256,7 @@ unsigned initially, so SmartScreen may warn on first run.
 
 ## What state is it in?
 
-Phases 1 and 2 are complete. Phases 3 and 4 are unstarted.
+Phases 1, 2, 3, and 3.5 are complete. Phase 4 is unstarted.
 
 ### Working
 
@@ -317,6 +323,12 @@ Phases 1 and 2 are complete. Phases 3 and 4 are unstarted.
   extracted — both would trade quiet false positives for more coverage —
   so tools like `read_multiple_notes` don't populate `destination` and
   rule 2 is documented to miss those.
+- **Chain hardening (Phase 3.5)** — HMAC-keyed hash chain, randomized-cadence
+  heartbeats with genesis-fixed cadence bounds, an external per-platform
+  anchor file, three new `verify` exit codes, `auditmcp key`, and
+  `auditmcp reset`. See the "Chain hardening" section below for the full
+  write-up; legacy Phase 1-3 databases keep working unchanged with a
+  visible migration warning.
 
 ### Not yet built
 
@@ -340,7 +352,7 @@ type). Stdio MCP is JSON-RPC end to end so it never exercises this path;
 
 ### How it has been verified
 
-`cargo test` runs 206 tests covering the hash chain (including concurrent
+`cargo test` runs 253 tests covering the hash chain (including concurrent
 writers against a shared DB and interleaved multi-server chains), secrets
 detection and its false-positive cases, truncation UTF-8 boundary safety,
 export fidelity, unmask hash resolution, `verify` exit codes and
@@ -348,10 +360,14 @@ export fidelity, unmask hash resolution, `verify` exit codes and
 resynchronization after an oversized event, per-listener id isolation so
 two upstreams reusing the same JSON-RPC ids never cross-attribute,
 `Host`-header rewriting to the upstream authority, and non-JSON upstream
-responses being logged as errors with their body — and Phase 3's
+responses being logged as errors with their body — Phase 3's
 anomaly detection: destination extraction and kind tagging, all three
 rules' arm/fire/silent cases, and rule 3's cooldown (one burst yields
-one flag, with a second burst after the window firing again).
+one flag, with a second burst after the window firing again) — and Phase
+3.5's chain hardening: HKDF subkey derivation and salting, the bootstrap
+decision table (fresh/existing/wrong-key/legacy), heartbeat gap detection
+within and across sessions, the anchor's own internal chain plus its
+cross-check against the database, and `reset`'s archive-vs-delete behavior.
 
 Beyond unit tests, the proxy has been exercised end to end on **native
 Windows** (Git Bash + PowerShell) and on an **Ubuntu VM**. The Linux run
@@ -405,21 +421,26 @@ the opt-in exception.
 
 ## Known limitations
 
-**`verify` cannot detect deletion of the most recent row(s).** Hash chaining
-proves that every row from the beginning up to some point is unaltered and in
-its original order, but it can only do that by having a *later* row whose
-`id`/`prev_hash` fails to line up with what was deleted. If the tail of the
-chain is truncated (the newest N rows removed) there is no later row left to
-expose the gap — `verify` will report the chain as fully intact, and this
-stays true forever, even after new rows are appended in a future session (the
-writer just chains onto whatever the current last row happens to be; it has
-no way to know rows used to exist after it).
+**`verify` cannot detect deletion of the most recent row(s), from hashing
+alone.** Hash chaining proves that every row from the beginning up to some
+point is unaltered and in its original order, but it can only do that by
+having a *later* row whose `id`/`prev_hash` fails to line up with what was
+deleted. If the tail of the chain is truncated (the newest N rows removed)
+there is no later row left to expose the gap from hashing alone.
+
+Phase 3.5 ("Chain hardening", below) narrows this gap without closing it
+completely: heartbeats make a **within-session** truncation visible (the
+gap between two surviving heartbeats gets too wide), and the external
+anchor makes a **whole-database replace** visible (the anchor, stored
+elsewhere, still names a row the swapped-in database doesn't have). What
+remains uncovered is an attacker who has both DB write access and the
+anchor file, and who truncates precisely between two heartbeats without
+ever letting a wider session boundary or anchor tick expose the gap — see
+the updated threat model below for the exact boundary.
 
 This is an inherent limit of hash-chaining alone, not a bug — it is the same
 reason real append-only transparency logs need an external
-checkpoint/witness mechanism, which is out of scope for a local single-user
-tool. In short: `auditmcp verify` proves nothing in the middle of the log was
-altered or removed, not that nothing was truncated off the end.
+checkpoint/witness mechanism.
 
 **Very large responses are recorded only in part.** Over HTTP, response
 bodies stream through to the client untouched however large they are, but
@@ -455,13 +476,154 @@ and it cannot audit what never flows through it.
 
 ---
 
+## Chain hardening (Phase 3.5)
+
+The plain hash chain (`hash = SHA256(prev_hash + canonical_json(entry))`)
+proves interior integrity but has two gaps: it's **publicly verifiable and
+therefore forgeable** by anyone with database write access, and **tail
+truncation is invisible** to hashing alone (see Known limitations above).
+Phase 3.5 closes both, while staying inside the project's philosophy — local
+first, one binary, one config file, fail-open, no cloud. None of it can ever
+block a `tools/call`; every new mechanism here is warn-and-continue at
+runtime. Only `auditmcp run`'s startup and `auditmcp verify` are strict.
+
+**HMAC-keyed hash chain.** `hash` is now `HMAC-SHA256(chain_key, prev_hash +
+canonical_json(entry))` for any database created under Phase 3.5 — same
+32-byte size, no schema change, but no longer forgeable without the key.
+`chain_key` and a second `anchor_key` are both derived from one root key via
+HKDF-SHA256, salted with the database's own `db_uuid` so the same root key
+never produces the same effective keys across two databases. The root key
+lives at `~/.auditmcp/keys/audit.key` by default (`[chain].key_path`),
+generated automatically the first time `auditmcp run` starts against a
+database that doesn't exist yet, with 0600/0700 permissions on Unix (Windows
+has no POSIX bits; see the caveat under `auditmcp key` below). **There is no
+key rotation** — a deliberate scope cut, not a TODO: rotating would need
+multi-key verification and `kid`-style migration semantics that don't earn
+their weight for a single-user tool. `auditmcp reset --keep-old` is the
+supported way to get a fresh key.
+
+Startup is strict about the key, because a wrong or missing one means `run`
+cannot produce a valid chain: a database with no key present refuses to
+start; a database whose HMAC-protected first row doesn't verify under the
+key that *is* present also refuses to start (wrong key, or a corrupted key
+file).
+
+**Heartbeats.** With `[heartbeat].enabled = true` (the default), synthetic
+rows are appended at a randomized cadence (`cadence_min_secs`..`cadence_max_secs`,
+default 30–90s) — `tool_name = "__heartbeat"`, plus `__session_start` at
+`run` startup and `__session_end` during the graceful shutdown window. The
+cadence range is fixed once, at the chain's genesis, in `chain_metadata`; an
+attacker with DB write access can't lower it retroactively to hide a gap,
+because doing so would itself break the HMAC of those genesis rows.
+`verify` flags any gap between two heartbeats in the same session that
+exceeds `cadence_max_secs × 1.5` (fudge factor for scheduler jitter). These
+rows are chain-integrity plumbing, not tool-call activity: `query` hides
+them by default (`--include-synthetic` shows them), `export` always
+includes them, and Phase 3's anomaly rules never see them.
+
+**External anchor.** With `[anchor].enabled = true` (the default), a small
+JSONL file — itself an HMAC chain, keyed by `anchor_key` — is appended to
+every `cadence_secs` (default 300s) outside the database, at a per-platform
+default path unless `[anchor].path` overrides it:
+
+| Platform | Default path |
+|---|---|
+| Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/auditmcp/anchor.log` |
+| macOS | `~/Library/Application Support/auditmcp/anchor.log` |
+| Windows | `%LOCALAPPDATA%\auditmcp\anchor.log` |
+
+Each line names the chain's current tail (`chain_last_id`, `chain_last_hash`)
+and chains from the previous line's `anchor_hmac`. `verify` checks the
+anchor's own internal chain, then cross-checks every entry against the live
+database — a row the anchor names must still exist with the hash the anchor
+recorded. Anchoring needs a key, so it's unavailable (with a warning, not a
+failure) on a legacy unkeyed chain.
+
+**`auditmcp key`** — a deliberately small operational surface:
+
+```bash
+auditmcp key path        --config config.toml   # print the resolved key file path
+auditmcp key fingerprint --config config.toml   # sha256(root_key)[:16] -- safe to share
+auditmcp key backup <dest> --config config.toml # atomic copy, same 0600/0700 perms
+```
+
+No `key generate` (automatic on first run against a new database), no `key
+rotate` (see above), no `key import`.
+
+**`auditmcp reset`** — the only supported "start fresh" / migration path:
+
+```bash
+auditmcp reset --config config.toml --yes               # delete DB, key, and anchor; fresh chain
+auditmcp reset --config config.toml --yes --keep-old     # archive them (audit.db.reset-bak-<timestamp>), fresh chain
+```
+
+Refuses to run without `--yes`. `--keep-old` archives with a timestamped
+suffix rather than deleting; either way, a brand-new HMAC-protected chain
+(new key, new `db_uuid`) is bootstrapped immediately after.
+
+**Migrating a Phase 1-3 (legacy) chain.** There is no in-place upgrade — a
+retrofit would either need the user's blessing on some default key (bad UX)
+or produce a chain mixing hash schemes (bad design), and both are rejected.
+Two supported paths instead:
+
+1. **Keep it as-is.** A chain with no `hmac_version` in `chain_metadata`
+   keeps working exactly as before — `verify` still walks the plain
+   SHA-256 chain — but prints a warning on every `run` and `verify`:
+   > `WARNING: This chain uses legacy unkeyed SHA-256. New rows are being
+   > appended without HMAC protection. Run 'auditmcp reset --keep-old' to
+   > migrate to an HMAC-protected chain.`
+2. **Migrate by resetting.** `auditmcp reset --keep-old` archives the old
+   chain and starts a fresh one with HMAC, heartbeats, and the anchor all
+   enabled.
+
+**Config additions**, all optional and default on — see
+[`config.example.toml`](config.example.toml) for the full block with
+comments:
+
+```toml
+[chain]
+key_path = "~/.auditmcp/keys/audit.key"
+
+[heartbeat]
+enabled = true
+cadence_min_secs = 30
+cadence_max_secs = 90
+
+[anchor]
+enabled = true
+path = ""          # empty = per-platform default
+cadence_secs = 300
+```
+
+**Explicit non-goals for this phase:** key rotation, multi-anchor (writing
+the anchor to more than one location), OS keychain integration, OS-level
+append-only file bits (`chattr +a` / `chflags uappnd` — a possible future
+`auditmcp harden`), external witnessing or any network/remote anchor, and
+any policy enforcement or blocking — this is audit hardening, not a gateway.
+
+---
+
 ## Threat model
 
 Primary concern: a prompt-injected or otherwise compromised agent using MCP
 tool calls to exfiltrate data or take unintended destructive actions.
 Secondary: general accountability — "what did my agent actually do."
 
-Not defended against: a fully malicious MCP client that bypasses the proxy
+**What Phase 3.5 adds defense against**, on top of the plain hash chain: an
+attacker with database write access but not the key file can no longer
+forge or extend the chain (HMAC), and can no longer silently truncate the
+tail of an in-progress session without either a heartbeat-gap or a missing
+`__session_end` becoming visible (heartbeats), or the externally-stored
+anchor disagreeing with the (now-shorter) database (anchor) — provided the
+anchor file itself wasn't also under that attacker's control. An attacker
+with DB write access *and* anchor write access, but still without the key
+file, cannot forge either chain, since both are HMAC-keyed.
+
+**Still out of scope:** full-machine compromise (an attacker who reads the
+key file directly has everything needed to forge both chains), an
+adversary with both the key file and DB write access, and a truncation
+precise enough to avoid ever crossing a heartbeat or anchor tick. None of
+this defends against a fully malicious MCP client that bypasses the proxy
 entirely, or nation-state-level adversaries. This is a practical safety net,
 not a hardened boundary.
 

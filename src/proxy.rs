@@ -50,9 +50,68 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // unambiguous. See `session.rs` for why the scope has to exist anyway.
     let session = Arc::new(Session::new(uuid::Uuid::new_v4().to_string()));
     let server_name = config.server_name_for(program);
+
+    let db_path = Path::new(&config.logging.db_path);
+    // Phase 3.5: decides fresh-HMAC vs. existing-HMAC vs. legacy, and
+    // refuses to start outright if this database is HMAC-protected but the
+    // key can't be loaded or doesn't verify -- see `chain::bootstrap`.
+    let key_path = config.chain.resolved_key_path()?;
+    let chain_mode = crate::chain::bootstrap(
+        db_path,
+        &key_path,
+        config.heartbeat.cadence_min_secs,
+        config.heartbeat.cadence_max_secs,
+    )?;
+
     // Refuses to start if the database can't be opened -- see
     // `db::spawn_writer` for why that is not a fail-open case.
-    let (db, writer) = db::spawn_writer(Path::new(&config.logging.db_path))?;
+    let (db, writer) = db::spawn_writer_with_key(db_path, chain_mode.hash_key())?;
+
+    let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence(
+        config.heartbeat.cadence_min_secs,
+        config.heartbeat.cadence_max_secs,
+    );
+    if config.heartbeat.enabled {
+        db.log(crate::heartbeat::session_start_entry(
+            session.id(),
+            &server_name,
+            heartbeat_min,
+            heartbeat_max,
+        ));
+    }
+    let heartbeat_task = config.heartbeat.enabled.then(|| {
+        tokio::spawn(crate::heartbeat::run(
+            db.clone(),
+            session.id().to_string(),
+            server_name.clone(),
+            heartbeat_min,
+            heartbeat_max,
+        ))
+    });
+
+    // Anchor needs a real key: a legacy (unkeyed) chain has nothing to
+    // derive one from, so anchoring is silently unavailable there rather
+    // than refusing to start -- see the fail-open contract.
+    let anchor_task = match (config.anchor.enabled, chain_mode.anchor_key()) {
+        (true, Some(anchor_key)) => {
+            let anchor_path = crate::anchor::resolve_anchor_path(&config.anchor.path)?;
+            Some(tokio::spawn(crate::anchor::run(
+                db_path.to_path_buf(),
+                anchor_path,
+                anchor_key,
+                config.anchor.cadence_secs,
+            )))
+        }
+        (true, None) => {
+            tracing::warn!(
+                "[anchor] is enabled but this is a legacy (unkeyed) chain, which has no key \
+                 to anchor with; anchoring is skipped for this session. Run `auditmcp reset \
+                 --keep-old` to migrate to an HMAC-protected chain."
+            );
+            None
+        }
+        (false, _) => None,
+    };
 
     // Also refuses to start, for a different reason: `patterns.toml` is
     // compiled into the binary with `include_str!`, so this parse is
@@ -202,6 +261,18 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         if !status.success() {
             tracing::warn!("target command exited with status {status}");
         }
+    }
+
+    // Stop heartbeats before writing __session_end, so a heartbeat can
+    // never land after the row that's supposed to close the session.
+    if let Some(task) = heartbeat_task {
+        task.abort();
+    }
+    if let Some(task) = anchor_task {
+        task.abort();
+    }
+    if config.heartbeat.enabled {
+        db.log(crate::heartbeat::session_end_entry(session.id(), &server_name));
     }
 
     // Drop the last sender so the writer's channel closes, then wait for it

@@ -184,6 +184,7 @@ pub fn run(
         since_cutoff,
         status.as_deref(),
         anomalous,
+        true, // export is a complete record; synthetic rows are never hidden
     );
 
     match output {

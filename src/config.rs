@@ -17,6 +17,99 @@ pub struct Config {
     #[serde(default)]
     pub server: Vec<ServerConfig>,
     pub logging: LoggingConfig,
+    /// Phase 3.5 chain-hardening sections. All optional and all default
+    /// on, so a config written before Phase 3.5 existed parses unchanged
+    /// and gets the new protections automatically -- see
+    /// `auditmcp-phase-3.5-chain-hardening.md`.
+    #[serde(default)]
+    pub chain: ChainConfig,
+    #[serde(default)]
+    pub heartbeat: HeartbeatConfig,
+    #[serde(default)]
+    pub anchor: AnchorConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChainConfig {
+    /// Path to the HMAC root key file. `~` expands to the home directory.
+    /// Auto-generated on first run if the database does not exist yet.
+    #[serde(default = "default_key_path_string")]
+    pub key_path: String,
+}
+
+impl Default for ChainConfig {
+    fn default() -> Self {
+        ChainConfig {
+            key_path: default_key_path_string(),
+        }
+    }
+}
+
+fn default_key_path_string() -> String {
+    "~/.auditmcp/keys/audit.key".to_string()
+}
+
+impl ChainConfig {
+    pub fn resolved_key_path(&self) -> anyhow::Result<std::path::PathBuf> {
+        crate::keys::expand_tilde(&self.key_path)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HeartbeatConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_heartbeat_cadence_min")]
+    pub cadence_min_secs: u64,
+    #[serde(default = "default_heartbeat_cadence_max")]
+    pub cadence_max_secs: u64,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        HeartbeatConfig {
+            enabled: true,
+            cadence_min_secs: default_heartbeat_cadence_min(),
+            cadence_max_secs: default_heartbeat_cadence_max(),
+        }
+    }
+}
+
+fn default_heartbeat_cadence_min() -> u64 {
+    30
+}
+fn default_heartbeat_cadence_max() -> u64 {
+    90
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnchorConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Empty string means "use the per-platform default" -- see
+    /// `anchor::default_anchor_path`.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default = "default_anchor_cadence")]
+    pub cadence_secs: u64,
+}
+
+impl Default for AnchorConfig {
+    fn default() -> Self {
+        AnchorConfig {
+            enabled: true,
+            path: String::new(),
+            cadence_secs: default_anchor_cadence(),
+        }
+    }
+}
+
+fn default_anchor_cadence() -> u64 {
+    300
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Deserialize)]

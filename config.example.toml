@@ -69,3 +69,30 @@ default_tier = "minimal"
 [logging.tool_overrides]
 # delete_file = "full"
 # list_directory = "minimal"
+
+# --- Phase 3.5: chain hardening -------------------------------------------
+# All three sections below are optional and default ON — a config written
+# before Phase 3.5 existed parses unchanged and gets these protections
+# automatically the next time `auditmcp run` starts a fresh database. See
+# the README's "Chain hardening" section for what each one defends against.
+
+[chain]
+# Path to the HMAC root key file. Auto-generated on first run against a
+# database that doesn't exist yet; `~` expands to your home directory.
+# key_path = "~/.auditmcp/keys/audit.key"
+
+[heartbeat]
+# Synthetic chain rows written at a randomized cadence so within-session
+# tail truncation (deleting the newest rows) becomes visible to `verify`,
+# not just interior tampering.
+# enabled = true
+# cadence_min_secs = 30
+# cadence_max_secs = 90
+
+[anchor]
+# An external, append-only witness log (its own HMAC chain) stored outside
+# the database, so a whole-database truncate-and-replace attack also has to
+# find and rewrite this file to stay undetected.
+# enabled = true
+# path = ""   # empty = per-platform default; see the README
+# cadence_secs = 300

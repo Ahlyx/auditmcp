@@ -24,6 +24,7 @@ pub fn run(
     status: Option<String>,
     anomalous: bool,
     verbose: bool,
+    include_synthetic: bool,
 ) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     let conn = db::open_readonly(Path::new(&config.logging.db_path))?;
@@ -43,6 +44,7 @@ pub fn run(
         since_cutoff,
         status.as_deref(),
         anomalous,
+        include_synthetic,
     );
 
     if filtered.is_empty() {
@@ -122,6 +124,14 @@ pub fn run(
 /// documented at the anomaly module: rows with no rule fired have both
 /// score and reasons columns NULL, so absence and presence are the exact
 /// filter contract, not a comparison against zero.
+///
+/// `include_synthetic` controls Phase 3.5's `__`-prefixed rows
+/// (`__heartbeat`, `__session_start`, `__session_end` -- see
+/// `heartbeat.rs`): `false` is `query`'s default, since those rows are
+/// chain-integrity plumbing rather than tool-call activity and would
+/// otherwise clutter every listing. `export` always passes `true` --
+/// an export is a complete record for downstream tooling, and hiding rows
+/// there would undermine the very completeness an export exists to prove.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn filter_rows(
     rows: Vec<StoredRow>,
@@ -131,8 +141,10 @@ pub(crate) fn filter_rows(
     since_cutoff: Option<DateTime<Utc>>,
     status: Option<&str>,
     anomalous_only: bool,
+    include_synthetic: bool,
 ) -> Vec<StoredRow> {
     rows.into_iter()
+        .filter(|r| include_synthetic || !r.entry.tool_name.starts_with("__"))
         .filter(|r| tool.is_none() || tool == Some(r.entry.tool_name.as_str()))
         .filter(|r| session.is_none() || session == Some(r.entry.session_id.as_str()))
         .filter(|r| server.is_none() || server == r.entry.server_name.as_deref())
@@ -368,13 +380,17 @@ mod tests {
     }
 
     fn stored_row(id: i64, anomaly_score: Option<f64>) -> StoredRow {
+        stored_row_named(id, "echo", anomaly_score)
+    }
+
+    fn stored_row_named(id: i64, tool_name: &str, anomaly_score: Option<f64>) -> StoredRow {
         StoredRow {
             id,
             entry: crate::db::ToolCallEntry {
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
                 session_id: "s".to_string(),
                 agent_id: None,
-                tool_name: "echo".to_string(),
+                tool_name: tool_name.to_string(),
                 server_name: Some("srv".to_string()),
                 args_json: None,
                 result_json: None,
@@ -405,9 +421,32 @@ mod tests {
             stored_row(3, None),
             stored_row(4, Some(3.0)),
         ];
-        let filtered = filter_rows(rows, None, None, None, None, None, true);
+        let filtered = filter_rows(rows, None, None, None, None, None, true, true);
         let ids: Vec<i64> = filtered.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![2, 4]);
+    }
+
+    /// `include_synthetic=false` (query's default) drops every
+    /// `__`-prefixed row; `true` (export's contract) keeps them all.
+    #[test]
+    fn include_synthetic_toggles_dunder_prefixed_rows() {
+        let rows = || {
+            vec![
+                stored_row_named(1, "echo", None),
+                stored_row_named(2, "__heartbeat", None),
+                stored_row_named(3, "__session_start", None),
+                stored_row_named(4, "__session_end", None),
+            ]
+        };
+
+        let default_hidden = filter_rows(rows(), None, None, None, None, None, false, false);
+        assert_eq!(
+            default_hidden.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let shown = filter_rows(rows(), None, None, None, None, None, false, true);
+        assert_eq!(shown.len(), 4);
     }
 
     /// The pre-Phase-3 behavior: `anomalous_only=false` keeps every row
@@ -416,7 +455,7 @@ mod tests {
     #[test]
     fn anomalous_only_false_preserves_pre_phase_3_behavior() {
         let rows = vec![stored_row(1, None), stored_row(2, Some(1.0))];
-        let filtered = filter_rows(rows, None, None, None, None, None, false);
+        let filtered = filter_rows(rows, None, None, None, None, None, false, true);
         assert_eq!(filtered.len(), 2);
     }
 }

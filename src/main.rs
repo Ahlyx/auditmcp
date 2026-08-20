@@ -1,13 +1,18 @@
+mod anchor;
 mod anomaly;
 mod audit;
+mod chain;
 mod config;
 mod db;
 mod export;
 mod extract;
+mod heartbeat;
 mod http;
 mod jsonrpc;
+mod keys;
 mod proxy;
 mod query;
+mod reset;
 mod secrets;
 mod session;
 mod shutdown;
@@ -71,6 +76,12 @@ enum Command {
         /// this -- it stays clean and safe to glance at or paste elsewhere.
         #[arg(long)]
         verbose: bool,
+        /// Show Phase 3.5's synthetic chain rows (`__heartbeat`,
+        /// `__session_start`, `__session_end`), hidden by default since
+        /// they are chain-integrity plumbing rather than tool-call
+        /// activity.
+        #[arg(long)]
+        include_synthetic: bool,
     },
     /// Walk the hash chain and confirm no row was altered or removed.
     /// Exit codes: 0 = clean, 1 = hash-chain tamper/failure,
@@ -135,6 +146,52 @@ enum Command {
         #[arg(long)]
         note: String,
     },
+    /// Phase 3.5 chain-key operations: inspect or back up the HMAC root
+    /// key. No `generate` (happens automatically on first `run`) and no
+    /// `rotate`/`import` -- deliberate design decisions, see
+    /// `keys.rs`'s module doc.
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
+    },
+    /// Destructive: archives (`--keep-old`) or deletes the current
+    /// database, chain key, and anchor, then bootstraps a fresh
+    /// HMAC-protected chain. The only supported way to migrate a legacy
+    /// (pre-Phase-3.5) chain, or to get a new chain key.
+    Reset {
+        #[arg(long)]
+        config: PathBuf,
+        /// Required: `reset` is destructive and refuses to run without it.
+        #[arg(long)]
+        yes: bool,
+        /// Archive the old database/key/anchor with a timestamped
+        /// `.reset-bak-<stamp>` suffix instead of deleting them outright.
+        #[arg(long)]
+        keep_old: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyAction {
+    /// Print the resolved key file path (does not require the key to exist).
+    Path {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Print `sha256(root_key)[:16]` -- safe to share out-of-band to
+    /// confirm two people/machines are looking at the same key.
+    Fingerprint {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Atomically copy the key file to `dest`, with the same 0600/0700
+    /// permissions as the original (Unix; see the README for the Windows
+    /// caveat).
+    Backup {
+        #[arg(long)]
+        config: PathBuf,
+        dest: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -166,7 +223,17 @@ async fn main() -> anyhow::Result<()> {
             status,
             anomalous,
             verbose,
-        } => query::run(&config, tool, session, since, status, anomalous, verbose),
+            include_synthetic,
+        } => query::run(
+            &config,
+            tool,
+            session,
+            since,
+            status,
+            anomalous,
+            verbose,
+            include_synthetic,
+        ),
         Command::Verify {
             config,
             repair_index,
@@ -195,5 +262,38 @@ async fn main() -> anyhow::Result<()> {
             &config, format, tool, since, status, server, anomalous, output,
         ),
         Command::Unmask { config, hash, note } => unmask::run(&config, &hash, &note),
+        Command::Key { action } => match action {
+            KeyAction::Path { config } => {
+                let cfg = config::Config::load(&config)?;
+                println!("{}", cfg.chain.resolved_key_path()?.display());
+                Ok(())
+            }
+            KeyAction::Fingerprint { config } => {
+                let cfg = config::Config::load(&config)?;
+                let key_path = cfg.chain.resolved_key_path()?;
+                let key = keys::KeyFile::load(&key_path)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no key file at {} (has `auditmcp run` been used yet?)",
+                        key_path.display()
+                    )
+                })?;
+                println!("{}", key.fingerprint()?);
+                Ok(())
+            }
+            KeyAction::Backup { config, dest } => {
+                let cfg = config::Config::load(&config)?;
+                let key_path = cfg.chain.resolved_key_path()?;
+                let key = keys::KeyFile::load(&key_path)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no key file at {} (has `auditmcp run` been used yet?)",
+                        key_path.display()
+                    )
+                })?;
+                key.backup(&dest)?;
+                println!("Key backed up to {}", dest.display());
+                Ok(())
+            }
+        },
+        Command::Reset { config, yes, keep_old } => reset::run(&config, yes, keep_old),
     }
 }

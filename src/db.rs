@@ -55,8 +55,20 @@ CREATE TABLE IF NOT EXISTS redactions (
 );
 CREATE INDEX IF NOT EXISTS idx_redactions_sha256 ON redactions(secret_sha256);
 CREATE INDEX IF NOT EXISTS idx_redactions_tool_call_id ON redactions(tool_call_id);
+
+-- SCHEMA CHANGE (Phase 3.5, chain hardening): per-database chain
+-- configuration, populated once at genesis and never mutated afterward.
+-- Absence of the `hmac_version` key marks the chain as a pre-Phase-3.5
+-- (Phase 1-3) legacy chain -- unkeyed SHA-256, no HMAC, no heartbeats, no
+-- anchor. A row's presence here is what tells `run`/`verify` which hashing
+-- scheme applies to THIS database; see `chain::bootstrap`.
+CREATE TABLE IF NOT EXISTS chain_metadata (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 "#;
 
+use hmac::{Hmac, Mac};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -182,6 +194,132 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// `hash = HMAC-SHA256(chain_key, prev_hash || canonical_json(entry))`,
+/// hex-encoded. Same canonicalization and prev_hash-input convention as
+/// `compute_hash` (see its doc); the only difference is the keyed
+/// primitive, which is what makes the chain unforgeable by someone who has
+/// database write access but not the key file (Phase 3.5's whole point --
+/// see the module doc at the top of this file... actually see
+/// `auditmcp-phase-3.5-chain-hardening.md` for the threat model this
+/// defends against).
+fn compute_hash_hmac(chain_key: &[u8; 32], prev_hash: &str, entry: &ToolCallEntry) -> anyhow::Result<String> {
+    let canonical = serde_json::to_string(entry)
+        .map_err(|e| anyhow::anyhow!("failed to canonicalize entry for hashing: {e}"))?;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(chain_key)
+        .map_err(|e| anyhow::anyhow!("failed to initialize HMAC: {e}"))?;
+    mac.update(prev_hash.as_bytes());
+    mac.update(canonical.as_bytes());
+    let digest = mac.finalize().into_bytes();
+
+    Ok(hex_encode(&digest))
+}
+
+/// Which hashing scheme a chain write or verification uses. `Legacy` is
+/// the unkeyed Phase 1-3 SHA-256 chain (see `compute_hash`); `Hmac` is
+/// Phase 3.5's keyed chain (see `compute_hash_hmac`). A single database's
+/// chain is one or the other for its entire lifetime -- see
+/// `chain::bootstrap` and the "No in-place upgrade" section of the Phase
+/// 3.5 spec for why there is no in-between state.
+#[derive(Clone, Copy)]
+pub enum HashKey {
+    Legacy,
+    Hmac([u8; 32]),
+}
+
+impl HashKey {
+    fn compute(&self, prev_hash: &str, entry: &ToolCallEntry) -> anyhow::Result<String> {
+        match self {
+            HashKey::Legacy => compute_hash(prev_hash, entry),
+            HashKey::Hmac(key) => compute_hash_hmac(key, prev_hash, entry),
+        }
+    }
+}
+
+/// One `chain_metadata` row's worth of genesis configuration, read back.
+/// `hmac_version` is `None` for a legacy (pre-Phase-3.5) chain -- its
+/// absence, not a special value, is what marks legacy, matching how the
+/// table is documented in `SCHEMA`.
+#[derive(Debug, Clone)]
+pub struct ChainMetadata {
+    pub db_uuid: String,
+    pub hmac_version: Option<String>,
+    pub heartbeat_cadence_min_secs: Option<u64>,
+    pub heartbeat_cadence_max_secs: Option<u64>,
+    pub created_at: Option<String>,
+}
+
+fn chain_metadata_get(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM chain_metadata WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| anyhow::anyhow!("failed to read chain_metadata.{key}: {e}"))
+}
+
+/// Reads back the chain's genesis configuration, or `None` if this
+/// database predates the `chain_metadata` table entirely (an empty, freshly
+/// created table also reads back as `None` here via the `db_uuid` check --
+/// a chain with no `db_uuid` row has no genesis configuration to speak of).
+pub fn read_chain_metadata(conn: &Connection) -> anyhow::Result<Option<ChainMetadata>> {
+    let Some(db_uuid) = chain_metadata_get(conn, "db_uuid")? else {
+        return Ok(None);
+    };
+    let hmac_version = chain_metadata_get(conn, "hmac_version")?;
+    let heartbeat_cadence_min_secs = chain_metadata_get(conn, "heartbeat_cadence_min_secs")?
+        .and_then(|v| v.parse().ok());
+    let heartbeat_cadence_max_secs = chain_metadata_get(conn, "heartbeat_cadence_max_secs")?
+        .and_then(|v| v.parse().ok());
+    let created_at = chain_metadata_get(conn, "created_at")?;
+
+    Ok(Some(ChainMetadata {
+        db_uuid,
+        hmac_version,
+        heartbeat_cadence_min_secs,
+        heartbeat_cadence_max_secs,
+        created_at,
+    }))
+}
+
+/// Writes the genesis `chain_metadata` row set for a brand-new HMAC chain.
+/// Called exactly once, at the moment a fresh database is initialized --
+/// see `chain::bootstrap`. Never called again afterward: these values are
+/// fixed for the chain's lifetime (in particular, the heartbeat cadence
+/// range is genesis-fixed specifically so an attacker with DB write access
+/// cannot lower the expected cadence retroactively to hide a gap, since
+/// doing so would break the HMAC of these very rows).
+pub fn write_chain_metadata_genesis(
+    conn: &Connection,
+    db_uuid: &str,
+    heartbeat_cadence_min_secs: u64,
+    heartbeat_cadence_max_secs: u64,
+) -> anyhow::Result<()> {
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let entries: [(&str, String); 5] = [
+        ("db_uuid", db_uuid.to_string()),
+        ("hmac_version", "1".to_string()),
+        (
+            "heartbeat_cadence_min_secs",
+            heartbeat_cadence_min_secs.to_string(),
+        ),
+        (
+            "heartbeat_cadence_max_secs",
+            heartbeat_cadence_max_secs.to_string(),
+        ),
+        ("created_at", created_at),
+    ];
+    for (key, value) in entries {
+        conn.execute(
+            "INSERT INTO chain_metadata (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )
+        .map_err(|e| anyhow::anyhow!("failed to write chain_metadata.{key}: {e}"))?;
+    }
+    Ok(())
 }
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -320,7 +458,27 @@ fn last_hash(conn: &Connection) -> anyhow::Result<String> {
 ///     in-memory cache `writer_loop` used to keep) can be stale the moment
 ///     another process commits, and inserting with it forks the chain just
 ///     as surely as the deferred-BEGIN race.
+// Every production write path now goes through `insert_row_with_key`
+// (Phase 3.5), which needs a `HashKey` decided by `chain::bootstrap`. This
+// plain-legacy wrapper has no production caller left -- it exists solely
+// so the large pre-Phase-3.5 test suite, pinned to unkeyed SHA-256 golden
+// hashes, needs no changes. `#[cfg(test)]` says that plainly instead of
+// leaving it looking like unused production code.
+#[cfg(test)]
 pub(crate) fn insert_row(conn: &mut Connection, entry: &ToolCallEntry) -> anyhow::Result<String> {
+    insert_row_with_key(conn, entry, &HashKey::Legacy)
+}
+
+/// Same as `insert_row`, but hashes under the given `HashKey` -- `Legacy`
+/// for a pre-Phase-3.5 chain, `Hmac` for one bootstrapped under Phase 3.5.
+/// `insert_row` is kept as a thin `Legacy`-only wrapper (rather than being
+/// replaced by this everywhere) so the large existing Phase 1-3 test suite,
+/// which is pinned to plain unkeyed SHA-256 golden hashes, needs no changes.
+pub(crate) fn insert_row_with_key(
+    conn: &mut Connection,
+    entry: &ToolCallEntry,
+    hash_key: &HashKey,
+) -> anyhow::Result<String> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| anyhow::anyhow!("failed to begin insert transaction: {e}"))?;
@@ -329,7 +487,7 @@ pub(crate) fn insert_row(conn: &mut Connection, entry: &ToolCallEntry) -> anyhow
     // hold the write lock, so no other process can move the head between
     // this read and our COMMIT.
     let prev_hash = last_hash(&tx)?;
-    let hash = compute_hash(&prev_hash, entry)?;
+    let hash = hash_key.compute(&prev_hash, entry)?;
 
     // GENESIS_PREV_HASH is a hash *input* sentinel only — the stored
     // prev_hash column stays NULL for the first row, matching the schema's
@@ -980,7 +1138,19 @@ impl std::fmt::Display for ChainIssue {
 /// any"). The outer `Result` is for operational failures (can't read the
 /// table at all); the inner `Result` is the actual verification outcome —
 /// `Ok(row_count)` means every row checked out.
+// See the `#[cfg(test)]` note on `insert_row` above -- same reasoning.
+#[cfg(test)]
 pub fn verify_chain(conn: &Connection) -> anyhow::Result<Result<usize, ChainIssue>> {
+    verify_chain_with_key(conn, &HashKey::Legacy)
+}
+
+/// Same as `verify_chain`, but recomputes each row's hash under the given
+/// `HashKey`. See `insert_row_with_key` for why `verify_chain` stays a
+/// thin `Legacy`-only wrapper rather than being replaced by this.
+pub fn verify_chain_with_key(
+    conn: &Connection,
+    hash_key: &HashKey,
+) -> anyhow::Result<Result<usize, ChainIssue>> {
     let rows = read_all_rows(conn)?;
 
     let mut expected_prev_hash = GENESIS_PREV_HASH.to_string();
@@ -1010,7 +1180,7 @@ pub fn verify_chain(conn: &Connection) -> anyhow::Result<Result<usize, ChainIssu
             }));
         }
 
-        let recomputed = compute_hash(&stored_prev_hash, &row.entry)?;
+        let recomputed = hash_key.compute(&stored_prev_hash, &row.entry)?;
         if recomputed != row.hash {
             return Ok(Err(ChainIssue::ContentTampered {
                 id: row.id,
@@ -1193,6 +1363,17 @@ impl DbWriter {
 /// so there is no way to tell the user later and the obligation moves to
 /// telling them now.
 pub fn spawn_writer(db_path: &Path) -> anyhow::Result<(DbHandle, DbWriter)> {
+    spawn_writer_with_key(db_path, HashKey::Legacy)
+}
+
+/// Same as `spawn_writer`, but every row the writer thread inserts is
+/// hashed under the given `HashKey` rather than always the legacy scheme.
+/// This is what `chain::bootstrap`'s decision (fresh HMAC chain vs.
+/// existing legacy chain) actually gets wired to at runtime.
+pub fn spawn_writer_with_key(
+    db_path: &Path,
+    hash_key: HashKey,
+) -> anyhow::Result<(DbHandle, DbWriter)> {
     let conn = open_db(db_path)?;
     let (tx, rx) = sync_channel::<ToolCallEntry>(CHANNEL_CAPACITY);
     let (done_tx, done_rx) = sync_channel::<()>(1);
@@ -1200,7 +1381,7 @@ pub fn spawn_writer(db_path: &Path) -> anyhow::Result<(DbHandle, DbWriter)> {
 
     let writer_tally = tally.clone();
     let handle = std::thread::spawn(move || {
-        writer_loop(conn, rx, writer_tally);
+        writer_loop(conn, rx, writer_tally, hash_key);
         let _ = done_tx.send(());
     });
 
@@ -1222,7 +1403,12 @@ pub fn spawn_writer(db_path: &Path) -> anyhow::Result<(DbHandle, DbWriter)> {
 /// release profile, a panic on this thread would abort the *entire*
 /// process, taking the proxied session down with it — exactly what
 /// fail-open logging must not do.
-fn writer_loop(mut conn: Connection, rx: Receiver<ToolCallEntry>, dropped: DropTally) {
+fn writer_loop(
+    mut conn: Connection,
+    rx: Receiver<ToolCallEntry>,
+    dropped: DropTally,
+    hash_key: HashKey,
+) {
     // No "database unavailable" branch here any more: `spawn_writer` opens
     // the connection before this thread exists, so reaching this function
     // means the database is open. A proxy that runs while recording nothing
@@ -1236,7 +1422,7 @@ fn writer_loop(mut conn: Connection, rx: Receiver<ToolCallEntry>, dropped: DropT
     // the SHA-256 and the disk write.
     for entry in rx.iter() {
         let tool_name = entry.tool_name.clone();
-        if let Err(e) = insert_row(&mut conn, &entry) {
+        if let Err(e) = insert_row_with_key(&mut conn, &entry, &hash_key) {
             // Counted, not just warned. This is a genuine loss -- the
             // transaction rolled back, so the chain is intact but shorter
             // than the calls that happened -- and it is the loss path most
