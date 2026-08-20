@@ -44,7 +44,12 @@ pub fn random_cadence(min_secs: u64, max_secs: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
-fn base_entry(session_id: &str, server_name: &str, tool_name: &str, args_json: String) -> ToolCallEntry {
+fn base_entry(
+    session_id: &str,
+    server_name: &str,
+    tool_name: &str,
+    args_json: String,
+) -> ToolCallEntry {
     ToolCallEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         session_id: session_id.to_string(),
@@ -169,9 +174,15 @@ pub async fn run(
         tokio::time::sleep(this_cadence).await;
 
         let next_cadence = random_cadence(cadence_min_secs, cadence_max_secs);
-        let expected_next_before = chrono::Utc::now() + chrono::Duration::from_std(next_cadence).unwrap_or_default();
+        let expected_next_before =
+            chrono::Utc::now() + chrono::Duration::from_std(next_cadence).unwrap_or_default();
         let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-        db.log(heartbeat_entry(&session_id, &server_name, n, expected_next_before));
+        db.log(heartbeat_entry(
+            &session_id,
+            &server_name,
+            n,
+            expected_next_before,
+        ));
     }
 }
 
@@ -206,7 +217,10 @@ pub fn find_heartbeat_gaps(
     let mut by_session: HashMap<&str, Vec<&crate::db::StoredRow>> = HashMap::new();
     for r in rows {
         if r.entry.tool_name == HEARTBEAT_TOOL_NAME {
-            by_session.entry(r.entry.session_id.as_str()).or_default().push(r);
+            by_session
+                .entry(r.entry.session_id.as_str())
+                .or_default()
+                .push(r);
         }
     }
 
@@ -265,7 +279,8 @@ mod tests {
         assert!(entry.anomaly_score.is_none());
         assert!(entry.anomaly_reasons.is_none());
 
-        let args: serde_json::Value = serde_json::from_str(entry.args_json.as_deref().unwrap()).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(entry.args_json.as_deref().unwrap()).unwrap();
         assert_eq!(args["type"], "heartbeat");
         assert_eq!(args["counter"], 42);
         assert_eq!(args["expected_next_before"], now.to_rfc3339());
@@ -282,7 +297,8 @@ mod tests {
     #[test]
     fn session_start_carries_the_cadence_range_used_for_this_session() {
         let start = session_start_entry("sess-1", "srv", 12, 34);
-        let args: serde_json::Value = serde_json::from_str(start.args_json.as_deref().unwrap()).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(start.args_json.as_deref().unwrap()).unwrap();
         assert_eq!(args["heartbeat_cadence_min_secs"], 12);
         assert_eq!(args["heartbeat_cadence_max_secs"], 34);
         assert_eq!(args["session_id"], "sess-1");

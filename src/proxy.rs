@@ -272,7 +272,10 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         task.abort();
     }
     if config.heartbeat.enabled {
-        db.log(crate::heartbeat::session_end_entry(session.id(), &server_name));
+        db.log(crate::heartbeat::session_end_entry(
+            session.id(),
+            &server_name,
+        ));
     }
 
     // Drop the last sender so the writer's channel closes, then wait for it

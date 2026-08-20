@@ -193,7 +193,10 @@ mod tests {
     use crate::db::test_support::{remove_db_files, temp_db_path};
 
     fn temp_key_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("auditmcp_test_bootstrap_key_{label}_{}.key", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "auditmcp_test_bootstrap_key_{label}_{}.key",
+            uuid::Uuid::new_v4()
+        ))
     }
 
     struct Fixture {
@@ -248,8 +251,12 @@ mod tests {
         {
             let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
             let mut conn = db::open_for_write(&fx.db_path).unwrap();
-            db::insert_row_with_key(&mut conn, &db::test_support::sample_entry(), &mode.hash_key())
-                .unwrap();
+            db::insert_row_with_key(
+                &mut conn,
+                &db::test_support::sample_entry(),
+                &mode.hash_key(),
+            )
+            .unwrap();
         }
 
         let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
@@ -262,8 +269,12 @@ mod tests {
         {
             let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
             let mut conn = db::open_for_write(&fx.db_path).unwrap();
-            db::insert_row_with_key(&mut conn, &db::test_support::sample_entry(), &mode.hash_key())
-                .unwrap();
+            db::insert_row_with_key(
+                &mut conn,
+                &db::test_support::sample_entry(),
+                &mode.hash_key(),
+            )
+            .unwrap();
         }
         std::fs::remove_file(&fx.key_path).unwrap();
 
@@ -277,8 +288,12 @@ mod tests {
         {
             let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
             let mut conn = db::open_for_write(&fx.db_path).unwrap();
-            db::insert_row_with_key(&mut conn, &db::test_support::sample_entry(), &mode.hash_key())
-                .unwrap();
+            db::insert_row_with_key(
+                &mut conn,
+                &db::test_support::sample_entry(),
+                &mode.hash_key(),
+            )
+            .unwrap();
         }
         // Swap in a different key file with the same db_uuid but a
         // different root key.

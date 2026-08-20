@@ -157,7 +157,13 @@ pub fn run(config_path: &Path, repair_index: bool, yes: bool) -> anyhow::Result<
         if repair_index {
             println!("Nothing to repair.");
         }
-        return finish_clean(&conn, &config, &metadata, anchor_key, key_fingerprint.as_deref());
+        return finish_clean(
+            &conn,
+            &config,
+            &metadata,
+            anchor_key,
+            key_fingerprint.as_deref(),
+        );
     }
 
     // Distinct wording from the chain-tamper FAILED above: drift is not
@@ -201,7 +207,13 @@ pub fn run(config_path: &Path, repair_index: bool, yes: bool) -> anyhow::Result<
         println!(
             "OK: re-checked after repair — redactions index now consistent with redaction_flags."
         );
-        finish_clean(&conn, &config, &metadata, anchor_key, key_fingerprint.as_deref())
+        finish_clean(
+            &conn,
+            &config,
+            &metadata,
+            anchor_key,
+            key_fingerprint.as_deref(),
+        )
     } else {
         eprintln!(
             "DRIFT: {} row(s) still inconsistent after repair (no parseable redaction_flags to rebuild from):",
@@ -267,7 +279,10 @@ fn finish_clean(
                 }
                 let mismatches = crate::anchor::verify_anchor_against_chain(&entries, &rows);
                 if !mismatches.is_empty() {
-                    eprintln!("FAILED: anchor cross-check against the database found {} issue(s):", mismatches.len());
+                    eprintln!(
+                        "FAILED: anchor cross-check against the database found {} issue(s):",
+                        mismatches.len()
+                    );
                     for m in &mismatches {
                         eprintln!("  {m}");
                     }
@@ -291,7 +306,9 @@ fn finish_clean(
         "Summary: {} row(s), {} session(s), last row at {}{}{}",
         rows.len(),
         session_count,
-        rows.last().map(|r| r.entry.timestamp.as_str()).unwrap_or("-"),
+        rows.last()
+            .map(|r| r.entry.timestamp.as_str())
+            .unwrap_or("-"),
         key_fingerprint
             .map(|fp| format!(", key fingerprint {fp}"))
             .unwrap_or_default(),
@@ -533,10 +550,14 @@ mod tests {
     impl HmacFixture {
         fn new(label: &str, heartbeat_max_secs: u64, anchor_enabled: bool) -> Self {
             let db_path = temp_db_path(label);
-            let key_path = std::env::temp_dir()
-                .join(format!("auditmcp_test_verify_key_{label}_{}.key", uuid::Uuid::new_v4()));
-            let anchor_path = std::env::temp_dir()
-                .join(format!("auditmcp_test_verify_anchor_{label}_{}.log", uuid::Uuid::new_v4()));
+            let key_path = std::env::temp_dir().join(format!(
+                "auditmcp_test_verify_key_{label}_{}.key",
+                uuid::Uuid::new_v4()
+            ));
+            let anchor_path = std::env::temp_dir().join(format!(
+                "auditmcp_test_verify_anchor_{label}_{}.log",
+                uuid::Uuid::new_v4()
+            ));
             let config_path = db_path.with_extension("toml");
             std::fs::write(
                 &config_path,
@@ -592,8 +613,12 @@ mod tests {
         let fx = HmacFixture::new("hmac_clean", 90, false);
         let mode = fx.bootstrap();
         let mut conn = db::open_for_write(&fx.db_path).unwrap();
-        db::insert_row_with_key(&mut conn, &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"), &mode.hash_key())
-            .unwrap();
+        db::insert_row_with_key(
+            &mut conn,
+            &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"),
+            &mode.hash_key(),
+        )
+        .unwrap();
         drop(conn);
 
         assert_eq!(fx.run().unwrap(), VerifyOutcome::Clean);
@@ -604,8 +629,12 @@ mod tests {
         let fx = HmacFixture::new("hmac_missing_key", 90, false);
         let mode = fx.bootstrap();
         let mut conn = db::open_for_write(&fx.db_path).unwrap();
-        db::insert_row_with_key(&mut conn, &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"), &mode.hash_key())
-            .unwrap();
+        db::insert_row_with_key(
+            &mut conn,
+            &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"),
+            &mode.hash_key(),
+        )
+        .unwrap();
         drop(conn);
         std::fs::remove_file(&fx.key_path).unwrap();
 
@@ -653,10 +682,18 @@ mod tests {
         let fx = HmacFixture::new("hmac_anchor_broken", 90, true);
         let mode = fx.bootstrap();
         let mut conn = db::open_for_write(&fx.db_path).unwrap();
-        let hash = db::insert_row_with_key(&mut conn, &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"), &mode.hash_key())
-            .unwrap();
+        let hash = db::insert_row_with_key(
+            &mut conn,
+            &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"),
+            &mode.hash_key(),
+        )
+        .unwrap();
         let id: i64 = conn
-            .query_row("SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         drop(conn);
 
@@ -678,10 +715,18 @@ mod tests {
         let fx = HmacFixture::new("hmac_anchor_mismatch", 90, true);
         let mode = fx.bootstrap();
         let mut conn = db::open_for_write(&fx.db_path).unwrap();
-        let hash = db::insert_row_with_key(&mut conn, &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"), &mode.hash_key())
-            .unwrap();
+        let hash = db::insert_row_with_key(
+            &mut conn,
+            &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"),
+            &mode.hash_key(),
+        )
+        .unwrap();
         let id: i64 = conn
-            .query_row("SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
 
         let anchor_key = mode.anchor_key().unwrap();
@@ -693,7 +738,8 @@ mod tests {
         // hash-chain walk. Deleting the only row makes the chain trivially
         // empty (still verifies as intact -- zero rows), so the anchor
         // mismatch is the only failure this test can hit.
-        conn.execute("DELETE FROM tool_calls WHERE id = ?1", [id]).unwrap();
+        conn.execute("DELETE FROM tool_calls WHERE id = ?1", [id])
+            .unwrap();
         drop(conn);
 
         assert_eq!(fx.run().unwrap(), VerifyOutcome::AnchorMismatch);
@@ -704,10 +750,18 @@ mod tests {
         let fx = HmacFixture::new("hmac_anchor_clean", 90, true);
         let mode = fx.bootstrap();
         let mut conn = db::open_for_write(&fx.db_path).unwrap();
-        let hash = db::insert_row_with_key(&mut conn, &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"), &mode.hash_key())
-            .unwrap();
+        let hash = db::insert_row_with_key(
+            &mut conn,
+            &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"),
+            &mode.hash_key(),
+        )
+        .unwrap();
         let id: i64 = conn
-            .query_row("SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         drop(conn);
 

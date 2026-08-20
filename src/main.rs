@@ -294,6 +294,10 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         },
-        Command::Reset { config, yes, keep_old } => reset::run(&config, yes, keep_old),
+        Command::Reset {
+            config,
+            yes,
+            keep_old,
+        } => reset::run(&config, yes, keep_old),
     }
 }

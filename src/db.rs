@@ -204,7 +204,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// see the module doc at the top of this file... actually see
 /// `auditmcp-phase-3.5-chain-hardening.md` for the threat model this
 /// defends against).
-fn compute_hash_hmac(chain_key: &[u8; 32], prev_hash: &str, entry: &ToolCallEntry) -> anyhow::Result<String> {
+fn compute_hash_hmac(
+    chain_key: &[u8; 32],
+    prev_hash: &str,
+    entry: &ToolCallEntry,
+) -> anyhow::Result<String> {
     let canonical = serde_json::to_string(entry)
         .map_err(|e| anyhow::anyhow!("failed to canonicalize entry for hashing: {e}"))?;
 
@@ -270,10 +274,10 @@ pub fn read_chain_metadata(conn: &Connection) -> anyhow::Result<Option<ChainMeta
         return Ok(None);
     };
     let hmac_version = chain_metadata_get(conn, "hmac_version")?;
-    let heartbeat_cadence_min_secs = chain_metadata_get(conn, "heartbeat_cadence_min_secs")?
-        .and_then(|v| v.parse().ok());
-    let heartbeat_cadence_max_secs = chain_metadata_get(conn, "heartbeat_cadence_max_secs")?
-        .and_then(|v| v.parse().ok());
+    let heartbeat_cadence_min_secs =
+        chain_metadata_get(conn, "heartbeat_cadence_min_secs")?.and_then(|v| v.parse().ok());
+    let heartbeat_cadence_max_secs =
+        chain_metadata_get(conn, "heartbeat_cadence_max_secs")?.and_then(|v| v.parse().ok());
     let created_at = chain_metadata_get(conn, "created_at")?;
 
     Ok(Some(ChainMetadata {

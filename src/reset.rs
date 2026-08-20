@@ -55,7 +55,10 @@ pub fn run(config_path: &Path, yes: bool, keep_old: bool) -> anyhow::Result<()> 
     for line in &summary {
         println!("  {line}");
     }
-    println!("  created: fresh HMAC-protected chain at {}", db_path.display());
+    println!(
+        "  created: fresh HMAC-protected chain at {}",
+        db_path.display()
+    );
     println!("  created: new chain key at {}", key_path.display());
 
     Ok(())
@@ -75,12 +78,21 @@ fn archive_or_remove(
     if keep_old {
         let backup_path = append_suffix(path, &format!(".reset-bak-{stamp}"));
         std::fs::rename(path, &backup_path).map_err(|e| {
-            anyhow::anyhow!("failed to archive {label} file {} to {}: {e}", path.display(), backup_path.display())
+            anyhow::anyhow!(
+                "failed to archive {label} file {} to {}: {e}",
+                path.display(),
+                backup_path.display()
+            )
         })?;
-        summary.push(format!("archived {label}: {} -> {}", path.display(), backup_path.display()));
+        summary.push(format!(
+            "archived {label}: {} -> {}",
+            path.display(),
+            backup_path.display()
+        ));
     } else {
-        std::fs::remove_file(path)
-            .map_err(|e| anyhow::anyhow!("failed to remove {label} file {}: {e}", path.display()))?;
+        std::fs::remove_file(path).map_err(|e| {
+            anyhow::anyhow!("failed to remove {label} file {}: {e}", path.display())
+        })?;
         summary.push(format!("removed {label}: {}", path.display()));
     }
     Ok(())
@@ -110,10 +122,14 @@ mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let db_path = temp_db_path(label);
-            let key_path = std::env::temp_dir()
-                .join(format!("auditmcp_test_reset_key_{label}_{}.key", uuid::Uuid::new_v4()));
-            let anchor_path = std::env::temp_dir()
-                .join(format!("auditmcp_test_reset_anchor_{label}_{}.log", uuid::Uuid::new_v4()));
+            let key_path = std::env::temp_dir().join(format!(
+                "auditmcp_test_reset_key_{label}_{}.key",
+                uuid::Uuid::new_v4()
+            ));
+            let anchor_path = std::env::temp_dir().join(format!(
+                "auditmcp_test_reset_anchor_{label}_{}.log",
+                uuid::Uuid::new_v4()
+            ));
             let config_path = db_path.with_extension("toml");
             std::fs::write(
                 &config_path,
@@ -137,8 +153,12 @@ mod tests {
         fn seed(&self) {
             let mode = crate::chain::bootstrap(&self.db_path, &self.key_path, 30, 90).unwrap();
             let mut conn = crate::db::open_for_write(&self.db_path).unwrap();
-            crate::db::insert_row_with_key(&mut conn, &crate::db::test_support::sample_entry(), &mode.hash_key())
-                .unwrap();
+            crate::db::insert_row_with_key(
+                &mut conn,
+                &crate::db::test_support::sample_entry(),
+                &mode.hash_key(),
+            )
+            .unwrap();
             std::fs::write(&self.anchor_path, "{}\n").unwrap();
         }
     }
@@ -152,7 +172,12 @@ mod tests {
             // Sweep any archived backups this test's own runs created.
             if let Some(parent) = self.db_path.parent() {
                 if let Ok(entries) = std::fs::read_dir(parent) {
-                    let stem = self.db_path.file_name().unwrap().to_string_lossy().to_string();
+                    let stem = self
+                        .db_path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
                     for e in entries.flatten() {
                         let name = e.file_name().to_string_lossy().to_string();
                         if name.starts_with(&stem) && name.contains("reset-bak") {
@@ -179,7 +204,10 @@ mod tests {
 
         run(&fx.config_path, true, false).unwrap();
 
-        assert!(fx.db_path.exists(), "a fresh database must exist after reset");
+        assert!(
+            fx.db_path.exists(),
+            "a fresh database must exist after reset"
+        );
         assert!(fx.key_path.exists(), "a fresh key must exist after reset");
 
         let conn = crate::db::open_readonly(&fx.db_path).unwrap();

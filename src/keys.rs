@@ -108,11 +108,12 @@ impl KeyFile {
     /// equivalent tightening applied here, which is a known gap (see the
     /// README's chain-hardening section).
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("key path {} has no parent directory", path.display()))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("failed to create key directory {}: {e}", parent.display()))?;
+        let parent = path.parent().ok_or_else(|| {
+            anyhow::anyhow!("key path {} has no parent directory", path.display())
+        })?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!("failed to create key directory {}: {e}", parent.display())
+        })?;
 
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow::anyhow!("failed to serialize key file: {e}"))?;
@@ -136,11 +137,18 @@ impl KeyFile {
     /// interrupted backup never leaves a half-written file at `dest`.
     /// Permissions on the copy are set the same way `save` sets them.
     pub fn backup(&self, dest: &Path) -> anyhow::Result<()> {
-        let parent = dest
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("backup destination {} has no parent directory", dest.display()))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("failed to create backup directory {}: {e}", parent.display()))?;
+        let parent = dest.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "backup destination {} has no parent directory",
+                dest.display()
+            )
+        })?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create backup directory {}: {e}",
+                parent.display()
+            )
+        })?;
 
         let tmp = dest.with_extension(format!(
             "{}.tmp-{}",
@@ -149,8 +157,9 @@ impl KeyFile {
         ));
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow::anyhow!("failed to serialize key file: {e}"))?;
-        std::fs::write(&tmp, json)
-            .map_err(|e| anyhow::anyhow!("failed to write backup temp file {}: {e}", tmp.display()))?;
+        std::fs::write(&tmp, json).map_err(|e| {
+            anyhow::anyhow!("failed to write backup temp file {}: {e}", tmp.display())
+        })?;
 
         #[cfg(unix)]
         {
@@ -161,7 +170,10 @@ impl KeyFile {
 
         std::fs::rename(&tmp, dest).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            anyhow::anyhow!("failed to move backup into place at {}: {e}", dest.display())
+            anyhow::anyhow!(
+                "failed to move backup into place at {}: {e}",
+                dest.display()
+            )
         })?;
         Ok(())
     }
@@ -277,8 +289,11 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
-        let parent_mode =
-            std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        let parent_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(parent_mode, 0o700);
 
         std::fs::remove_file(&path).ok();
@@ -358,7 +373,11 @@ mod tests {
 
     #[test]
     fn expand_tilde_leaves_absolute_paths_untouched() {
-        let p = if cfg!(windows) { "C:\\abs\\path" } else { "/abs/path" };
+        let p = if cfg!(windows) {
+            "C:\\abs\\path"
+        } else {
+            "/abs/path"
+        };
         let expanded = expand_tilde(p).unwrap();
         assert_eq!(expanded, PathBuf::from(p));
     }

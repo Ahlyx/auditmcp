@@ -45,7 +45,12 @@ pub struct AnchorEntry {
 /// followed by hash `"3..."` (JSON canonicalization doesn't apply here
 /// since this isn't hashing a struct -- these are the four scalar values
 /// named directly in the spec).
-fn canonical_bytes(timestamp: &str, chain_last_id: i64, chain_last_hash: &str, prev_anchor_hmac: &str) -> Vec<u8> {
+fn canonical_bytes(
+    timestamp: &str,
+    chain_last_id: i64,
+    chain_last_hash: &str,
+    prev_anchor_hmac: &str,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(timestamp.as_bytes());
     buf.push(0);
@@ -66,7 +71,12 @@ fn compute_anchor_hmac(
 ) -> anyhow::Result<String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(anchor_key)
         .map_err(|e| anyhow::anyhow!("failed to initialize anchor HMAC: {e}"))?;
-    mac.update(&canonical_bytes(timestamp, chain_last_id, chain_last_hash, prev_anchor_hmac));
+    mac.update(&canonical_bytes(
+        timestamp,
+        chain_last_id,
+        chain_last_hash,
+        prev_anchor_hmac,
+    ));
     let digest = mac.finalize().into_bytes();
     Ok(hex_encode(&digest))
 }
@@ -88,14 +98,16 @@ fn hex_encode(bytes: &[u8]) -> String {
 pub fn default_anchor_path() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        let base = std::env::var_os("LOCALAPPDATA")
-            .ok_or_else(|| anyhow::anyhow!("%LOCALAPPDATA% is not set; cannot resolve the default anchor path"))?;
+        let base = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+            anyhow::anyhow!("%LOCALAPPDATA% is not set; cannot resolve the default anchor path")
+        })?;
         Ok(PathBuf::from(base).join("auditmcp").join("anchor.log"))
     }
     #[cfg(target_os = "macos")]
     {
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| anyhow::anyhow!("$HOME is not set; cannot resolve the default anchor path"))?;
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            anyhow::anyhow!("$HOME is not set; cannot resolve the default anchor path")
+        })?;
         Ok(PathBuf::from(home)
             .join("Library")
             .join("Application Support")
@@ -107,8 +119,9 @@ pub fn default_anchor_path() -> anyhow::Result<PathBuf> {
         if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
             return Ok(PathBuf::from(xdg).join("auditmcp").join("anchor.log"));
         }
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| anyhow::anyhow!("$HOME is not set; cannot resolve the default anchor path"))?;
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            anyhow::anyhow!("$HOME is not set; cannot resolve the default anchor path")
+        })?;
         Ok(PathBuf::from(home)
             .join(".local")
             .join("state")
@@ -135,7 +148,12 @@ fn last_anchor_hmac(path: &Path) -> anyhow::Result<Option<String>> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(anyhow::anyhow!("failed to read anchor file {}: {e}", path.display())),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "failed to read anchor file {}: {e}",
+                path.display()
+            ))
+        }
     };
     let last_line = content.lines().rev().find(|l| !l.trim().is_empty());
     match last_line {
@@ -167,13 +185,23 @@ pub fn append_entry(
     chain_last_hash: &str,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("failed to create anchor directory {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create anchor directory {}: {e}",
+                parent.display()
+            )
+        })?;
     }
 
     let prev_anchor_hmac = last_anchor_hmac(path)?.unwrap_or_else(genesis_prev_anchor_hmac);
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let anchor_hmac = compute_anchor_hmac(anchor_key, &timestamp, chain_last_id, chain_last_hash, &prev_anchor_hmac)?;
+    let anchor_hmac = compute_anchor_hmac(
+        anchor_key,
+        &timestamp,
+        chain_last_id,
+        chain_last_hash,
+        &prev_anchor_hmac,
+    )?;
 
     let entry = AnchorEntry {
         timestamp,
@@ -190,7 +218,8 @@ pub fn append_entry(
         .append(true)
         .open(path)
         .map_err(|e| anyhow::anyhow!("failed to open anchor file {}: {e}", path.display()))?;
-    writeln!(file, "{line}").map_err(|e| anyhow::anyhow!("failed to append to anchor file {}: {e}", path.display()))?;
+    writeln!(file, "{line}")
+        .map_err(|e| anyhow::anyhow!("failed to append to anchor file {}: {e}", path.display()))?;
 
     Ok(())
 }
@@ -203,15 +232,25 @@ pub fn read_entries(path: &Path) -> anyhow::Result<Vec<AnchorEntry>> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(anyhow::anyhow!("failed to read anchor file {}: {e}", path.display())),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "failed to read anchor file {}: {e}",
+                path.display()
+            ))
+        }
     };
     let mut entries = Vec::new();
     for (i, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let entry: AnchorEntry = serde_json::from_str(line)
-            .map_err(|e| anyhow::anyhow!("anchor file {} line {}: not valid JSON: {e}", path.display(), i + 1))?;
+        let entry: AnchorEntry = serde_json::from_str(line).map_err(|e| {
+            anyhow::anyhow!(
+                "anchor file {} line {}: not valid JSON: {e}",
+                path.display(),
+                i + 1
+            )
+        })?;
         entries.push(entry);
     }
     Ok(entries)
@@ -279,7 +318,10 @@ pub fn verify_anchor_chain(entries: &[AnchorEntry], anchor_key: &[u8; 32]) -> Op
 /// names must exist and its stored `hash` must match `chain_last_hash`.
 /// Returns every mismatch found (not just the first), since these are
 /// independent claims about independent rows.
-pub fn verify_anchor_against_chain(entries: &[AnchorEntry], chain_rows: &[crate::db::StoredRow]) -> Vec<String> {
+pub fn verify_anchor_against_chain(
+    entries: &[AnchorEntry],
+    chain_rows: &[crate::db::StoredRow],
+) -> Vec<String> {
     let mut issues = Vec::new();
     for entry in entries {
         match chain_rows.iter().find(|r| r.id == entry.chain_last_id) {
@@ -344,7 +386,10 @@ mod tests {
     use super::*;
 
     fn temp_anchor_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("auditmcp_test_anchor_{label}_{}.log", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "auditmcp_test_anchor_{label}_{}.log",
+            uuid::Uuid::new_v4()
+        ))
     }
 
     fn key(seed: u8) -> [u8; 32] {
