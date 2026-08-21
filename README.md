@@ -629,6 +629,33 @@ not a hardened boundary.
 
 ---
 
+## Development
+
+### Troubleshooting
+
+**rust-analyzer may show phantom `E0308`/`E0608` squiggles in async/
+tokio-heavy files** (`http/`, `proxy.rs`, `anchor.rs`, `shutdown.rs`,
+`query.rs`, `truncate.rs`). These have been checked against the compiler
+and are not real: `cargo check --all-targets --all-features` is the
+source of truth and passes clean. rust-analyzer's own background
+`cargo check` (its "flycheck," visible under `target/flycheck0`) also
+comes back clean, and its proc-macro server log shows no load failures,
+panics, or ABI mismatches — so this isn't a proc-macro or config issue
+either. The one concrete lead found so far is that rust-analyzer's
+language server log fills with internal `ERROR inference diagnostic in
+desugared expr` lines while editing this codebase, a message tied to its
+handling of diagnostics inside desugared (`.await`, `?`, `for`,
+`tokio::select!`) expressions — but that's a correlation, not a
+confirmed cause, and no matching upstream issue has been found. Treat
+these squiggles as cosmetic; if one blocks your workflow, trust
+`cargo check`/`cargo build` over the editor. If this becomes disruptive
+enough to chase further, the next step is a minimal reproduction (a
+fresh `cargo new` project, adding dependencies until the phantom errors
+reappear, then stripping down) filed at
+[rust-lang/rust-analyzer/issues](https://github.com/rust-lang/rust-analyzer/issues).
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
