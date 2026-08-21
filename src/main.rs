@@ -7,6 +7,7 @@ mod db;
 mod export;
 mod extract;
 mod heartbeat;
+mod hex;
 mod http;
 mod jsonrpc;
 mod keys;

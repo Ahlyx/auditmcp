@@ -114,6 +114,22 @@ pub fn run(config_path: &Path, repair_index: bool, yes: bool) -> anyhow::Result<
                 }
             };
             let (chain_key, ak) = key.derive_subkeys(&m.db_uuid)?;
+
+            // `chain_metadata` carries its own HMAC (see
+            // `db::verify_chain_metadata_hmac`) precisely because it is a
+            // plain table outside the `tool_calls` hash chain -- an
+            // attacker with DB write access could otherwise edit
+            // `hmac_version` or the heartbeat cadence directly and this
+            // command would still report a clean chain. A mismatch here is
+            // exactly as severe as a broken row hash.
+            if !db::verify_chain_metadata_hmac(&conn, &chain_key, m)? {
+                eprintln!(
+                    "FAILED: chain_metadata failed HMAC verification -- it was edited \
+                     directly rather than produced by `auditmcp run`/`reset`."
+                );
+                return Ok(VerifyOutcome::Tampered);
+            }
+
             anchor_key = Some(ak);
             key_fingerprint = Some(key.fingerprint()?);
             HashKey::Hmac(chain_key)
@@ -639,6 +655,31 @@ mod tests {
         std::fs::remove_file(&fx.key_path).unwrap();
 
         assert_eq!(fx.run().unwrap(), VerifyOutcome::Drift);
+    }
+
+    /// Regression test for fix #1: `chain_metadata` edited directly (no
+    /// `tool_calls` row touched) must fail `verify` with the tamper exit
+    /// code, not the plain chain-hash-passed / clean path -- see the
+    /// matching `chain::bootstrap` test for the `run`-side half of this.
+    #[test]
+    fn tampered_chain_metadata_reports_tampered() {
+        let fx = HmacFixture::new("hmac_metadata_tamper", 90, false);
+        let mode = fx.bootstrap();
+        let mut conn = db::open_for_write(&fx.db_path).unwrap();
+        db::insert_row_with_key(
+            &mut conn,
+            &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"),
+            &mode.hash_key(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chain_metadata SET value = '999999' WHERE key = 'heartbeat_cadence_max_secs'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(fx.run().unwrap(), VerifyOutcome::Tampered);
     }
 
     /// A too-wide gap between two heartbeats in the same session is

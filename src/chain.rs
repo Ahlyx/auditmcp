@@ -99,7 +99,7 @@ pub fn bootstrap(
     // before we touched it" unobservable afterward.
     let db_existed = db_path.exists();
 
-    let conn = db::open_for_write(db_path)?;
+    let mut conn = db::open_for_write(db_path)?;
     let metadata = db::read_chain_metadata(&conn)?;
 
     if !db_existed {
@@ -110,13 +110,14 @@ pub fn bootstrap(
         // "wrong key" concept until a chain exists to disagree with it.
         let db_uuid = uuid::Uuid::new_v4().to_string();
         let key = KeyFile::load_or_generate(key_path, &db_uuid)?;
+        let (chain_key, anchor_key) = key.derive_subkeys(&db_uuid)?;
         db::write_chain_metadata_genesis(
-            &conn,
+            &mut conn,
+            &chain_key,
             &db_uuid,
             default_heartbeat_cadence_min_secs,
             default_heartbeat_cadence_max_secs,
         )?;
-        let (chain_key, anchor_key) = key.derive_subkeys(&db_uuid)?;
         return Ok(ChainMode::Hmac {
             chain_key,
             anchor_key,
@@ -138,6 +139,24 @@ pub fn bootstrap(
                 )
             })?;
             let (chain_key, anchor_key) = key.derive_subkeys(&m.db_uuid)?;
+
+            // `chain_metadata` is a plain table, not part of the hash
+            // chain -- see `db::verify_chain_metadata_hmac`. A mismatch
+            // here means the table was edited directly (a lowered
+            // heartbeat cadence, a flipped hmac_version) and is exactly as
+            // severe as a broken row hash, so it refuses to start the same
+            // way a first-row HMAC failure does.
+            if !db::verify_chain_metadata_hmac(&conn, &chain_key, &m)? {
+                return Err(anyhow::anyhow!(
+                    "this database's chain_metadata failed HMAC verification -- \
+                     refusing to start. chain_metadata (hmac_version, heartbeat \
+                     cadence, db_uuid) is not covered by the tool_calls hash chain \
+                     itself, so it carries its own HMAC computed at genesis; a \
+                     mismatch means it was edited directly rather than produced by \
+                     `auditmcp run`/`reset`. The only supported recovery is \
+                     `auditmcp reset --keep-old`."
+                ));
+            }
 
             verify_first_row(&conn, &chain_key).map_err(|e| {
                 anyhow::anyhow!(
@@ -280,6 +299,46 @@ mod tests {
 
         let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
         assert!(err.to_string().contains("chain key is"), "{err}");
+    }
+
+    /// Regression test for fix #1: `chain_metadata` is a plain table with
+    /// no hash-chain linkage of its own, so editing it directly (without
+    /// touching any `tool_calls` row) must still be caught -- otherwise an
+    /// attacker with DB write access could e.g. widen
+    /// `heartbeat_cadence_max_secs` to suppress gap detection while
+    /// `verify` and `run` both kept reporting a clean, HMAC-protected
+    /// chain.
+    #[test]
+    fn tampered_chain_metadata_refuses_to_start_even_though_tool_calls_is_untouched() {
+        let fx = Fixture::new("tampered_metadata");
+        {
+            let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+            let mut conn = db::open_for_write(&fx.db_path).unwrap();
+            db::insert_row_with_key(
+                &mut conn,
+                &db::test_support::sample_entry(),
+                &mode.hash_key(),
+            )
+            .unwrap();
+        }
+
+        // Directly edit chain_metadata, bypassing the hash chain entirely
+        // -- no tool_calls row is touched.
+        {
+            let conn = db::open_for_write(&fx.db_path).unwrap();
+            conn.execute(
+                "UPDATE chain_metadata SET value = '999999' WHERE key = 'heartbeat_cadence_max_secs'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("chain_metadata failed HMAC verification"),
+            "{err}"
+        );
     }
 
     #[test]

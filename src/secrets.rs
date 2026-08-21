@@ -392,12 +392,7 @@ pub fn shannon_entropy(s: &str) -> f64 {
 fn sha256_hex(s: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
+    crate::hex::hex_encode(&hasher.finalize())
 }
 
 /// One detected secret occurrence.

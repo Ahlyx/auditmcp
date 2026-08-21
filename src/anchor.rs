@@ -19,6 +19,7 @@
 //! "64 lowercase hex chars" validation as every other entry; there is no
 //! separate code path for "this is the first line."
 
+use crate::hex::hex_encode;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -79,14 +80,6 @@ fn compute_anchor_hmac(
     ));
     let digest = mac.finalize().into_bytes();
     Ok(hex_encode(&digest))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 /// The per-platform default anchor path, used when `[anchor].path` is
