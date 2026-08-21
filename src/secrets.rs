@@ -187,7 +187,20 @@ fn merge_overlapping_hits(mut hits: Vec<Hit>) -> Vec<Hit> {
     merged
 }
 
+/// Picks which of two overlapping hits represents the merged group for
+/// redaction purposes. **Never lets an allowlisted hit win over a
+/// non-allowlisted one, checked first and unconditionally.** An allowlisted
+/// hit is a confirmed false positive for its *own* match; it says nothing
+/// about a genuine secret that happens to overlap it from a different
+/// pattern. Letting specificity/severity ranking override this would mean a
+/// benign unmasked string sitting next to a real leaked secret could pick
+/// the allowlisted hit as the group's winner -- and `redact_ranges` redacts
+/// (or doesn't) based on the winner, so the real secret's bytes would be
+/// written to the audit log in the clear.
 fn pick_preferred(a: Hit, b: Hit) -> Hit {
+    if a.allowlisted != b.allowlisted {
+        return if a.allowlisted { b } else { a };
+    }
     if a.is_heuristic != b.is_heuristic {
         return if a.is_heuristic { b } else { a };
     }
@@ -815,6 +828,55 @@ requires_entropy_check = false
             "merged range must be the full union"
         );
         assert_eq!(redacted, format!("[REDACTED:{}]", hits[0].pattern_name));
+    }
+
+    /// Regression test for fix #3 (`pick_preferred` allowlist bug): an
+    /// allowlisted hit overlapping a genuine, non-allowlisted hit from a
+    /// different pattern must NOT suppress redaction of the real secret.
+    /// Before the fix, `pick_preferred` only compared specificity/severity,
+    /// so an allowlisted match could be chosen as the merged group's
+    /// winner and the whole union range -- including the real secret's
+    /// bytes -- would be left unredacted.
+    #[test]
+    fn allowlisted_hit_never_suppresses_redaction_of_an_overlapping_real_secret() {
+        let custom = r#"
+[[pattern]]
+name = "left_part"
+regex = "AAAA[0-9]{5}"
+severity = "medium"
+requires_entropy_check = false
+
+[[pattern]]
+name = "right_part"
+regex = "[0-9]{5}BBBB"
+severity = "medium"
+requires_entropy_check = false
+"#;
+        let patterns = PatternSet::from_str(custom).unwrap();
+        // "left_part" matches "AAAA12345" (0..9) -- allowlisted below.
+        // "right_part" matches "12345BBBB" (4..13) -- a genuine secret,
+        // never allowlisted. The two overlap on bytes 4..9.
+        let text = "AAAA12345BBBB";
+        let mut allowlist = HashSet::new();
+        allowlist.insert(sha256_hex("AAAA12345"));
+
+        let (redacted, hits) = scan_and_redact_text(text, &patterns, &allowlist);
+
+        assert_eq!(hits.len(), 1, "must still merge into one group: {hits:?}");
+        assert!(
+            !hits[0].allowlisted,
+            "the merged winner must not be the allowlisted hit, since a genuine \
+             secret overlaps it: {hits:?}"
+        );
+        assert!(
+            redacted.starts_with("[REDACTED:"),
+            "the real secret's bytes must be redacted, not left in the clear: \
+             {redacted:?}"
+        );
+        assert!(
+            !redacted.contains("12345"),
+            "no fragment of the real secret should survive: {redacted:?}"
+        );
     }
 
     /// One range fully containing another (e.g. a wide heuristic match
