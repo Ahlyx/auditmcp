@@ -315,10 +315,16 @@ mod tests {
     use super::*;
 
     fn temp_key_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "auditmcp_test_key_{label}_{}.key",
-            uuid::Uuid::new_v4()
-        ))
+        crate::db::test_support::temp_isolated_dir(label).join("audit.key")
+    }
+
+    /// Removes a key file and the isolated directory `temp_key_path`
+    /// created for it.
+    fn cleanup_key_path(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 
     #[test]
@@ -344,7 +350,7 @@ mod tests {
         assert_eq!(loaded.root_key_hex, key.root_key_hex);
         assert_eq!(loaded.db_uuid, "db-1");
 
-        std::fs::remove_file(&path).ok();
+        cleanup_key_path(&path);
     }
 
     #[test]
@@ -370,7 +376,41 @@ mod tests {
             & 0o777;
         assert_eq!(parent_mode, 0o700);
 
-        std::fs::remove_file(&path).ok();
+        cleanup_key_path(&path);
+    }
+
+    /// Windows equivalent of `saved_key_file_has_0600_permissions`: after
+    /// `save`, the file's DACL must grant access to exactly one SID (the
+    /// current user), not the broader set inherited from the parent
+    /// directory. This is the fix for the gap `save`'s doc comment used to
+    /// describe explicitly ("no equivalent tightening applied here").
+    #[cfg(windows)]
+    #[test]
+    fn saved_key_file_restricts_the_acl_to_the_current_user() {
+        use windows_acl::acl::ACL;
+        use windows_acl::helper::{current_user, name_to_sid, sid_to_string};
+
+        let path = temp_key_path("acl");
+        KeyFile::generate("db-1").save(&path).unwrap();
+
+        let acl = ACL::from_file_path(path.to_str().unwrap(), false).unwrap();
+        let entries = acl.all().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the DACL must contain exactly one entry after save: {:?}",
+            entries.iter().map(|e| &e.string_sid).collect::<Vec<_>>()
+        );
+
+        let username = current_user().unwrap();
+        let mut expected_sid = name_to_sid(&username, None).unwrap();
+        let expected_string_sid = sid_to_string(expected_sid.as_mut_ptr() as *mut _).unwrap();
+        assert_eq!(
+            entries[0].string_sid, expected_string_sid,
+            "the sole entry must belong to the current user"
+        );
+
+        cleanup_key_path(&path);
     }
 
     /// The same root key salted with two different `db_uuid`s must derive
@@ -427,7 +467,7 @@ mod tests {
         let loaded = KeyFile::load(&dest).unwrap().unwrap();
         assert_eq!(loaded.root_key_hex, key.root_key_hex);
 
-        std::fs::remove_file(&dest).ok();
+        cleanup_key_path(&dest);
     }
 
     #[test]
@@ -442,7 +482,7 @@ mod tests {
             .any(|e| e.file_name().to_string_lossy().contains("tmp-"));
         assert!(!stray_temp, "backup must not leave a stray temp file");
 
-        std::fs::remove_file(&dest).ok();
+        cleanup_key_path(&dest);
     }
 
     #[test]

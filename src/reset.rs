@@ -122,10 +122,7 @@ mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let db_path = temp_db_path(label);
-            let key_path = std::env::temp_dir().join(format!(
-                "auditmcp_test_reset_key_{label}_{}.key",
-                uuid::Uuid::new_v4()
-            ));
+            let key_path = crate::db::test_support::temp_isolated_dir(label).join("audit.key");
             let anchor_path = std::env::temp_dir().join(format!(
                 "auditmcp_test_reset_anchor_{label}_{}.log",
                 uuid::Uuid::new_v4()
@@ -167,6 +164,9 @@ mod tests {
         fn drop(&mut self) {
             remove_db_files(&self.db_path);
             let _ = std::fs::remove_file(&self.key_path);
+            if let Some(parent) = self.key_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
             let _ = std::fs::remove_file(&self.anchor_path);
             let _ = std::fs::remove_file(&self.config_path);
             // Sweep any archived backups this test's own runs created.

@@ -426,6 +426,22 @@ pub(crate) mod test_support {
         std::env::temp_dir().join(format!("auditmcp_test_{label}_{}.db", uuid::Uuid::new_v4()))
     }
 
+    /// A fresh, uniquely-named directory under the OS temp root, created
+    /// (and thus owned) by this process -- for any test file whose
+    /// permissions get tightened after creation (e.g. a Phase 3.5 key via
+    /// `KeyFile::save`, which chmods the file's *parent* directory on
+    /// Unix). Placing that file directly in the shared OS temp root (as
+    /// earlier test helpers did) meant that chmod targeted a directory
+    /// (`/tmp`) this process doesn't own, which fails with `EPERM` under a
+    /// non-root CI user -- a directory this process created itself doesn't
+    /// have that problem.
+    pub(crate) fn temp_isolated_dir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("auditmcp_test_{label}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("failed to create isolated test directory");
+        dir
+    }
+
     pub(crate) fn cleanup(conn: Connection, path: &std::path::Path) {
         drop(conn);
         remove_db_files(path);

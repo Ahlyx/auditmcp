@@ -212,10 +212,7 @@ mod tests {
     use crate::db::test_support::{remove_db_files, temp_db_path};
 
     fn temp_key_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "auditmcp_test_bootstrap_key_{label}_{}.key",
-            uuid::Uuid::new_v4()
-        ))
+        crate::db::test_support::temp_isolated_dir(label).join("audit.key")
     }
 
     struct Fixture {
@@ -236,6 +233,9 @@ mod tests {
         fn drop(&mut self) {
             remove_db_files(&self.db_path);
             let _ = std::fs::remove_file(&self.key_path);
+            if let Some(parent) = self.key_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
         }
     }
 
