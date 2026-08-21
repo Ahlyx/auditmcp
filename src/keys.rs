@@ -11,6 +11,7 @@
 //! a brand new one. If key rotation is ever revisited, it needs its own
 //! design pass, not an incremental patch onto this module.
 
+use crate::hex::hex_encode;
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -102,11 +103,11 @@ impl KeyFile {
     }
 
     /// Writes the key file, creating its parent directory if needed.
-    /// Permissions are set to 0600 (file) / 0700 (parent dir) on Unix;
-    /// Windows has no POSIX permission bits and relies on NTFS ACLs
-    /// inherited from the user's profile directory instead -- there is no
-    /// equivalent tightening applied here, which is a known gap (see the
-    /// README's chain-hardening section).
+    /// Permissions are set to 0600 (file) / 0700 (parent dir) on Unix. On
+    /// Windows, the file's DACL is rewritten to grant only the current
+    /// user access, replacing whatever it inherited -- see
+    /// `restrict_to_current_user_windows` for why this can't just be a
+    /// permission-bits equivalent the way Unix's is.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let parent = path.parent().ok_or_else(|| {
             anyhow::anyhow!("key path {} has no parent directory", path.display())
@@ -127,6 +128,10 @@ impl KeyFile {
                 .map_err(|e| anyhow::anyhow!("failed to set key directory permissions: {e}"))?;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| anyhow::anyhow!("failed to set key file permissions: {e}"))?;
+        }
+        #[cfg(windows)]
+        {
+            restrict_to_current_user_windows(path)?;
         }
 
         Ok(())
@@ -166,6 +171,10 @@ impl KeyFile {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| anyhow::anyhow!("failed to set backup file permissions: {e}"))?;
+        }
+        #[cfg(windows)]
+        {
+            restrict_to_current_user_windows(&tmp)?;
         }
 
         std::fs::rename(&tmp, dest).map_err(|e| {
@@ -218,12 +227,77 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+/// Rewrites `path`'s DACL so only the current user has access, replacing
+/// whatever it inherited from its parent directory.
+///
+/// Windows has no permission-bits analogue to Unix's 0600 -- access is
+/// governed by a discretionary ACL (DACL) attached to the file itself, not
+/// a small integer. A newly created file inherits its DACL from its parent
+/// directory, which on a typical machine grants the owning user, the
+/// Administrators group, and SYSTEM full control -- broader than the
+/// single-user access 0600 gives on Unix, and not tightened by anything
+/// `std::fs` exposes. This was a known, permanent gap (not just a race
+/// window) on this project's primary target platform until this function:
+/// it removes every existing ACL entry and grants exactly one back, to the
+/// user running this process.
+#[cfg(windows)]
+fn restrict_to_current_user_windows(path: &Path) -> anyhow::Result<()> {
+    use winapi::um::winnt::{DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+    use windows_acl::acl::ACL;
+    use windows_acl::helper::{current_user, name_to_sid};
+
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("key path {} is not valid UTF-8", path.display()))?;
+
+    let username = current_user()
+        .ok_or_else(|| anyhow::anyhow!("could not determine the current Windows user"))?;
+    let mut user_sid = name_to_sid(&username, None).map_err(|e| {
+        anyhow::anyhow!("failed to resolve SID for user '{username}' (Win32 error {e})")
+    })?;
+
+    let mut acl = ACL::from_file_path(path_str, false).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open ACL for key file {} (Win32 error {e})",
+            path.display()
+        )
+    })?;
+
+    // Remove every existing entry first -- including the ones just
+    // inherited from the parent directory -- so what's left afterward is
+    // exactly the one grant added below, not that grant plus whatever was
+    // already there.
+    let entries = acl.all().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to enumerate ACL for key file {} (Win32 error {e})",
+            path.display()
+        )
+    })?;
+    for mut entry in entries {
+        if let Some(sid) = entry.sid.as_mut() {
+            acl.remove(sid.as_mut_ptr() as *mut _, None, None)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to strip an inherited ACL entry from key file {} (Win32 error {e})",
+                        path.display()
+                    )
+                })?;
+        }
     }
-    s
+
+    acl.allow(
+        user_sid.as_mut_ptr() as *mut _,
+        false,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to grant the current user access to key file {} (Win32 error {e})",
+            path.display()
+        )
+    })?;
+
+    Ok(())
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {

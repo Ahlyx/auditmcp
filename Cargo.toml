@@ -52,3 +52,7 @@ lto = true
 strip = true
 codegen-units = 1
 panic = "abort"
+
+[target."cfg(windows)".dependencies]
+winapi = { version = "0.3.9", features = ["winnt"] }
+windows-acl = "0.3.0"
