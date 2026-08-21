@@ -172,7 +172,15 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         .take()
         .ok_or_else(|| anyhow::anyhow!("child stdout was not piped"))?;
 
-    let inbound = tokio::spawn(pump_client_to_child(child_stdin, Arc::clone(&session)));
+    let inbound = tokio::spawn(pump_client_to_child(
+        child_stdin,
+        Arc::clone(&session),
+        db.clone(),
+        server_name.clone(),
+        Arc::clone(&config),
+        Arc::clone(&patterns),
+        Arc::clone(&allowlist),
+    ));
 
     let outbound = tokio::spawn(pump_child_to_client(
         child_stdout,
@@ -314,7 +322,15 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
 /// best-effort parses `tools/call` requests to start tracking a pending
 /// call. Parsing never gates forwarding: a malformed or non-UTF-8 line is
 /// still passed through untouched, just not logged.
-async fn pump_client_to_child(mut child_in: ChildStdin, session: Arc<Session>) {
+async fn pump_client_to_child(
+    mut child_in: ChildStdin,
+    session: Arc<Session>,
+    db: DbHandle,
+    server_name: String,
+    config: Arc<Config>,
+    patterns: Arc<PatternSet>,
+    allowlist: Arc<HashSet<String>>,
+) {
     let mut reader = BufReader::new(tokio::io::stdin());
     let mut buf: Vec<u8> = Vec::new();
 
@@ -342,7 +358,7 @@ async fn pump_client_to_child(mut child_in: ChildStdin, session: Arc<Session>) {
         if let Some(msg) = parse_rpc_message(&buf) {
             if msg.is_tool_call_request() {
                 if let (Some(id_key), Some(tool_name)) = (msg.id_key(), msg.tool_name()) {
-                    session.register(
+                    let displaced = session.register(
                         id_key,
                         PendingCall {
                             tool_name,
@@ -351,10 +367,55 @@ async fn pump_client_to_child(mut child_in: ChildStdin, session: Arc<Session>) {
                             started: Instant::now(),
                         },
                     );
+                    if let Some(stale) = displaced {
+                        log_stale_pending_call(
+                            stale,
+                            &session,
+                            &server_name,
+                            &config,
+                            &patterns,
+                            &allowlist,
+                            &db,
+                        );
+                    }
                 }
             }
         }
     }
+}
+
+/// Logs a `PendingCall` displaced by a JSON-RPC id reused before its
+/// original response arrived (see `Session::register`). Rather than
+/// silently vanishing when its real response later finds nothing to
+/// resolve, it is recorded here as a timeout -- the honest description of
+/// "a tool call happened and this proxy never got to see its outcome" --
+/// so the fail-open contract holds even for this edge case.
+fn log_stale_pending_call(
+    call: PendingCall,
+    session: &Session,
+    server_name: &str,
+    config: &Config,
+    patterns: &PatternSet,
+    allowlist: &HashSet<String>,
+    db: &DbHandle,
+) {
+    tracing::warn!(
+        "JSON-RPC id reused for tool '{}' before its previous response arrived; \
+         logging the earlier call as a timeout rather than dropping it",
+        call.tool_name
+    );
+    let configured_tier = config.tier_for_tool(&call.tool_name);
+    let (mut entry, dest) = audit::build_entry(
+        call,
+        CallOutcome::timed_out(),
+        session.id(),
+        server_name,
+        configured_tier,
+        patterns,
+        allowlist,
+    );
+    session.attach_anomaly(&mut entry, dest.as_ref(), Instant::now());
+    db.log(entry);
 }
 
 /// Child stdout -> client stdout. Forwards every line byte-for-byte, and

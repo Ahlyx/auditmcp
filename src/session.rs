@@ -109,8 +109,18 @@ impl Session {
     /// `RpcMessage::id_key`, which renders the id as canonical JSON so a
     /// numeric `1` and a string `"1"` — both legal, distinct JSON-RPC ids —
     /// never collide.
-    pub(crate) fn register(&self, id_key: String, call: PendingCall) {
-        self.lock().insert(id_key, call);
+    ///
+    /// A well-behaved client never reuses an id before its response
+    /// arrives, but nothing on the wire enforces that. If one does (a
+    /// client-side retry after its own timeout, for instance), silently
+    /// overwriting the earlier `PendingCall` would mean its eventual real
+    /// response finds nothing to resolve and vanishes from the log with no
+    /// trace — a fail-open violation, since a tool call happened and never
+    /// got recorded. Returns the displaced call, if any, so the caller can
+    /// log it as best-effort (see call sites in `proxy.rs` / `http.rs`)
+    /// rather than dropping it.
+    pub(crate) fn register(&self, id_key: String, call: PendingCall) -> Option<PendingCall> {
+        self.lock().insert(id_key, call)
     }
 
     /// Takes the pending call for `id_key`, if this session has one.
@@ -179,6 +189,26 @@ mod tests {
             s.resolve("1").is_none(),
             "a second resolve of the same id must find nothing — this is what \
              makes a replayed response produce no duplicate row"
+        );
+    }
+
+    /// The property fix #6 exists for: registering a second call under an
+    /// id that already has one pending must hand back the displaced call
+    /// rather than silently discarding it, so the caller can log it instead
+    /// of letting it vanish when its real response later finds nothing to
+    /// resolve.
+    #[test]
+    fn registering_a_reused_id_returns_the_displaced_call() {
+        let s = Session::new("sess-1".to_string());
+        assert!(s.register("1".to_string(), call("first")).is_none());
+
+        let displaced = s.register("1".to_string(), call("second"));
+        assert_eq!(displaced.map(|c| c.tool_name), Some("first".to_string()));
+
+        // The second call is now the one tracked under id "1".
+        assert_eq!(
+            s.resolve("1").map(|c| c.tool_name),
+            Some("second".to_string())
         );
     }
 
