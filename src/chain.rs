@@ -100,7 +100,6 @@ pub fn bootstrap(
     let db_existed = db_path.exists();
 
     let mut conn = db::open_for_write(db_path)?;
-    let metadata = db::read_chain_metadata(&conn)?;
 
     if !db_existed {
         // "No DB, no key" and "no DB, key present" both land here: either
@@ -108,24 +107,64 @@ pub fn bootstrap(
         // user pointed a new config at a key_path they already had) is
         // reused rather than treated as a conflict -- there is no
         // "wrong key" concept until a chain exists to disagree with it.
-        let db_uuid = uuid::Uuid::new_v4().to_string();
-        let key = KeyFile::load_or_generate(key_path, &db_uuid)?;
-        let (chain_key, anchor_key) = key.derive_subkeys(&db_uuid)?;
-        db::write_chain_metadata_genesis(
+        //
+        // If genesis fails after we created the file, remove what we just
+        // created: leaving it behind means the next start classifies this
+        // half-initialized database as LEGACY (no `chain_metadata`) and --
+        // permanently, by design -- appends unkeyed rows to what was meant
+        // to be an HMAC-protected chain. Failing loudly now keeps the
+        // bootstrap table honest.
+        match bootstrap_fresh_chain(
             &mut conn,
-            &chain_key,
-            &db_uuid,
+            key_path,
             default_heartbeat_cadence_min_secs,
             default_heartbeat_cadence_max_secs,
-        )?;
-        return Ok(ChainMode::Hmac {
-            chain_key,
-            anchor_key,
-            heartbeat_cadence_min_secs: default_heartbeat_cadence_min_secs,
-            heartbeat_cadence_max_secs: default_heartbeat_cadence_max_secs,
-        });
+        ) {
+            Ok(mode) => Ok(mode),
+            Err(e) => {
+                let _ = std::fs::remove_file(db_path);
+                let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+                let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+                Err(e)
+            }
+        }
+    } else {
+        classify_existing_chain(&conn, key_path, db_path)
     }
+}
 
+/// The `!db_existed` branch of `bootstrap`: new uuid, new (or reused) key,
+/// genesis metadata in one transaction.
+fn bootstrap_fresh_chain(
+    conn: &mut rusqlite::Connection,
+    key_path: &Path,
+    heartbeat_cadence_min_secs: u64,
+    heartbeat_cadence_max_secs: u64,
+) -> anyhow::Result<ChainMode> {
+    let db_uuid = uuid::Uuid::new_v4().to_string();
+    let key = KeyFile::load_or_generate(key_path, &db_uuid)?;
+    let (chain_key, anchor_key) = key.derive_subkeys(&db_uuid)?;
+    db::write_chain_metadata_genesis(
+        conn,
+        &chain_key,
+        &db_uuid,
+        heartbeat_cadence_min_secs,
+        heartbeat_cadence_max_secs,
+    )?;
+    Ok(ChainMode::Hmac {
+        chain_key,
+        anchor_key,
+        heartbeat_cadence_min_secs,
+        heartbeat_cadence_max_secs,
+    })
+}
+
+fn classify_existing_chain(
+    conn: &rusqlite::Connection,
+    key_path: &Path,
+    _db_path: &Path,
+) -> anyhow::Result<ChainMode> {
+    let metadata = db::read_chain_metadata(conn)?;
     match metadata {
         Some(m) if m.hmac_version.as_deref() == Some("1") => {
             let key = KeyFile::load(key_path)?.ok_or_else(|| {
@@ -146,7 +185,7 @@ pub fn bootstrap(
             // heartbeat cadence, a flipped hmac_version) and is exactly as
             // severe as a broken row hash, so it refuses to start the same
             // way a first-row HMAC failure does.
-            if !db::verify_chain_metadata_hmac(&conn, &chain_key, &m)? {
+            if !db::verify_chain_metadata_hmac(conn, &chain_key, &m)? {
                 return Err(anyhow::anyhow!(
                     "this database's chain_metadata failed HMAC verification -- \
                      refusing to start. chain_metadata (hmac_version, heartbeat \
@@ -158,7 +197,7 @@ pub fn bootstrap(
                 ));
             }
 
-            verify_first_row(&conn, &chain_key).map_err(|e| {
+            verify_first_row(conn, &chain_key).map_err(|e| {
                 anyhow::anyhow!(
                     "HMAC verification of the first chain row failed with the key at {} -- \
                      refusing to start. This usually means the wrong key file is in use, or \
