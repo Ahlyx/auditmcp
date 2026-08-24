@@ -357,7 +357,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         }
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = nibble(pair[0])
             .ok_or_else(|| format!("invalid hex character '{}'", pair[0] as char))?;
         let lo = nibble(pair[1])

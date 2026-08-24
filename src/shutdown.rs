@@ -20,6 +20,7 @@
 //! a console-input event with no forced kill attached.
 
 use std::sync::{Condvar, Mutex, OnceLock};
+#[cfg(windows)]
 use std::time::Duration;
 
 /// How long the writer gets to finish its queue at shutdown. Generous
