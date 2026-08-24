@@ -3,17 +3,19 @@
 //!
 //! Read-only, like `query`/`verify`. Deliberately has no `--unmask` flag:
 //! `args_json`/`result_json` are emitted exactly as stored (already
-//! redacted at write time, never re-processed here), and `redaction_flags`
-//! is emitted in the same structured shape `query --verbose` already
-//! parses (`query::StoredRedaction`) rather than re-deriving that shape
-//! independently.
+//! redacted at write time, never re-processed here), while the two derived
+//! JSON-in-TEXT columns -- `redaction_flags` and `anomaly_reasons` -- are
+//! emitted parsed into the structured shapes their readers already use
+//! (`query::StoredRedaction`, `query::StoredReason`) rather than re-derived
+//! or left as strings a consumer has to parse a second time.
 //!
-//! NOT fail-open: if a row's `redaction_flags` is present but fails to
-//! parse as the expected shape, that is corrupted data, not a quiet gap.
-//! `ExportRow::from_stored` returns `Err`, which aborts the whole export --
-//! an audit export that's silently missing a row is worse than one that
-//! fails loudly and says why. With `--output`, the abort is also atomic
-//! (see `write_atomic`): nothing at the destination path changes.
+//! NOT fail-open: if a row's `redaction_flags`/`anomaly_reasons` is present
+//! but fails to parse as its expected shape, that is corrupted data, not a
+//! quiet gap. `ExportRow::from_stored` returns `Err`, which aborts the
+//! whole export -- an audit export that's silently missing a row is worse
+//! than one that fails loudly and says why. With `--output`, the abort is
+//! also atomic (see `write_atomic`): nothing at the destination path
+//! changes.
 //!
 //! Exit codes: unlike `verify` (which has two independently meaningful
 //! nonzero codes -- tamper vs. drift -- and calls `std::process::exit`
@@ -40,10 +42,12 @@ pub enum ExportFormat {
 }
 
 /// One exported row. Field order mirrors `db::SELECT_ALL_SQL` (the
-/// schema's own column order), except `redaction_flags`: that column is
-/// exported parsed into the structured shape, not its raw JSON-in-TEXT
-/// form, since a compliance/analysis consumer wants `pattern`/`severity`
-/// as real JSON fields, not a string they have to parse a second time.
+/// schema's own column order), except the two derived JSON-in-TEXT columns:
+/// `redaction_flags` and `anomaly_reasons` are exported parsed into their
+/// structured shapes, not raw strings, since a compliance/analysis
+/// consumer wants `pattern`/`severity`/`rule` as real JSON fields, not a
+/// string they have to parse a second time. (`args_json`/`result_json`
+/// stay raw for the hash-reproduction reason documented below.)
 ///
 /// Every field carries an explicit `#[serde(rename)]`, even where it just
 /// restates the Rust field name: this struct's JSON output is a public
@@ -101,8 +105,11 @@ pub struct ExportRow {
     pub redaction_count: i64,
     #[serde(rename = "anomaly_score")]
     pub anomaly_score: Option<f64>,
+    /// Parsed from the stored JSON-in-TEXT column, same policy as
+    /// `redaction_flags` above: structured for consumers, abort-loudly on
+    /// corruption.
     #[serde(rename = "anomaly_reasons")]
-    pub anomaly_reasons: Option<String>,
+    pub anomaly_reasons: Option<Vec<crate::query::StoredReason>>,
     #[serde(rename = "hash")]
     pub hash: String,
     #[serde(rename = "prev_hash")]
@@ -127,6 +134,17 @@ impl ExportRow {
             })?,
         };
 
+        let anomaly_reasons = match row.entry.anomaly_reasons.as_deref() {
+            None => None,
+            Some(raw) => Some(serde_json::from_str(raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "row id {}: anomaly_reasons is not valid JSON, aborting export rather than \
+                     silently dropping this row's data ({e})",
+                    row.id
+                )
+            })?),
+        };
+
         Ok(ExportRow {
             id: row.id,
             timestamp: row.entry.timestamp.clone(),
@@ -146,7 +164,7 @@ impl ExportRow {
             redaction_flags,
             redaction_count: row.entry.redaction_count,
             anomaly_score: row.entry.anomaly_score,
-            anomaly_reasons: row.entry.anomaly_reasons.clone(),
+            anomaly_reasons,
             hash: row.hash.clone(),
             prev_hash: row.prev_hash.clone(),
         })
@@ -176,6 +194,7 @@ pub fn run(
     let rows = db::read_all_rows(&conn)?;
 
     let since_cutoff = since.as_deref().map(parse_since).transpose()?;
+    let status = crate::query::normalize_status_filter(status.as_deref())?;
     let filtered = filter_rows(
         rows,
         tool.as_deref(),
@@ -639,6 +658,94 @@ mod tests {
             content, "pre-existing content\n",
             "an aborted export must not touch a pre-existing destination file"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `anomaly_reasons` follows the same contract as `redaction_flags`:
+    /// exported parsed into its structured shape, and unparseable stored
+    /// JSON aborts the export rather than quietly emitting a string (or
+    /// dropping the row).
+    #[test]
+    fn anomaly_reasons_exports_structured_and_aborts_loudly_on_corruption() {
+        let dir = temp_test_dir("anomaly_reasons");
+        let db_path = dir.join("audit.db");
+
+        let mut good = sample_entry();
+        good.anomaly_score = Some(2.0);
+        good.anomaly_reasons = Some(
+            r#"[{"rule":"size_spike","detail":"bytes_out=1000 exceeds 5× mean (100)"}]"#
+                .to_string(),
+        );
+        seed(&db_path, &[good]);
+
+        let config_path = write_config(&dir, &db_path);
+        let output_path = dir.join("out.jsonl");
+        run(
+            &config_path,
+            ExportFormat::Jsonl,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(output_path.clone()),
+        )
+        .unwrap();
+
+        let lines = read_lines(&output_path);
+        assert_eq!(lines.len(), 1);
+        let row: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(
+            row["anomaly_reasons"][0]["rule"], "size_spike",
+            "reasons must be real JSON fields, not a string to parse twice"
+        );
+
+        // Corruption aborts.
+        let db_path2 = dir.join("audit2.db");
+        let mut bad = sample_entry();
+        bad.anomaly_score = Some(1.0);
+        bad.anomaly_reasons = Some("not json".to_string());
+        seed(&db_path2, &[bad]);
+        let config_path2 = write_config(&dir, &db_path2);
+        let result = run(
+            &config_path2,
+            ExportFormat::Jsonl,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "unparseable anomaly_reasons must abort the export"
+        );
+        assert!(result.unwrap_err().to_string().contains("anomaly_reasons"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_status_filter_is_rejected_not_silently_empty() {
+        let dir = temp_test_dir("bad_status");
+        let db_path = dir.join("audit.db");
+        seed(&db_path, &[sample_entry()]);
+        let config_path = write_config(&dir, &db_path);
+
+        let result = run(
+            &config_path,
+            ExportFormat::Jsonl,
+            None,
+            None,
+            Some("Errorr".to_string()),
+            None,
+            false,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown --status"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
