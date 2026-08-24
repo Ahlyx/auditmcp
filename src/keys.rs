@@ -15,6 +15,8 @@ use crate::hex::hex_encode;
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+#[cfg(unix)]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 const KEY_FILE_VERSION: u32 = 1;
@@ -77,9 +79,11 @@ impl KeyFile {
         Ok((chain_key, anchor_key))
     }
 
-    /// `sha256(root_key)[:16]`, hex-encoded -- safe to share out-of-band
-    /// (e.g. pasted into a ticket to confirm "yes, this is the same key")
-    /// since it does not reveal the key itself.
+    /// `sha256(root_key)`, hex-encoded, truncated to its first 16
+    /// characters (64 bits of the digest). Display-only -- safe to share
+    /// out-of-band (e.g. pasted into a ticket to confirm "yes, this is the
+    /// same key") since it does not reveal the key itself, and never used
+    /// as a MAC.
     pub fn fingerprint(&self) -> anyhow::Result<String> {
         use sha2::Digest;
         let root_key = self.root_key_bytes()?;
@@ -108,6 +112,12 @@ impl KeyFile {
     /// user access, replacing whatever it inherited -- see
     /// `restrict_to_current_user_windows` for why this can't just be a
     /// permission-bits equivalent the way Unix's is.
+    ///
+    /// The restrictive permissions are applied AT CREATION, not after:
+    /// `std::fs::write` creates with umask defaults (typically 0644 --
+    /// world-readable) and tightening afterwards leaves a window in which
+    /// the root key sits on disk readable by every local process. See
+    /// `write_restricted`.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let parent = path.parent().ok_or_else(|| {
             anyhow::anyhow!("key path {} has no parent directory", path.display())
@@ -116,25 +126,16 @@ impl KeyFile {
             anyhow::anyhow!("failed to create key directory {}: {e}", parent.display())
         })?;
 
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| anyhow::anyhow!("failed to serialize key file: {e}"))?;
-        std::fs::write(path, json)
-            .map_err(|e| anyhow::anyhow!("failed to write key file {}: {e}", path.display()))?;
-
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
                 .map_err(|e| anyhow::anyhow!("failed to set key directory permissions: {e}"))?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| anyhow::anyhow!("failed to set key file permissions: {e}"))?;
-        }
-        #[cfg(windows)]
-        {
-            restrict_to_current_user_windows(path)?;
         }
 
-        Ok(())
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| anyhow::anyhow!("failed to serialize key file: {e}"))?;
+        write_restricted(path, &json)
     }
 
     /// Atomically copies this key to `dest`: write-to-temp then rename,
@@ -162,19 +163,9 @@ impl KeyFile {
         ));
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow::anyhow!("failed to serialize key file: {e}"))?;
-        std::fs::write(&tmp, json).map_err(|e| {
-            anyhow::anyhow!("failed to write backup temp file {}: {e}", tmp.display())
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| anyhow::anyhow!("failed to set backup file permissions: {e}"))?;
-        }
-        #[cfg(windows)]
-        {
-            restrict_to_current_user_windows(&tmp)?;
+        if let Err(e) = write_restricted(&tmp, &json) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
 
         std::fs::rename(&tmp, dest).map_err(|e| {
@@ -300,14 +291,80 @@ fn restrict_to_current_user_windows(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Writes key material to `path` with restrictive permissions in effect
+/// FROM THE MOMENT THE FILE EXISTS, closing the TOCTOU window where the
+/// plaintext root key sat on disk world-readable between `fs::write` (which
+/// creates with umask defaults) and a later permission fix-up.
+///
+/// - Unix: created via `OpenOptions` with mode 0600, so no readable state
+///   ever exists; a post-write `set_permissions` re-asserts 0600 for the
+///   pre-existing-file case.
+/// - Windows: an EMPTY file is created first, its DACL is rewritten to
+///   grant only the current user (`restrict_to_current_user_windows`), and
+///   only then is content written -- a racing reader can win only an empty
+///   file it cannot reopen.
+fn write_restricted(path: &Path, json: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| f.write_all(json.as_bytes()))
+            .map_err(|e| anyhow::anyhow!("failed to write key file {}: {e}", path.display()))?;
+        // Re-assert for a file that already existed (creation-time modes do
+        // not apply to it); idempotent on a freshly created one.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow::anyhow!("failed to set key file permissions: {e}"))?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        {
+            let _unused = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to create key file {}: {e}", path.display())
+                })?;
+        } // handle dropped: empty, DACL-restricted file now exists
+        restrict_to_current_user_windows(path)?;
+        std::fs::write(path, json)
+            .map_err(|e| anyhow::anyhow!("failed to write key file {}: {e}", path.display()))
+    }
+}
+
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) {
+    // Operates on bytes with an explicit nibble table rather than slicing
+    // by byte offset into the string: a corrupt or malicious key file whose
+    // `root_key_hex` contains multi-byte characters would otherwise panic
+    // on a non-char-boundary slice instead of returning this error.
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_string());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = nibble(pair[0])
+            .ok_or_else(|| format!("invalid hex character '{}'", pair[0] as char))?;
+        let lo = nibble(pair[1])
+            .ok_or_else(|| format!("invalid hex character '{}'", pair[1] as char))?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -494,5 +551,31 @@ mod tests {
         };
         let expanded = expand_tilde(p).unwrap();
         assert_eq!(expanded, PathBuf::from(p));
+    }
+
+    /// A malformed `root_key_hex` must produce an error, never the panic a
+    /// byte-offset slice into multi-byte characters produced. This value is
+    /// DB/file-controlled, so it is hostile input by the project's own
+    /// threat model.
+    #[test]
+    fn hex_decode_rejects_multibyte_and_non_hex_without_panicking() {
+        // '€' is 3 bytes; even total length, but a naive 2-byte slice
+        // straddles its interior.
+        assert!(hex_decode("€100").is_err());
+        assert!(hex_decode("€1").is_err());
+        // '+' parses as numeric sign for from_str_radix but is not hex.
+        assert!(hex_decode("+a0a").is_err());
+        assert!(hex_decode("zz").is_err());
+        assert!(hex_decode("abc").is_err()); // odd length
+                                             // Uppercase stays accepted (it was before).
+        assert_eq!(hex_decode("DEADBEEF"), Ok(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(hex_decode(""), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn key_file_with_multibyte_hex_is_an_error_not_a_panic() {
+        let mut key = KeyFile::generate("db-1");
+        key.root_key_hex = "€100".to_string();
+        assert!(key.root_key_bytes().is_err());
     }
 }
