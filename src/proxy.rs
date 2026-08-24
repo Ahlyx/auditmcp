@@ -38,9 +38,28 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 
+/// Cap on a single buffered line. MCP framing is newline-delimited JSON-RPC,
+/// so one line is one message; a peer that emits gigabytes without a newline
+/// is not speaking MCP. Mirrors the HTTP transport's request cap in spirit
+/// (`MAX_REQUEST_BYTES`): exceeding it is refused rather than truncated,
+/// because forwarding half a message would corrupt the peer's view of the
+/// protocol -- and buffering it whole would let a hostile or broken peer
+/// exhaust memory through a proxy that promised fail-open.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> {
+    // Windows: holds the console-close/shutdown teardown grace open while
+    // the drain below runs, instead of racing a forced kill. No-op on Unix.
+    shutdown::install_blocking_close_handler();
+
     let config = Arc::new(Config::load(config_path)?);
     let target = config.resolve_target(target)?;
+    // Windows: the majority of real MCP servers launch through `.cmd`
+    // shims (`npx`, `npm`, `uvx`), which `CreateProcess` will not resolve
+    // or execute directly -- only `.exe` (or extensionless names that
+    // resolve to one). Without this, `run -- npx -y some/server` fails
+    // with "program not found" even though `npx` is on PATH.
+    let target = maybe_wrap_windows_shim(target);
     let (program, args) = target
         .split_first()
         .expect("resolve_target rejects an empty command");
@@ -250,18 +269,16 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
             abandoned.len()
         );
         for call in abandoned {
-            let configured_tier = config.tier_for_tool(&call.tool_name);
-            let (mut entry, dest) = audit::build_entry(
+            log_completed(
+                &session,
                 call,
                 CallOutcome::timed_out(),
-                session.id(),
                 &server_name,
-                configured_tier,
+                &config,
                 &patterns,
                 &allowlist,
+                &db,
             );
-            session.attach_anomaly(&mut entry, dest.as_ref(), std::time::Instant::now());
-            db.log(entry);
         }
     }
 
@@ -291,7 +308,11 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // exits — see `DbWriter`. The drop must come first: waiting with a live
     // sender would burn the whole timeout and report a spurious timeout.
     drop(db);
-    match writer.wait_for_drain(DRAIN_TIMEOUT) {
+    let drain = writer.wait_for_drain(DRAIN_TIMEOUT);
+    // Either way the queue has been written or given up on; the blocking
+    // close/shutdown handler must stop holding the OS grace open.
+    shutdown::note_drain_complete();
+    match drain {
         db::DrainOutcome::Drained { dropped: 0 } => {}
         db::DrainOutcome::Drained { dropped } => {
             return Err(anyhow::anyhow!(
@@ -346,6 +367,56 @@ async fn pump_client_to_child(
         if n == 0 {
             break; // EOF: client closed stdin.
         }
+        if buf.len() > MAX_LINE_BYTES && !buf.ends_with(b"\n") {
+            tracing::warn!(
+                "client sent {} bytes without a newline; refusing to buffer \
+                 further -- closing the session rather than growing memory \
+                 without bound",
+                buf.len()
+            );
+            break;
+        }
+
+        // Register BEFORE forwarding, mirroring the HTTP transport (where
+        // `register_if_tool_call` precedes `client.request`). Both writes
+        // below are await points on a multithreaded runtime, so a fast
+        // target can answer a trivial tool call while this task is parked
+        // inside them; registering first means that response always finds
+        // its pending entry instead of vanishing ("nothing to close out")
+        // and leaving an orphan to be mis-logged as a timeout at drain.
+        for msg in parse_rpc_messages(&buf) {
+            if !msg.is_tool_call_request() {
+                continue;
+            }
+            if let (Some(id_key), Some(tool_name)) = (msg.id_key(), msg.tool_name()) {
+                let displaced = session.register(
+                    id_key,
+                    PendingCall {
+                        tool_name,
+                        args: msg.arguments().cloned(),
+                        bytes_in: buf.len() as i64,
+                        started: Instant::now(),
+                    },
+                );
+                if let Some(stale) = displaced {
+                    tracing::warn!(
+                        "JSON-RPC id reused for tool '{}' before its previous response \
+                         arrived; logging the earlier call as a timeout rather than dropping it",
+                        stale.tool_name
+                    );
+                    log_completed(
+                        &session,
+                        stale,
+                        CallOutcome::timed_out(),
+                        &server_name,
+                        &config,
+                        &patterns,
+                        &allowlist,
+                        &db,
+                    );
+                }
+            }
+        }
 
         if let Err(e) = child_in.write_all(&buf).await {
             tracing::warn!("error writing to child stdin: {e}");
@@ -354,60 +425,29 @@ async fn pump_client_to_child(
         if let Err(e) = child_in.flush().await {
             tracing::warn!("error flushing child stdin: {e}");
         }
-
-        if let Some(msg) = parse_rpc_message(&buf) {
-            if msg.is_tool_call_request() {
-                if let (Some(id_key), Some(tool_name)) = (msg.id_key(), msg.tool_name()) {
-                    let displaced = session.register(
-                        id_key,
-                        PendingCall {
-                            tool_name,
-                            args: msg.arguments().cloned(),
-                            bytes_in: buf.len() as i64,
-                            started: Instant::now(),
-                        },
-                    );
-                    if let Some(stale) = displaced {
-                        log_stale_pending_call(
-                            stale,
-                            &session,
-                            &server_name,
-                            &config,
-                            &patterns,
-                            &allowlist,
-                            &db,
-                        );
-                    }
-                }
-            }
-        }
     }
 }
 
-/// Logs a `PendingCall` displaced by a JSON-RPC id reused before its
-/// original response arrived (see `Session::register`). Rather than
-/// silently vanishing when its real response later finds nothing to
-/// resolve, it is recorded here as a timeout -- the honest description of
-/// "a tool call happened and this proxy never got to see its outcome" --
-/// so the fail-open contract holds even for this edge case.
-fn log_stale_pending_call(
-    call: PendingCall,
+/// The single place the stdio transport turns a completed or abandoned call
+/// into a row, so the tier lookup, the pipeline inputs, and the anomaly
+/// attachment cannot drift between the response path, the id-reuse path,
+/// and the shutdown drain -- the same single-entry-point shape
+/// `http::server::log_entry` provides for the HTTP transports.
+#[allow(clippy::too_many_arguments)] // mirrors http's log_entry; bundling the pipeline inputs would obscure the uniformity it exists to enforce
+fn log_completed(
     session: &Session,
+    call: PendingCall,
+    outcome: CallOutcome,
     server_name: &str,
     config: &Config,
     patterns: &PatternSet,
     allowlist: &HashSet<String>,
     db: &DbHandle,
 ) {
-    tracing::warn!(
-        "JSON-RPC id reused for tool '{}' before its previous response arrived; \
-         logging the earlier call as a timeout rather than dropping it",
-        call.tool_name
-    );
     let configured_tier = config.tier_for_tool(&call.tool_name);
     let (mut entry, dest) = audit::build_entry(
         call,
-        CallOutcome::timed_out(),
+        outcome,
         session.id(),
         server_name,
         configured_tier,
@@ -446,6 +486,15 @@ async fn pump_child_to_client(
         if n == 0 {
             break; // EOF: child closed stdout (exited).
         }
+        if buf.len() > MAX_LINE_BYTES && !buf.ends_with(b"\n") {
+            tracing::warn!(
+                "target sent {} bytes without a newline; refusing to buffer \
+                 further -- closing the session rather than growing memory \
+                 without bound",
+                buf.len()
+            );
+            break;
+        }
 
         if let Err(e) = stdout.write_all(&buf).await {
             tracing::warn!("error writing to client stdout: {e}");
@@ -455,45 +504,44 @@ async fn pump_child_to_client(
             tracing::warn!("error flushing client stdout: {e}");
         }
 
-        let Some(msg) = parse_rpc_message(&buf) else {
-            continue;
-        };
-        let Some(id_key) = msg.id_key() else {
-            continue;
-        };
+        let msgs = parse_rpc_messages(&buf);
+        for msg in msgs {
+            // Notifications and responses to untracked calls resolve
+            // nothing; a replay of an already-resolved id finds nothing the
+            // second time. Either way there is nothing to close out.
+            let Some(id_key) = msg.id_key() else {
+                continue;
+            };
+            let Some(call) = session.resolve(&id_key) else {
+                continue;
+            };
 
-        // Response to something we didn't track (not a tools/call), or a
-        // replay of one already resolved — either way there is nothing to
-        // close out and nothing to log.
-        let Some(call) = session.resolve(&id_key) else {
-            continue;
-        };
-
-        let configured_tier = config.tier_for_tool(&call.tool_name);
-        let (mut entry, dest) = audit::build_entry(
-            call,
-            CallOutcome::from_rpc(&msg, buf.len() as i64),
-            session.id(),
-            &server_name,
-            configured_tier,
-            &patterns,
-            &allowlist,
-        );
-        session.attach_anomaly(&mut entry, dest.as_ref(), std::time::Instant::now());
-        db.log(entry);
+            log_completed(
+                &session,
+                call,
+                CallOutcome::from_rpc(&msg, buf.len() as i64),
+                &server_name,
+                &config,
+                &patterns,
+                &allowlist,
+                &db,
+            );
+        }
     }
 }
 
 /// Best-effort decode of a raw line for logging purposes only. Strips a
 /// trailing `\n`/`\r\n` before parsing (the raw bytes forwarded to the peer
-/// are never touched by this). Returns `None` — never panics — on
-/// non-UTF-8 bytes or invalid/non-JSON-RPC-shaped content, which is
-/// expected to happen sometimes (partial reads, non-MCP framing, etc.) and
-/// must not be treated as fatal.
-fn parse_rpc_message(buf: &[u8]) -> Option<RpcMessage> {
+/// are never touched by this). Returns an empty vec — never panics — on
+/// non-UTF-8 bytes or content with no parseable JSON-RPC envelope, which is
+/// expected to happen sometimes (partial reads, non-MCP framing, batches of
+/// malformed elements) and must not be treated as fatal.
+fn parse_rpc_messages(buf: &[u8]) -> Vec<RpcMessage> {
     let trimmed = strip_trailing_newline(buf);
-    let text = std::str::from_utf8(trimmed).ok()?;
-    serde_json::from_str::<RpcMessage>(text).ok()
+    match std::str::from_utf8(trimmed) {
+        Ok(text) => RpcMessage::parse_batch(text.as_bytes()),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn strip_trailing_newline(buf: &[u8]) -> &[u8] {
@@ -507,28 +555,112 @@ fn strip_trailing_newline(buf: &[u8]) -> &[u8] {
     &buf[..end]
 }
 
+/// Windows: resolve `.cmd`/`.bat` shims so `run -- npx -y some/server`
+/// works the way every MCP client's own launcher does. `CreateProcess`
+/// searches PATH for `name` and `name.exe` but will neither find nor
+/// execute `npx.cmd` -- and npm-style global installs ship exactly that
+/// shim, making it the single most common MCP target command.
+///
+/// Returns a possibly-rewritten command vector. A shim is executed via
+/// `cmd /c <full path>` because `.cmd`/`.bat` are batch scripts, not
+/// executables; args pass through as ordinary quoted arguments, which is
+/// correct for the package names and flags MCP launches use.
+#[cfg(windows)]
+fn maybe_wrap_windows_shim(target: Vec<String>) -> Vec<String> {
+    let Some((program, rest)) = target.split_first() else {
+        return target;
+    };
+
+    // Already a path, or an explicit .exe: CreateProcess handles both.
+    let lower = program.to_lowercase();
+    let has_path_sep = program.contains('\\') || program.contains('/');
+    match () {
+        _ if has_path_sep => return target,
+        _ if lower.ends_with(".exe") => return target,
+        _ if lower.ends_with(".cmd") || lower.ends_with(".bat") => {
+            // Explicitly a batch file but not found by path search below
+            // would fail anyway; route through cmd regardless of whether
+            // PATH lookup locates it, since cmd resolves bare names too.
+            let mut out = vec!["cmd".to_string(), "/c".to_string()];
+            out.push(match find_on_path(program) {
+                Some(full) => full,
+                None => program.clone(),
+            });
+            out.extend(rest.iter().cloned());
+            return out;
+        }
+        _ => {}
+    }
+
+    // Extensionless name: prefer what CreateProcess would do (.exe), and
+    // only take over when the name resolves to a batch shim instead.
+    match find_on_path(&format!("{program}.exe")) {
+        Some(_) => target, // let CreateProcess do its normal thing
+        None => match find_on_path(&format!("{program}.cmd"))
+            .or_else(|| find_on_path(&format!("{program}.bat")))
+        {
+            Some(shim) => {
+                tracing::warn!(
+                    "target command '{program}' resolved to batch shim '{shim}'; \
+                     launching via 'cmd /c' (Windows cannot execute .cmd shims directly)"
+                );
+                let mut out = vec!["cmd".to_string(), "/c".to_string(), shim];
+                out.extend(rest.iter().cloned());
+                out
+            }
+            // Nothing anywhere on PATH: leave untouched so the spawn fails
+            // with the original, honest "program not found" error.
+            None => target,
+        },
+    }
+}
+
+/// Searches PATH for an exact file name and returns its first absolute hit.
+#[cfg(windows)]
+fn find_on_path(file_name: &str) -> Option<String> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(file_name))
+        .find(|candidate| candidate.is_file())
+        .map(|found| found.to_string_lossy().into_owned())
+}
+
+#[cfg(not(windows))]
+fn maybe_wrap_windows_shim(target: Vec<String>) -> Vec<String> {
+    target
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_rpc_message_returns_none_on_invalid_utf8() {
+    fn parse_rpc_messages_returns_empty_on_invalid_utf8() {
         let invalid_utf8 = vec![0xff, 0xfe, 0xfd, b'\n'];
-        assert!(parse_rpc_message(&invalid_utf8).is_none());
+        assert!(parse_rpc_messages(&invalid_utf8).is_empty());
     }
 
     #[test]
-    fn parse_rpc_message_returns_none_on_malformed_json() {
-        assert!(parse_rpc_message(b"not json at all\n").is_none());
+    fn parse_rpc_messages_returns_empty_on_malformed_json() {
+        assert!(parse_rpc_messages(b"not json at all\n").is_empty());
     }
 
+    /// A batch (top-level array) parses into one RpcMessage per element,
+    /// so a batched tools/call is audited rather than silently forwarded
+    /// with no trace. This is the stdio-side half of the contract the HTTP
+    /// transport shares.
     #[test]
-    fn parse_rpc_message_extracts_tool_call_request() {
-        let line = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"msg":"hi"}}}
+    fn parse_rpc_messages_handles_batches() {
+        let line = br#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"a","arguments":{}}},
+                      {"jsonrpc":"2.0","method":"notifications/initialized"}]
 "#;
-        let msg = parse_rpc_message(line).expect("should parse");
-        assert!(msg.is_tool_call_request());
-        assert_eq!(msg.tool_name().as_deref(), Some("echo"));
-        assert_eq!(msg.id_key().as_deref(), Some("1"));
+        let msgs = parse_rpc_messages(line);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs.iter().filter(|m| m.is_tool_call_request()).count(),
+            1,
+            "exactly one element is a tools/call"
+        );
+        assert_eq!(msgs[0].tool_name().as_deref(), Some("a"));
     }
 }
