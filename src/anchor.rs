@@ -21,9 +21,10 @@
 
 use crate::hex::hex_encode;
 use hmac::{Hmac, Mac};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 fn genesis_prev_anchor_hmac() -> String {
@@ -133,13 +134,26 @@ pub fn resolve_anchor_path(configured_path: &str) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Reads the last line of the anchor file (if any) to get the previous
-/// entry's `anchor_hmac`, so the next entry can chain from it. `None` means
-/// "no anchor file yet, or it's empty" -- the caller uses the genesis
-/// sentinel in that case.
+/// How far back from the end of the file `last_anchor_hmac` reads. The
+/// anchor is read on every tick for the lifetime of a session; reading the
+/// whole append-only file each time is O(file) forever, while the chaining
+/// value only ever lives in the last line.
+const TAIL_WINDOW_BYTES: u64 = 64 * 1024;
+
+/// Reads the last COMPLETE line of the anchor file (if any) to get the
+/// previous entry's `anchor_hmac`, so the next entry can chain from it.
+/// `None` means "no anchor file yet, or it's empty" -- the caller uses the
+/// genesis sentinel in that case.
+///
+/// A trailing PARTIAL line (a process killed or a disk-full error landing
+/// mid-`writeln!`) is ignored rather than fatal: treating a torn write as
+/// permanent corruption wedged every future anchor tick forever, silently
+/// disabling the second witness while the proxy kept reporting healthy.
+/// Only a complete-but-unparseable last line is an error -- that is
+/// evidence of tampering, not of an interrupted write.
 fn last_anchor_hmac(path: &Path) -> anyhow::Result<Option<String>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(anyhow::anyhow!(
@@ -148,7 +162,20 @@ fn last_anchor_hmac(path: &Path) -> anyhow::Result<Option<String>> {
             ))
         }
     };
-    let last_line = content.lines().rev().find(|l| !l.trim().is_empty());
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(TAIL_WINDOW_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut tail = String::new();
+    file.read_to_string(&mut tail)
+        .map_err(|e| anyhow::anyhow!("failed to read anchor file {}: {e}", path.display()))?;
+
+    // Drop a trailing fragment that was never newline-terminated: it is by
+    // definition an incomplete write. Then take the last non-empty line.
+    let complete = match tail.rfind('\n') {
+        Some(cut) => &tail[..cut],
+        None => "",
+    };
+    let last_line = complete.lines().rev().find(|l| !l.trim().is_empty());
     match last_line {
         None => Ok(None),
         Some(line) => {
@@ -157,6 +184,64 @@ fn last_anchor_hmac(path: &Path) -> anyhow::Result<Option<String>> {
             Ok(Some(entry.anchor_hmac))
         }
     }
+}
+
+/// If the file's last byte is not `\n`, truncate the unterminated trailing
+/// fragment away (back to the last complete line). A no-op on a clean,
+/// empty, or not-yet-existing file. Only ever removes bytes after the final
+/// newline, so no complete entry can be lost.
+fn repair_torn_tail(path: &Path) -> anyhow::Result<()> {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        // Nothing to repair yet.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "failed to open anchor file {}: {e}",
+                path.display()
+            ))
+        }
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+
+    // Find where the last complete line ends, within the tail window.
+    let start = len.saturating_sub(TAIL_WINDOW_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut tail = String::new();
+    file.read_to_string(&mut tail)?;
+    match tail.rfind('\n') {
+        Some(pos) => {
+            let keep = start + pos as u64 + 1;
+            tracing::warn!(
+                "anchor file {} ended in a partial line (interrupted write); \
+                 truncating {} trailing byte(s) before appending",
+                path.display(),
+                len - keep
+            );
+            file.set_len(keep)?;
+        }
+        None => {
+            tracing::warn!(
+                "anchor file {} has no complete line in its tail window; \
+                 leaving it untouched for `verify` to report",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Appends one anchor entry, chaining from the file's last recorded
@@ -171,6 +256,19 @@ fn last_anchor_hmac(path: &Path) -> anyhow::Result<Option<String>> {
 /// of a size below the platform's atomic-write limit (comfortably true for
 /// one JSON line), so two writers appending concurrently interleave whole
 /// lines, never torn ones, without needing a rename step at all.
+///
+/// **Chaining is serialized across processes with a lock file.** Atomic
+/// appends prevent torn lines but not broken links: two sessions sharing a
+/// `db_path` (the documented multi-server setup) would each read the same
+/// tail, both chain from it, and produce two entries claiming the same
+/// `prev_anchor_hmac` -- a permanent false-positive mismatch in `verify`.
+///
+/// The lock is held only around read-tail/compute/append. It is fail-open:
+/// if it cannot be acquired within a few seconds -- a wedged live holder,
+/// say -- this tick's append is SKIPPED with a warning and retried on the
+/// next cadence tick, exactly like every other anchor write failure.
+/// A crashed writer's stale lock file is force-broken after
+/// `LOCK_STALE_AFTER`.
 pub fn append_entry(
     path: &Path,
     anchor_key: &[u8; 32],
@@ -186,6 +284,15 @@ pub fn append_entry(
         })?;
     }
 
+    let _lock = AnchorLock::acquire(path)?;
+
+    // Repair a torn tail left by a crash or disk-full landing mid-writeln!
+    // BEFORE chaining: drop the unterminated trailing fragment so this
+    // entry chains from the last COMPLETE entry and the file returns to
+    // one-entry-per-line. Without this, the next tick would append after
+    // the fragment -- turning it into permanent mid-file garbage that every
+    // later read trips over.
+    repair_torn_tail(path)?;
     let prev_anchor_hmac = last_anchor_hmac(path)?.unwrap_or_else(genesis_prev_anchor_hmac);
     let timestamp = chrono::Utc::now().to_rfc3339();
     let anchor_hmac = compute_anchor_hmac(
@@ -217,10 +324,88 @@ pub fn append_entry(
     Ok(())
 }
 
+/// How long `AnchorLock::acquire` waits for another process's live lock
+/// before proceeding without it -- fail-open, per the module contract.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Age at which a lock file is presumed abandoned by a dead process and
+/// force-removed rather than waited on.
+const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Advisory lock serializing the anchor's read-modify-append cycle across
+/// processes. Held via RAII: dropping removes the file.
+struct AnchorLock {
+    path: PathBuf,
+}
+
+impl AnchorLock {
+    fn acquire(anchor_path: &Path) -> anyhow::Result<Self> {
+        let lock_path = anchor_path.with_extension(
+            anchor_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!("{e}.lock"))
+                .unwrap_or_else(|| "lock".to_string()),
+        );
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(AnchorLock { path: lock_path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to create anchor lock {}: {e}",
+                        lock_path.display()
+                    ))
+                }
+            }
+            // Someone else holds it. Break a stale lock outright; otherwise
+            // wait, then give up and proceed unlocked.
+            let stale = std::fs::metadata(&lock_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > LOCK_STALE_AFTER);
+            if stale {
+                let _ = std::fs::remove_file(&lock_path);
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "anchor: could not acquire {} within {:?}; appending without \
+                     the cross-process lock (verify may report a prev_anchor_hmac \
+                     mismatch if another session appends concurrently)",
+                    lock_path.display(),
+                    LOCK_WAIT
+                );
+                return Err(anyhow::anyhow!("anchor lock busy"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for AnchorLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Reads every entry in the anchor file, in file order. `Ok(vec![])` if the
 /// file doesn't exist -- an anchor that was never written is not itself an
 /// error (see the fail-open contract: `verify` reports this, doesn't fail
 /// on it).
+///
+/// A trailing PARTIAL line (no newline at EOF, not parseable) is a torn
+/// write -- a crash or disk-full landing mid-`writeln!` -- and is skipped,
+/// because hard-failing here conflated "crashed mid-write" with tampering
+/// and made every subsequent `verify` report a healthy-but-anchored log as
+/// broken forever. Any complete line failing to parse, or a torn-looking
+/// line anywhere but the end of the file, is still an error: that is
+/// evidence of editing, not of interruption.
 pub fn read_entries(path: &Path) -> anyhow::Result<Vec<AnchorEntry>> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -232,18 +417,33 @@ pub fn read_entries(path: &Path) -> anyhow::Result<Vec<AnchorEntry>> {
             ))
         }
     };
+    let ends_clean = content.ends_with('\n');
     let mut entries = Vec::new();
     for (i, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let entry: AnchorEntry = serde_json::from_str(line).map_err(|e| {
-            anyhow::anyhow!(
-                "anchor file {} line {}: not valid JSON: {e}",
-                path.display(),
-                i + 1
-            )
-        })?;
+        let entry: AnchorEntry = match serde_json::from_str(line) {
+            Ok(e) => e,
+            // Only the final line can be a legitimate torn write (no
+            // newline after it); anything else failing to parse is
+            // mid-file damage and stays an error.
+            Err(_) if i + 1 == content.lines().count() && !ends_clean => {
+                tracing::warn!(
+                    "anchor file {} ends in a partial line (interrupted write); \
+                     it is skipped and chaining continues from the last complete entry",
+                    path.display()
+                );
+                break;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "anchor file {} line {}: not valid JSON: {e}",
+                    path.display(),
+                    i + 1
+                ))
+            }
+        };
         entries.push(entry);
     }
     Ok(entries)
@@ -344,7 +544,7 @@ pub async fn run(db_path: PathBuf, anchor_path: PathBuf, anchor_key: [u8; 32], c
     loop {
         tokio::time::sleep(cadence).await;
 
-        let tail = match crate::db::open_readonly(&db_path).and_then(|conn| last_real_row(&conn)) {
+        let tail = match crate::db::open_readonly(&db_path).and_then(|conn| last_chain_row(&conn)) {
             Ok(Some(t)) => t,
             Ok(None) => continue, // nothing logged yet; nothing to anchor
             Err(e) => {
@@ -362,7 +562,7 @@ pub async fn run(db_path: PathBuf, anchor_path: PathBuf, anchor_key: [u8; 32], c
 /// `(id, hash)` of the last row in `tool_calls`, or `None` if the table is
 /// empty. Not filtered to non-synthetic rows -- the anchor's job is to
 /// witness the chain's actual tail, whatever kind of row that is.
-fn last_real_row(conn: &rusqlite::Connection) -> anyhow::Result<Option<(i64, String)>> {
+fn last_chain_row(conn: &rusqlite::Connection) -> anyhow::Result<Option<(i64, String)>> {
     conn.query_row(
         "SELECT id, hash FROM tool_calls ORDER BY id DESC LIMIT 1",
         [],
@@ -371,8 +571,6 @@ fn last_real_row(conn: &rusqlite::Connection) -> anyhow::Result<Option<(i64, Str
     .optional()
     .map_err(|e| anyhow::anyhow!("failed to read chain tail: {e}"))
 }
-
-use rusqlite::OptionalExtension;
 
 #[cfg(test)]
 mod tests {
@@ -460,6 +658,81 @@ mod tests {
         let path = temp_anchor_path("missing");
         let entries = read_entries(&path).unwrap();
         assert!(entries.is_empty());
+    }
+
+    /// A crash mid-`writeln!` leaves a trailing fragment with no newline.
+    /// Chaining must continue from the last complete entry rather than
+    /// wedging every future anchor tick, and `read_entries` must skip the
+    /// fragment instead of reporting a healthy log as permanently broken.
+    #[test]
+    fn torn_trailing_line_is_tolerated_by_chaining_and_reading() {
+        let path = temp_anchor_path("torn_tail");
+        append_entry(&path, &key(5), 1, "h1").unwrap();
+        append_entry(&path, &key(5), 2, "h2").unwrap();
+
+        // Simulate the torn write: a partial line after the last newline.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            std::io::Write::write_all(&mut f, b"{\"timestamp\":\"2026-").unwrap();
+        }
+
+        // The chaining read sees entry 2's hmac, not an error.
+        let hmac = last_anchor_hmac(&path).unwrap().expect("entry 2 exists");
+        assert_eq!(hmac, read_entries(&path).unwrap()[1].anchor_hmac);
+
+        // And the reader tolerates it too: two complete entries survive.
+        let entries = read_entries(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].chain_last_id, 2);
+
+        // A subsequent append chains from the last complete entry and
+        // verifies cleanly end to end.
+        append_entry(&path, &key(5), 3, "h3").unwrap();
+        let entries = read_entries(&path).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(verify_anchor_chain(&entries, &key(5)).is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A COMPLETE but unparseable last line is not a torn write -- that is
+    /// tampering -- so both reads must still reject it.
+    #[test]
+    fn complete_but_corrupt_last_line_is_still_an_error() {
+        let path = temp_anchor_path("corrupt_complete");
+        append_entry(&path, &key(6), 1, "h1").unwrap();
+        std::fs::write(&path, "not json at all\n").unwrap();
+
+        assert!(last_anchor_hmac(&path).is_err());
+        assert!(read_entries(&path).is_err());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The cross-process serialization actually works as a lock: while one
+    /// holder is alive and fresh, acquisition waits; once released (drop),
+    /// the next writer chains correctly from the appended state. The stale-
+    /// takeover path is time-based and exercised only implicitly here --
+    /// its failure mode is a skipped tick, which is fail-open by design.
+    #[test]
+    fn append_entry_cleans_up_its_lock_file_and_chains_across_uses() {
+        let path = temp_anchor_path("lock");
+        append_entry(&path, &key(7), 1, "h1").unwrap();
+        append_entry(&path, &key(7), 2, "h2").unwrap();
+
+        let lock_path = path.with_extension("log.lock");
+        assert!(
+            !lock_path.exists(),
+            "the lock file must be removed when each append finishes"
+        );
+
+        let entries = read_entries(&path).unwrap();
+        assert_eq!(entries[1].prev_anchor_hmac, entries[0].anchor_hmac);
+
+        std::fs::remove_file(&path).ok();
     }
 
     fn stored_row(id: i64, hash: &str) -> crate::db::StoredRow {
