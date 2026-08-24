@@ -80,25 +80,46 @@ impl SseParser {
     }
 }
 
-/// The value of the first line with the given field prefix.
+/// The value of the given field. When a field appears more than once in an
+/// event, the SPEC says the last occurrence wins (SSE §"field definitions"
+/// applies each line in order, overwriting), so an
+/// `event: message\nevent: endpoint` frame must be treated as an endpoint
+/// frame -- taking the first would forward it unrewritten and let the
+/// client bypass the proxy.
 fn field(event: &[u8], prefix: &str) -> Option<String> {
     let text = std::str::from_utf8(event).ok()?;
-    text.lines().find_map(|line| {
-        line.strip_prefix(prefix)
-            .map(|rest| rest.strip_prefix(' ').unwrap_or(rest).to_string())
-    })
+    let mut found = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            found = Some(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        }
+    }
+    found
 }
 
-/// Offset of an event terminator and its length (`\n\n` or `\r\n\r\n`).
+/// Offset of an event terminator and its length. The SSE grammar allows
+/// either LF or CRLF line endings independently per line, so besides the
+/// two uniform terminators (`\n\n`, `\r\n\r\n`) a mixed-style blank line
+/// (`"\n\r\n"` -- LF-terminated data line followed by CRLF terminator)
+/// is also spec-legal and must end the event rather than stall the parser
+/// until it merges with the next one's bytes.
 fn find_event_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
-    let lf = buf.windows(2).position(|w| w == b"\n\n");
-    match (crlf, lf) {
-        (Some(c), Some(l)) if c <= l => Some((c, 4)),
-        (_, Some(l)) => Some((l, 2)),
-        (Some(c), None) => Some((c, 4)),
-        (None, None) => None,
+    // Candidates as (offset, terminator length); earliest offset wins,
+    // longest terminator breaks ties so `\r\n\r\n` is consumed whole rather
+    // than leaving a stray `\n` to start the next event.
+    let mut candidates: Vec<(usize, usize)> = Vec::with_capacity(3);
+    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        candidates.push((i, 4));
     }
+    if let Some(i) = buf.windows(3).position(|w| w == b"\n\r\n") {
+        candidates.push((i, 3));
+    }
+    if let Some(i) = buf.windows(2).position(|w| w == b"\n\n") {
+        candidates.push((i, 2));
+    }
+    candidates
+        .into_iter()
+        .min_by_key(|&(pos, len)| (pos, std::cmp::Reverse(len)))
 }
 
 /// The concatenated `data:` lines of one event, or `None` for an event
@@ -159,32 +180,43 @@ pub(crate) fn endpoint_key(uri: &str) -> Option<String> {
     Some(parsed.path_and_query()?.to_string())
 }
 
-/// Replaces the `data:` payload of one event, preserving its other lines
-/// and its terminator so nothing else about the frame changes.
+/// Replaces the `data:` payload of one event, preserving everything else
+/// about the frame byte-for-byte -- other fields, their order, and each
+/// line's OWN line-ending style. Splitting the whole frame on a single
+/// detected newline style would silently rewrite the endings of lines that
+/// used the other style (a mixed-style frame is spec-legal), which is
+/// exactly the kind of byte the forwarding guarantee says never changes.
 pub(crate) fn replace_event_data(raw: &[u8], new_data: &str) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(raw) else {
         return raw.to_vec();
     };
-    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut out = String::with_capacity(text.len() + new_data.len());
+    let mut out = String::with_capacity(text.len() + new_data.len() + 2);
     let mut replaced = false;
-    for line in text.split(newline) {
-        if line.starts_with("data:") {
+    // split_inclusive keeps each line's terminator attached, so it is
+    // re-emitted verbatim for untouched lines and reattached to the one
+    // line whose payload changes.
+    for line in text.split_inclusive('\n') {
+        let (content, terminator) = match line.strip_suffix("\r\n") {
+            Some(content) => (content, "\r\n"),
+            None => match line.strip_suffix('\n') {
+                Some(content) => (content, "\n"),
+                None => (line, ""), // final line without a terminator
+            },
+        };
+        if content.starts_with("data:") {
             // Multi-line data collapses to one line; the payload is a URI,
             // which cannot legally span lines.
             if !replaced {
                 out.push_str("data: ");
                 out.push_str(new_data);
-                out.push_str(newline);
+                out.push_str(terminator);
                 replaced = true;
             }
+            // Subsequent data lines are dropped along with their terminators.
         } else {
-            out.push_str(line);
-            out.push_str(newline);
+            out.push_str(content);
+            out.push_str(terminator);
         }
     }
-    // `split` yields a trailing empty piece for the terminator, which the
-    // loop already re-added; drop the extra newline it introduces.
-    out.truncate(out.len() - newline.len());
     out.into_bytes()
 }
