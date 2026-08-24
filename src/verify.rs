@@ -76,6 +76,19 @@ impl VerifyOutcome {
     }
 }
 
+/// Loads the root key for an HMAC-protected chain and derives its
+/// subkeys, returning `(chain_key, anchor_key, fingerprint)`. Any failure
+/// here -- unreadable path, missing file, corrupt JSON, malformed or
+/// wrong-length key material -- is the caller's cue to report exit code 2.
+fn load_hmac_key(config: &Config, db_uuid: &str) -> anyhow::Result<([u8; 32], [u8; 32], String)> {
+    let key_path = config.chain.resolved_key_path()?;
+    let key = crate::keys::KeyFile::load(&key_path)?
+        .ok_or_else(|| anyhow::anyhow!("no key file at {}", key_path.display()))?;
+    let (chain_key, anchor_key) = key.derive_subkeys(db_uuid)?;
+    let fingerprint = key.fingerprint()?;
+    Ok((chain_key, anchor_key, fingerprint))
+}
+
 pub fn run(config_path: &Path, repair_index: bool, yes: bool) -> anyhow::Result<VerifyOutcome> {
     if yes && !repair_index {
         return Err(anyhow::anyhow!("--yes only applies to --repair-index"));
@@ -101,19 +114,22 @@ pub fn run(config_path: &Path, repair_index: bool, yes: bool) -> anyhow::Result<
     let mut key_fingerprint: Option<String> = None;
     let hash_key = match &metadata {
         Some(m) if m.hmac_version.as_deref() == Some("1") => {
-            let key_path = config.chain.resolved_key_path()?;
-            let key = match crate::keys::KeyFile::load(&key_path)? {
-                Some(k) => k,
-                None => {
+            // Every way of failing to obtain a usable chain key -- missing
+            // file, corrupt JSON, wrong-length root key, unresolvable key
+            // path -- maps to `Drift`, the code the module contract reserves
+            // for "chain intact but key missing/unloadable/unknown". Letting
+            // these propagate as plain errors would exit 1 and read as
+            // "tampered", sending a monitoring script to the wrong incident.
+            let (chain_key, ak, fingerprint) = match load_hmac_key(&config, &m.db_uuid) {
+                Ok(k) => k,
+                Err(e) => {
                     eprintln!(
                         "FAILED: this database is HMAC-protected (Phase 3.5) but its chain \
-                         key is missing at {}.",
-                        key_path.display()
+                         key is missing or unloadable: {e}"
                     );
                     return Ok(VerifyOutcome::Drift);
                 }
             };
-            let (chain_key, ak) = key.derive_subkeys(&m.db_uuid)?;
 
             // `chain_metadata` carries its own HMAC (see
             // `db::verify_chain_metadata_hmac`) precisely because it is a
@@ -131,7 +147,7 @@ pub fn run(config_path: &Path, repair_index: bool, yes: bool) -> anyhow::Result<
             }
 
             anchor_key = Some(ak);
-            key_fingerprint = Some(key.fingerprint()?);
+            key_fingerprint = Some(fingerprint);
             HashKey::Hmac(chain_key)
         }
         Some(m) if m.hmac_version.is_some() => {
@@ -653,6 +669,27 @@ mod tests {
         .unwrap();
         drop(conn);
         std::fs::remove_file(&fx.key_path).unwrap();
+
+        assert_eq!(fx.run().unwrap(), VerifyOutcome::Drift);
+    }
+
+    /// A key file that exists but cannot be used (corrupt JSON here; a
+    /// wrong-length or malformed key exercises the same arm) must report
+    /// the same "key missing/unloadable" outcome as a missing file -- exit
+    /// code 2, not 1, which monitoring would read as chain tampering.
+    #[test]
+    fn hmac_chain_with_corrupt_key_reports_drift_code() {
+        let fx = HmacFixture::new("hmac_corrupt_key", 90, false);
+        let mode = fx.bootstrap();
+        let mut conn = db::open_for_write(&fx.db_path).unwrap();
+        db::insert_row_with_key(
+            &mut conn,
+            &hmac_row("s1", "echo", "2026-01-01T00:00:00Z"),
+            &mode.hash_key(),
+        )
+        .unwrap();
+        drop(conn);
+        std::fs::write(&fx.key_path, "{not json at all").unwrap();
 
         assert_eq!(fx.run().unwrap(), VerifyOutcome::Drift);
     }
