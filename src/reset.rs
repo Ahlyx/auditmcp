@@ -28,10 +28,32 @@ pub fn run(config_path: &Path, yes: bool, keep_old: bool) -> anyhow::Result<()> 
     let stamp = chrono::Utc::now().format("%Y-%m-%d-%H%M%S").to_string();
     let mut summary = Vec::new();
 
-    // Sidecar WAL/SHM files carry no data that isn't also reachable through
-    // the main db file once checkpointed, and a fresh `open_for_write`
-    // below recreates them as needed -- they're removed rather than
-    // archived even under --keep-old.
+    // Flush the WAL into the main database BEFORE touching any file. SQLite
+    // checkpoints on clean close, but `run` dying to a crash or SIGKILL can
+    // leave committed transactions living only in the `-wal` sidecar -- and
+    // deleting that sidecar below (even under `--keep-old`, whose entire
+    // purpose is preserving the old record) would silently truncate the
+    // archive by exactly the rows the crash lost from disk view. Best-effort:
+    // a database too damaged to open for checkpointing proceeds anyway and
+    // reports through the normal archive path.
+    if db_path.exists() {
+        match crate::db::open_for_write(&db_path) {
+            Ok(conn) => {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "reset: could not open {} to checkpoint its WAL first ({e}); \
+                     proceeding, but an archived copy may miss recently committed rows",
+                    db_path.display()
+                );
+            }
+        }
+    }
+
+    // After the checkpoint the sidecars genuinely carry no data that isn't
+    // in the main db file, so they're removed rather than archived even
+    // under --keep-old; a fresh `bootstrap` below recreates them as needed.
     for sidecar_ext in ["db-wal", "db-shm"] {
         let sidecar = db_path.with_extension(sidecar_ext);
         let _ = std::fs::remove_file(&sidecar);
