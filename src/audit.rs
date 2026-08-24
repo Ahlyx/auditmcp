@@ -209,6 +209,15 @@ impl CallOutcome {
     /// captured when the request went out and are still recorded, which is
     /// the point of writing this row at all. `Timeout` escalates to the
     /// `full` tier, so those args are stored untruncated.
+    pub(crate) fn timed_out() -> Self {
+        CallOutcome {
+            status: CallStatus::Timeout,
+            result: None,
+            error: None,
+            bytes_out: None,
+        }
+    }
+
     /// A response body that is not JSON-RPC at all: a gateway's HTML error
     /// page, a wrong `Content-Type`, a body cut short. Only HTTP can
     /// produce this — stdio MCP is JSON-RPC end to end.
@@ -253,15 +262,6 @@ impl CallOutcome {
             ))),
             error: None,
             bytes_out: Some(bytes_out),
-        }
-    }
-
-    pub(crate) fn timed_out() -> Self {
-        CallOutcome {
-            status: CallStatus::Timeout,
-            result: None,
-            error: None,
-            bytes_out: None,
         }
     }
 }

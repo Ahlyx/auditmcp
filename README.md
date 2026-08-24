@@ -63,6 +63,10 @@ MCP config. A Claude Code `.mcp.json` entry looks like:
 }
 ```
 
+On Windows, npm-style `.cmd` shims (`npx`, `npm`, `uvx`) work as-is:
+auditmcp resolves the shim on PATH and launches it via `cmd /c`, which
+Windows cannot do directly.
+
 ### HTTP servers
 
 For MCP servers that speak HTTP rather than stdio, `serve` runs one loopback
@@ -89,6 +93,11 @@ upstream. Each listener mirrors exactly one upstream at the origin level —
 every path and method forwarded, only scheme and host swapped. Headers pass
 through untouched, including `Authorization`, and **no header is ever
 captured or stored**; only bodies are logged.
+
+Each `[[server]]` also accepts `request_timeout_secs` (default 60): how long
+to wait for an upstream's response headers before giving up on that request.
+Body streaming is never subject to it — a long-lived event stream is normal
+traffic, not a stall.
 
 ### Which servers can be proxied
 
@@ -163,7 +172,7 @@ auditmcp query  --config config.toml --tool delete_file --since 2h --status erro
 auditmcp verify --config config.toml                    # walk the hash chain (+ heartbeats, anchor)
 auditmcp export --config config.toml --format jsonl --output audit.jsonl
 auditmcp unmask --config config.toml <sha256> --note "confirmed false positive"
-auditmcp key    fingerprint --config config.toml        # sha256(root_key)[:16], safe to share
+auditmcp key    fingerprint --config config.toml        # first 16 hex chars of sha256(root_key), safe to share
 auditmcp reset  --config config.toml --yes --keep-old    # archive the chain and start fresh
 ```
 
@@ -196,16 +205,21 @@ verified rather than merely compiled:
 | `SIGINT` / Ctrl-C | Unix | Verified — real signal, mid-session |
 | Ctrl-Break | Windows | Verified — real event, mid-session |
 | Ctrl-C | Windows | Compiled, not verified¹ |
-| Console close | Windows | Compiled, not verified¹ |
-| System shutdown | Windows | Compiled, not verified¹ |
-| **Windows Service stop** | Windows | **Not covered²** |
+| Console close / system shutdown | Windows | Mechanism added², not verified¹ |
+| **Windows Service stop** | Windows | **Not covered³** |
 
-¹ These register through the same console-control handler as Ctrl-Break,
-which is verified. They are not separately testable without closing a
-console or shutting the machine down, and Windows will not deliver
-`CTRL_C_EVENT` to a process group created for testing.
+¹ These are not separately testable without closing a console or shutting
+the machine down, and Windows will not deliver `CTRL_C_EVENT` to a process
+group created for testing.
 
-² `SERVICE_CONTROL_STOP` (what `net stop` sends) goes to a service control
+² Console close and system shutdown arrive with a forced kill once their
+control handler returns (or a ~5s OS grace lapses). A second, blocking
+control handler now holds that grace open — up to 4s — while the audit
+queue drains, instead of the async path racing a near-immediate kill. The
+mechanism is compiled and unit-adjacent tested, but has not been exercised
+against a real console close.
+
+³ `SERVICE_CONTROL_STOP` (what `net stop` sends) goes to a service control
 handler, not a console event, so none of the above sees it. Running
 auditmcp as a true Windows Service needs a service dispatcher, which
 belongs with the not-yet-built install/lifecycle work. Until then, stopping
@@ -264,7 +278,9 @@ Phases 1, 2, 3, and 3.5 are complete. Phase 4 is unstarted.
   transparently, intercepts `tools/call` request/response pairs. Non-tool
   traffic (`initialize`, `tools/list`, notifications) is forwarded but not
   logged, since this tool audits *tool calls*. Child stderr is inherited so
-  tracebacks still reach your terminal.
+  tracebacks still reach your terminal. Top-level JSON-RPC **batches** are
+  audited per element on both transports, matching protocol revisions from
+  2025-03-26 onward that allow (or mandate) batching.
 - **Hash-chained SQLite log** (WAL mode) — `hash = SHA256(prev_hash +
   canonical_json(entry))`, written from a dedicated writer thread behind a
   channel so interception never blocks on disk I/O.
@@ -352,22 +368,23 @@ type). Stdio MCP is JSON-RPC end to end so it never exercises this path;
 
 ### How it has been verified
 
-`cargo test` runs 253 tests covering the hash chain (including concurrent
+`cargo test` runs 277 tests covering the hash chain (including concurrent
 writers against a shared DB and interleaved multi-server chains), secrets
 detection and its false-positive cases, truncation UTF-8 boundary safety,
 export fidelity, unmask hash resolution, `verify` exit codes and
 `--repair-index` semantics, the HTTP transport — SSE parser
-resynchronization after an oversized event, per-listener id isolation so
-two upstreams reusing the same JSON-RPC ids never cross-attribute,
-`Host`-header rewriting to the upstream authority, and non-JSON upstream
-responses being logged as errors with their body — Phase 3's
-anomaly detection: destination extraction and kind tagging, all three
-rules' arm/fire/silent cases, and rule 3's cooldown (one burst yields
+resynchronization after an oversized event, mixed-style event terminators,
+per-listener id isolation so two upstreams reusing the same JSON-RPC ids
+never cross-attribute, `Host`-header rewriting to the upstream authority,
+and non-JSON upstream responses being logged as errors with their body —
+Phase 3's anomaly detection: destination extraction and kind tagging, all
+three rules' arm/fire/silent cases, and rule 3's cooldown (one burst yields
 one flag, with a second burst after the window firing again) — and Phase
 3.5's chain hardening: HKDF subkey derivation and salting, the bootstrap
 decision table (fresh/existing/wrong-key/legacy), heartbeat gap detection
 within and across sessions, the anchor's own internal chain plus its
-cross-check against the database, and `reset`'s archive-vs-delete behavior.
+cross-check against the database, torn-tail recovery and lock-file
+serialization for the anchor, and `reset`'s archive-vs-delete behavior.
 
 Beyond unit tests, the proxy has been exercised end to end on **native
 Windows** (Git Bash + PowerShell) and on an **Ubuntu VM**. The Linux run
@@ -533,7 +550,12 @@ default path unless `[anchor].path` overrides it:
 | Windows | `%LOCALAPPDATA%\auditmcp\anchor.log` |
 
 Each line names the chain's current tail (`chain_last_id`, `chain_last_hash`)
-and chains from the previous line's `anchor_hmac`. `verify` checks the
+and chains from the previous line's `anchor_hmac`. Writes are serialized
+across processes by a lock file next to the anchor (several `auditmcp run`
+instances sharing a `db_path` is the recommended setup, and two of them
+appending concurrently would otherwise chain from the same tail), and a
+torn final line from a crash is repaired on the next append rather than
+wedging every future tick. `verify` checks the
 anchor's own internal chain, then cross-checks every entry against the live
 database — a row the anchor names must still exist with the hash the anchor
 recorded. Anchoring needs a key, so it's unavailable (with a warning, not a

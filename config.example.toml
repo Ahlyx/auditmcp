@@ -25,6 +25,10 @@
 #   auditmcp run --config config.toml -- python test-fixtures/fake_server.py
 # One of the two must be present; with neither, `run` errors rather than
 # starting up with nothing to proxy.
+#
+# Windows note: commands that launch through npm-style `.cmd` shims
+# (`npx`, `npm`, `uvx`) work as-is -- auditmcp resolves the shim on PATH
+# and launches it via `cmd /c`, which `CreateProcess` cannot do directly.
 [target]
 command = ["python", "test-fixtures/fake_server.py"]
 # Recorded in every row's `server_name` column. Optional — defaults to the
@@ -58,6 +62,11 @@ server_name = "fake_server"
 # # Origins accepted on inbound requests. Defaults to loopback only, which
 # # is what stops a page in your browser from driving your MCP servers.
 # # allowed_origins = ["http://localhost"]
+#
+# # Seconds to wait for an upstream's response headers before giving up on
+# # that request (the call is then recorded as a timeout). Body streaming
+# # is never cut off by this -- a long-lived SSE stream is normal traffic.
+# # request_timeout_secs = 60
 
 [logging]
 # Point every server's config at the same file (see note above). Prefer an

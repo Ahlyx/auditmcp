@@ -3,8 +3,9 @@
 //!
 //! This module is deliberately decoupled from `db.rs`: it takes an
 //! allowlist as a plain `HashSet<String>` of sha256 hashes rather than a
-//! `Connection`, so it can be unit-tested standalone and wired into
-//! `proxy.rs` (which will load the set from the DB once per session) later.
+//! `Connection`, so it can be unit-tested standalone and the transport
+//! layer stays in charge of loading it (both `proxy.rs` and `http/server.rs`
+//! load the set from the DB once per session, fail-open to an empty set).
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};

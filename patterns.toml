@@ -1,9 +1,11 @@
 # Secrets-detection patterns for auditmcp, in the spirit of Gitleaks' rule
-# format. This file is bundled into the binary at compile time (see
-# `include_str!` in src/secrets.rs) so detection works with zero setup, but
-# the format is plain, user-editable TOML — a user can maintain their own
-# copy and point auditmcp at it (config wiring for that lands alongside the
-# rest of Phase 2's secrets-detection integration).
+# format. This file is COMPILED INTO THE BINARY at build time (see
+# `include_str!` in src/secrets.rs), so detection works with zero setup.
+#
+# Editing this copy changes nothing until you rebuild from source, and
+# there is deliberately no config key pointing at a user-maintained copy
+# yet (see the README's "Not yet built"). The format is plain TOML so such
+# a key can be added without redesigning anything.
 #
 # Fields:
 #   name                    unique identifier, shows up in redaction markers
