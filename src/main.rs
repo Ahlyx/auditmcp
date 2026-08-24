@@ -22,7 +22,7 @@ mod unmask;
 mod verify;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -35,12 +35,23 @@ struct Cli {
     command: Command,
 }
 
+/// The one flag every subcommand shares. Flattened rather than redeclared
+/// per variant so the nine copies cannot drift apart (help text, required-
+/// ness, or name) -- the codebase's own duplication rule, applied to its
+/// own CLI.
+#[derive(clap::Args)]
+struct ConfigArg {
+    /// Path to the TOML config file.
+    #[arg(long)]
+    config: PathBuf,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Transparently proxy a stdio MCP server, logging every tool call
     Run {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config_args: ConfigArg,
         /// Command to launch the target MCP server, e.g. -- python
         /// server.py. Optional: if omitted, `[target].command` from the
         /// config file is used instead.
@@ -51,13 +62,13 @@ enum Command {
     /// Binds one loopback port per `[[server]]` in the config; each mirrors
     /// exactly one upstream. Runs until stopped.
     Serve {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config_args: ConfigArg,
     },
     /// Read logged tool calls back in a table format
     Query {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config_args: ConfigArg,
         #[arg(long)]
         tool: Option<String>,
         #[arg(long)]
@@ -85,11 +96,13 @@ enum Command {
         include_synthetic: bool,
     },
     /// Walk the hash chain and confirm no row was altered or removed.
-    /// Exit codes: 0 = clean, 1 = hash-chain tamper/failure,
-    /// 2 = redactions-index drift only (chain intact).
+    /// Exit codes: 0 = clean; 1 = hash-chain tamper/failure; 2 = index
+    /// drift or missing/unloadable chain key (chain intact); 3 = heartbeat
+    /// gap; 4 = anchor file's internal HMAC chain broken; 5 = anchor
+    /// references rows that are missing or hash differently.
     Verify {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config_args: ConfigArg,
         /// Rebuild the derived redactions index from redaction_flags (the
         /// source of truth) for drifted rows. Only ever adds/removes rows
         /// in the redactions table -- never touches tool_calls or any
@@ -106,8 +119,8 @@ enum Command {
     /// tooling. Read-only; redaction stays exactly as stored -- no
     /// --unmask flag here, ever (see export.rs's module doc for why).
     Export {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config_args: ConfigArg,
         #[arg(long)]
         format: export::ExportFormat,
         #[arg(long)]
@@ -137,8 +150,8 @@ enum Command {
     /// Never recovers plaintext of a past redaction -- none is ever stored.
     /// This is a deliberate, separate write, never a flag on `query`/`export`.
     Unmask {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config_args: ConfigArg,
         /// Full sha256 or an unambiguous prefix of one, as shown by
         /// `query --verbose` (prefix matching works like a git commit hash).
         hash: String,
@@ -160,8 +173,8 @@ enum Command {
     /// HMAC-protected chain. The only supported way to migrate a legacy
     /// (pre-Phase-3.5) chain, or to get a new chain key.
     Reset {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config_args: ConfigArg,
         /// Required: `reset` is destructive and refuses to run without it.
         #[arg(long)]
         yes: bool,
@@ -176,23 +189,37 @@ enum Command {
 enum KeyAction {
     /// Print the resolved key file path (does not require the key to exist).
     Path {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config_args: ConfigArg,
     },
-    /// Print `sha256(root_key)[:16]` -- safe to share out-of-band to
-    /// confirm two people/machines are looking at the same key.
+    /// Print the first 16 hex characters of sha256(root_key) (64 bits,
+    /// display-only) -- safe to share out-of-band to confirm two
+    /// people/machines are looking at the same key.
     Fingerprint {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config_args: ConfigArg,
     },
-    /// Atomically copy the key file to `dest`, with the same 0600/0700
-    /// permissions as the original (Unix; see the README for the Windows
-    /// caveat).
+    /// Atomically copy the key file to `dest`, with the same restrictive
+    /// permissions as the original.
     Backup {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config_args: ConfigArg,
         dest: PathBuf,
     },
+}
+
+/// Loads the config and the existing root key it names, for the `key`
+/// subcommands that operate on a key that must already exist.
+fn load_existing_key(config_path: &Path) -> anyhow::Result<(config::Config, keys::KeyFile)> {
+    let cfg = config::Config::load(config_path)?;
+    let key_path = cfg.chain.resolved_key_path()?;
+    let key = keys::KeyFile::load(&key_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no key file at {} (has `auditmcp run` been used yet?)",
+            key_path.display()
+        )
+    })?;
+    Ok((cfg, key))
 }
 
 #[tokio::main]
@@ -214,10 +241,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run { config, target } => proxy::run(&config, target).await,
-        Command::Serve { config } => http::serve(&config).await,
+        Command::Run {
+            config_args,
+            target,
+        } => proxy::run(&config_args.config, target).await,
+        Command::Serve { config_args } => http::serve(&config_args.config).await,
         Command::Query {
-            config,
+            config_args,
             tool,
             session,
             since,
@@ -226,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
             verbose,
             include_synthetic,
         } => query::run(
-            &config,
+            &config_args.config,
             tool,
             session,
             since,
@@ -236,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
             include_synthetic,
         ),
         Command::Verify {
-            config,
+            config_args,
             repair_index,
             yes,
         } => {
@@ -244,14 +274,14 @@ async fn main() -> anyhow::Result<()> {
             // exit-code policy itself stays testable in `verify::tests`.
             // `Clean` returns normally rather than exiting, keeping the
             // ordinary success path identical to every other subcommand's.
-            let outcome = verify::run(&config, repair_index, yes)?;
+            let outcome = verify::run(&config_args.config, repair_index, yes)?;
             if outcome != verify::VerifyOutcome::Clean {
                 std::process::exit(outcome.exit_code());
             }
             Ok(())
         }
         Command::Export {
-            config,
+            config_args,
             format,
             tool,
             since,
@@ -260,45 +290,42 @@ async fn main() -> anyhow::Result<()> {
             anomalous,
             output,
         } => export::run(
-            &config, format, tool, since, status, server, anomalous, output,
+            &config_args.config,
+            format,
+            tool,
+            since,
+            status,
+            server,
+            anomalous,
+            output,
         ),
-        Command::Unmask { config, hash, note } => unmask::run(&config, &hash, &note),
+        Command::Unmask {
+            config_args,
+            hash,
+            note,
+        } => unmask::run(&config_args.config, &hash, &note),
         Command::Key { action } => match action {
-            KeyAction::Path { config } => {
-                let cfg = config::Config::load(&config)?;
+            KeyAction::Path { config_args } => {
+                let cfg = config::Config::load(&config_args.config)?;
                 println!("{}", cfg.chain.resolved_key_path()?.display());
                 Ok(())
             }
-            KeyAction::Fingerprint { config } => {
-                let cfg = config::Config::load(&config)?;
-                let key_path = cfg.chain.resolved_key_path()?;
-                let key = keys::KeyFile::load(&key_path)?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no key file at {} (has `auditmcp run` been used yet?)",
-                        key_path.display()
-                    )
-                })?;
+            KeyAction::Fingerprint { config_args } => {
+                let (_cfg, key) = load_existing_key(&config_args.config)?;
                 println!("{}", key.fingerprint()?);
                 Ok(())
             }
-            KeyAction::Backup { config, dest } => {
-                let cfg = config::Config::load(&config)?;
-                let key_path = cfg.chain.resolved_key_path()?;
-                let key = keys::KeyFile::load(&key_path)?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no key file at {} (has `auditmcp run` been used yet?)",
-                        key_path.display()
-                    )
-                })?;
+            KeyAction::Backup { config_args, dest } => {
+                let (_cfg, key) = load_existing_key(&config_args.config)?;
                 key.backup(&dest)?;
                 println!("Key backed up to {}", dest.display());
                 Ok(())
             }
         },
         Command::Reset {
-            config,
+            config_args,
             yes,
             keep_old,
-        } => reset::run(&config, yes, keep_old),
+        } => reset::run(&config_args.config, yes, keep_old),
     }
 }
