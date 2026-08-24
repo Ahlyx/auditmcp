@@ -36,6 +36,7 @@ pub fn run(
     };
 
     let since_cutoff = since.as_deref().map(parse_since).transpose()?;
+    let status = normalize_status_filter(status.as_deref())?;
     let filtered = filter_rows(
         rows,
         tool.as_deref(),
@@ -57,11 +58,16 @@ pub fn run(
     // its own line, which is unnoticeable for a handful of rows and
     // dominates everything else once the log is large: rendering 200k rows
     // took 83s that way against 8s through a BufWriter, while reading those
-    // same rows took under a second. Errors are ignored for the same reason
-    // `println!` ignores them -- a closed pipe (`| head`) is a normal way to
-    // stop reading, not a failure of the query.
+    // same rows took under a second.
+    //
+    // Write errors stop the output silently and exit 0, deliberately: a
+    // closed pipe (`query | head`) is a normal way to stop reading, not a
+    // failure of the query. (`println!` would panic on that broken pipe;
+    // the explicitly ignored `Result`s here make the policy visible instead
+    // of incidental.)
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
+    let mut pipe_closed = false;
 
     // Header literals passed positionally (not inlined) to mirror the data
     // rows below and keep the column format string in one visible place.
@@ -72,6 +78,9 @@ pub fn run(
         "ID", "TIMESTAMP", "TOOL", "STATUS", "DUR(ms)", "PREVIEW"
     );
     for row in &filtered {
+        if pipe_closed {
+            break;
+        }
         let preview = row
             .entry
             .args_json
@@ -84,35 +93,70 @@ pub fn run(
             .map(|d| d.to_string())
             .unwrap_or_else(|| "-".to_string());
 
-        let _ = writeln!(
+        if writeln!(
             out,
             "{:<5} {:<30} {:<20} {:<8} {:>9}  {}",
             row.id, row.entry.timestamp, row.entry.tool_name, row.entry.status, duration, preview
-        );
+        )
+        .is_err()
+        {
+            pipe_closed = true;
+            continue;
+        }
 
         if anomalous {
             if let Some(summary) = anomaly_summary(
                 row.entry.anomaly_score,
                 row.entry.anomaly_reasons.as_deref(),
             ) {
-                let _ = writeln!(out, "      {summary}");
+                if writeln!(out, "      {summary}").is_err() {
+                    pipe_closed = true;
+                }
             }
         }
-        if verbose {
+        if verbose && !pipe_closed {
             if let Some(summary) =
                 redaction_summary(row.entry.redaction_flags.as_deref(), &allowlist)
             {
-                let _ = writeln!(out, "      {summary}");
+                if writeln!(out, "      {summary}").is_err() {
+                    pipe_closed = true;
+                }
             }
         }
     }
-    let _ = writeln!(out, "({} row(s))", filtered.len());
-    // Explicit, so a write failure surfaces here rather than being
-    // swallowed by BufWriter's drop.
-    out.flush()
-        .map_err(|e| anyhow::anyhow!("failed writing query output: {e}"))?;
+    if !pipe_closed {
+        let _ = writeln!(out, "({} row(s))", filtered.len());
+        // Explicit, so the happy path's flush failure is at least attempted
+        // before the handle drops; a broken pipe here stays non-fatal per
+        // the policy above.
+        let _ = out.flush();
+    }
 
     Ok(())
+}
+
+/// The status values `auditmcp` ever writes (see `audit::CallStatus`). A
+/// filter naming anything else is a typo that would otherwise silently
+/// match zero rows and present as "no matching tool calls."
+pub(crate) const KNOWN_STATUSES: [&str; 4] = ["success", "error", "timeout", "deferred"];
+
+/// Validates and normalizes a `--status` filter value. Returns the trimmed,
+/// lowercased value ready for exact comparison against stored statuses
+/// (which are always lowercase), or an error listing what is valid.
+pub(crate) fn normalize_status_filter(status: Option<&str>) -> anyhow::Result<Option<String>> {
+    match status {
+        None => Ok(None),
+        Some(raw) => {
+            let s = raw.trim().to_lowercase();
+            if !KNOWN_STATUSES.contains(&s.as_str()) {
+                return Err(anyhow::anyhow!(
+                    "unknown --status '{raw}': expected one of {}",
+                    KNOWN_STATUSES.join(", ")
+                ));
+            }
+            Ok(Some(s))
+        }
+    }
 }
 
 /// Filters rows by the criteria `query` and `export` both expose. Shared
@@ -208,14 +252,15 @@ fn redaction_summary(redaction_flags: Option<&str>, allowlist: &HashSet<String>)
 }
 
 /// Row shape stored in `anomaly_reasons`, mirroring
-/// `anomaly::Reason`. Deserialized here rather than shared as a type
-/// because the anomaly module writes `&'static str` rule names, while
-/// the read side must own its strings.
-#[derive(serde::Deserialize)]
-struct StoredReason {
-    rule: String,
+/// `anomaly::Reason`. Shared with `export` (which re-serializes the parsed
+/// shape) rather than duplicated there; deserialized here rather than
+/// shared as one type with the anomaly module because the anomaly module
+/// writes `&'static str` rule names, while the read side owns its strings.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub(crate) struct StoredReason {
+    pub(crate) rule: String,
     #[allow(dead_code)]
-    detail: String,
+    pub(crate) detail: String,
 }
 
 /// Renders `--anomalous`'s per-row summary, e.g.
@@ -255,25 +300,37 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
 /// omitted, and guessing wrong would silently query the wrong window.
 pub(crate) fn parse_since(input: &str) -> anyhow::Result<DateTime<Utc>> {
     let input = input.trim();
-    let (number_part, unit) = input.split_at(input.len().saturating_sub(1));
+    // Peel the unit off by char, not by byte: `split_at(len - 1)` panics
+    // when the last character is multi-byte (`--since 30分` would abort the
+    // process instead of producing a validation error).
+    let (unit_char_idx, unit_char) = input.char_indices().next_back().ok_or_else(|| {
+        anyhow::anyhow!("invalid --since value '{input}': expected e.g. 30m, 2h, 1d, 45s")
+    })?;
+    let number_part = &input[..unit_char_idx];
 
     let amount: i64 = number_part.parse().map_err(|_| {
         anyhow::anyhow!("invalid --since value '{input}': expected e.g. 30m, 2h, 1d, 45s")
     })?;
 
-    let duration = match unit {
-        "s" => chrono::Duration::seconds(amount),
-        "m" => chrono::Duration::minutes(amount),
-        "h" => chrono::Duration::hours(amount),
-        "d" => chrono::Duration::days(amount),
+    // Checked constructors throughout: a huge-but-parseable magnitude must
+    // come back as an error message, not as a panic from chrono's
+    // out-of-bounds arithmetic (a CLI flag is user input, not trusted math).
+    let duration = match unit_char {
+        's' => chrono::Duration::try_seconds(amount),
+        'm' => chrono::Duration::try_minutes(amount),
+        'h' => chrono::Duration::try_hours(amount),
+        'd' => chrono::Duration::try_days(amount),
         other => {
             return Err(anyhow::anyhow!(
                 "invalid --since unit '{other}': expected one of s, m, h, d (e.g. 30m, 2h, 1d)"
             ))
         }
-    };
+    }
+    .ok_or_else(|| anyhow::anyhow!("--since value '{input}' is out of range"))?;
 
-    Ok(Utc::now() - duration)
+    Utc::now()
+        .checked_sub_signed(duration)
+        .ok_or_else(|| anyhow::anyhow!("--since value '{input}' is out of range"))
 }
 
 #[cfg(test)]
@@ -308,6 +365,45 @@ mod tests {
     #[test]
     fn parse_since_rejects_unknown_unit() {
         assert!(parse_since("30x").is_err());
+    }
+
+    /// The unit is peeled off by character, not by byte: a trailing
+    /// multi-byte character must produce a validation error, never the
+    /// panic that byte-index slicing produced.
+    #[test]
+    fn parse_since_rejects_multibyte_unit_without_panicking() {
+        assert!(parse_since("30分").is_err());
+        assert!(parse_since("2hé").is_err());
+        assert!(parse_since("⏱").is_err());
+    }
+
+    /// Huge magnitudes must error, not panic inside chrono's duration or
+    /// date arithmetic.
+    #[test]
+    fn parse_since_rejects_out_of_range_magnitudes_without_panicking() {
+        for input in ["99999999999999999d", "99999999999999999s", "100000000000h"] {
+            assert!(parse_since(input).is_err(), "{input} should be rejected");
+        }
+    }
+
+    /// A filter naming a status auditmcp never writes is a typo; it must be
+    /// rejected rather than silently matching zero rows.
+    #[test]
+    fn status_filter_is_validated_and_normalized() {
+        assert_eq!(normalize_status_filter(None).unwrap(), None);
+        assert_eq!(
+            normalize_status_filter(Some("Error")).unwrap().as_deref(),
+            Some("error")
+        );
+        assert_eq!(
+            normalize_status_filter(Some("  deferred "))
+                .unwrap()
+                .as_deref(),
+            Some("deferred")
+        );
+        for bad in ["Errorr", "", "ok"] {
+            assert!(normalize_status_filter(Some(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]
