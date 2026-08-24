@@ -21,6 +21,33 @@ pub struct RpcMessage {
 }
 
 impl RpcMessage {
+    /// Parses one wire payload, which may be a single JSON-RPC object or a
+    /// top-level **batch** of them -- a plain JSON array, permitted by
+    /// protocol revisions 2025-03-26 onward. Before this existed, a batched
+    /// `tools/call` failed to parse as a single object, so it was forwarded
+    /// with no registration, no row, and no warning: tool calls happened
+    /// and left no trace, which for a fail-closed-at-the-audit tool is the
+    /// worst failure shape there is.
+    ///
+    /// Each element is parsed independently; malformed elements are skipped
+    /// rather than failing their well-formed siblings. An empty result
+    /// means "nothing here we can audit" -- it is never a forwarding
+    /// decision, since forwarding is unconditional regardless of parsing.
+    pub fn parse_batch(raw: &[u8]) -> Vec<RpcMessage> {
+        // Fast path: the overwhelmingly common single-object case parses
+        // directly, without materializing a Value tree for the whole body.
+        if let Ok(msg) = serde_json::from_slice::<RpcMessage>(raw) {
+            return vec![msg];
+        }
+        match serde_json::from_slice::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Array(items)) => items
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// A `tools/call` request has both a `method` and an `id` (a
     /// notification, which expects no response, has no `id`).
     pub fn is_tool_call_request(&self) -> bool {
@@ -284,5 +311,40 @@ mod tests {
         );
         assert!(!resp.is_error_response());
         assert!(!resp.is_mcp_tool_error());
+    }
+
+    /// A top-level array is a batch: each element parses independently, so
+    /// a batched tools/call is auditable and a malformed sibling does not
+    /// take its well-formed neighbor down with it.
+    #[test]
+    fn parse_batch_handles_top_level_arrays() {
+        let raw = br#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"a"}},
+                      {"jsonrpc":"2.0","id":2,"result":{}},
+                      42]"#;
+        let msgs = RpcMessage::parse_batch(raw);
+        assert_eq!(msgs.len(), 2, "the malformed element is skipped");
+        assert!(msgs[0].is_tool_call_request());
+        assert_eq!(msgs[0].id_key().as_deref(), Some("1"));
+        assert!(!msgs[1].is_tool_call_request());
+    }
+
+    #[test]
+    fn parse_batch_single_object_matches_direct_parse() {
+        let raw = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"x"}}"#;
+        let via_batch = RpcMessage::parse_batch(raw);
+        assert_eq!(via_batch.len(), 1);
+        assert_eq!(
+            via_batch[0].tool_name().as_deref(),
+            parse(std::str::from_utf8(raw).unwrap())
+                .tool_name()
+                .as_deref()
+        );
+    }
+
+    #[test]
+    fn parse_batch_of_garbage_is_empty_not_fatal() {
+        assert!(RpcMessage::parse_batch(b"not json").is_empty());
+        assert!(RpcMessage::parse_batch(b"[]").is_empty());
+        assert!(RpcMessage::parse_batch(br#"[1,2,3]"#).is_empty());
     }
 }

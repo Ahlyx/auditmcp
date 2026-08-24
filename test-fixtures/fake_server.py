@@ -112,6 +112,44 @@ def send(msg):
     sys.stdout.flush()
 
 
+def handle_one(msg):
+    """Handle a single JSON-RPC message object, returning a response or None."""
+    method = msg.get("method")
+    msg_id = msg.get("id")
+
+    # Notifications (no id) get no response.
+    if msg_id is None:
+        return None
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "auditmcp-fake-server", "version": "0.1.0"},
+            },
+        }
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
+    if method == "tools/call":
+        try:
+            result = handle_tool_call(msg.get("params") or {})
+            return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32000, "message": str(e)},
+            }
+    return {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "error": {"code": -32601, "message": f"method not found: {method}"},
+    }
+
+
 def main():
     for raw_line in sys.stdin:
         line = raw_line.strip()
@@ -122,41 +160,18 @@ def main():
         except json.JSONDecodeError:
             continue
 
-        method = msg.get("method")
-        msg_id = msg.get("id")
-
-        # Notifications (no id) get no response.
-        if msg_id is None:
+        # A top-level array is a JSON-RPC batch: each element is handled
+        # independently and every produced response goes back as one batch,
+        # per the 2025-03-26+ revisions auditmcp audits per element too.
+        if isinstance(msg, list):
+            responses = [r for m in msg if (r := handle_one(m)) is not None]
+            if responses:
+                send(responses)
             continue
 
-        if method == "initialize":
-            send({
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "auditmcp-fake-server", "version": "0.1.0"},
-                },
-            })
-        elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
-        elif method == "tools/call":
-            try:
-                result = handle_tool_call(msg.get("params") or {})
-                send({"jsonrpc": "2.0", "id": msg_id, "result": result})
-            except Exception as e:
-                send({
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "error": {"code": -32000, "message": str(e)},
-                })
-        else:
-            send({
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {"code": -32601, "message": f"method not found: {method}"},
-            })
+        response = handle_one(msg)
+        if response is not None:
+            send(response)
 
 
 if __name__ == "__main__":
