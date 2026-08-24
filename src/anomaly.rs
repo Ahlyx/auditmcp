@@ -5,8 +5,9 @@
 //!
 //! 1. **Size spike** — `bytes_out` for a tool exceeds
 //!    `SIZE_SPIKE_MULTIPLIER × running_mean` for the same tool in the same
-//!    session. Immune to the first `MIN_SAMPLES_FOR_SIZE_RULE - 1` calls
-//!    per tool, so a session's opening samples don't flag each other.
+//!    session. Immune to a tool's first `MIN_SAMPLES_FOR_SIZE_RULE` calls
+//!    (the rule arms once that many prior samples exist), so a session's
+//!    opening samples don't flag each other.
 //! 2. **Novel destination** — a **network-shaped** destination
 //!    (`url`, `host`, `uri`, `target`) was never seen in this session
 //!    before. Filesystem destinations are deliberately excluded: writing
@@ -87,14 +88,13 @@ pub struct AnomalyReport {
     pub reasons: Vec<Reason>,
 }
 
-/// Welford's running mean + `M2` (sum of squared deviations from the
-/// running mean). `M2` isn't read by rule 1 today, but keeping it makes a
-/// future stddev-based refinement free and costs one f64 per tool.
+/// Welford's running mean. Only `count` and `mean` are read today (rule 1
+/// compares against the mean); the M2 sum-of-squares that full Welford
+/// tracks was removed until a rule actually consumes it.
 #[derive(Default)]
 struct ToolStats {
     count: u64,
     mean: f64,
-    m2: f64,
 }
 
 impl ToolStats {
@@ -102,8 +102,6 @@ impl ToolStats {
         self.count += 1;
         let delta = x - self.mean;
         self.mean += delta / self.count as f64;
-        let delta2 = x - self.mean;
-        self.m2 += delta * delta2;
     }
 }
 
@@ -111,8 +109,7 @@ impl ToolStats {
 /// `session_id` for the lifetime of the session.
 #[derive(Default)]
 pub struct SessionStats {
-    /// Running (count, mean, M2) per tool. Rule 1 reads `count` and
-    /// `mean`.
+    /// Running (count, mean) per tool. Rule 1 reads both.
     tool_stats: HashMap<String, ToolStats>,
     /// The last few call timestamps per tool. Rule 3 checks whether the
     /// oldest of the last `RAPID_REPEAT_COUNT` sits inside
