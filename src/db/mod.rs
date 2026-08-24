@@ -194,6 +194,13 @@ fn open_db(path: &Path) -> anyhow::Result<Connection> {
     }
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| anyhow::anyhow!("failed to set synchronous pragma: {e}"))?;
+    // Enforce the schema's `REFERENCES tool_calls(id)` rather than leaving
+    // it decorative: SQLite ignores foreign keys unless this is set per
+    // connection. Nothing in this codebase deletes tool_calls rows (reset
+    // removes the whole file), so this only turns a hypothetical orphaning
+    // write into a loud failure instead of silent index drift.
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| anyhow::anyhow!("failed to enable foreign keys: {e}"))?;
     conn.execute_batch(SCHEMA)
         .map_err(|e| anyhow::anyhow!("failed to apply schema: {e}"))?;
 
@@ -214,13 +221,22 @@ fn is_busy(e: &rusqlite::Error) -> bool {
 /// Opens the audit DB read-only, for `query`/`verify`. Uses SQLite's actual
 /// read-only open flag rather than `Connection::open`, so a missing DB file
 /// fails with a clear error instead of silently creating an empty one.
+/// Carries the same busy timeout as a writer connection: WAL readers rarely
+/// contend, but a reader landing on the window around another process's
+/// commit/checkpoint would otherwise get an instant `SQLITE_BUSY` instead
+/// of briefly waiting -- the same "silently dropped work" shape the writer
+/// side guards against.
 pub fn open_readonly(path: &Path) -> anyhow::Result<Connection> {
-    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to open db {} read-only: {e} (has `auditmcp run` been used yet?)",
-            path.display()
-        )
-    })
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open db {} read-only: {e} (has `auditmcp run` been used yet?)",
+                path.display()
+            )
+        })?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| anyhow::anyhow!("failed to set busy timeout: {e}"))?;
+    Ok(conn)
 }
 
 /// Opens the audit DB for a one-off write from a CLI command (currently

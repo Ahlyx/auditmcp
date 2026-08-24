@@ -137,15 +137,25 @@ pub(crate) fn insert_row_with_key(
     )
     .map_err(|e| anyhow::anyhow!("failed to insert row: {e}"))?;
 
-    if let Some(flags_json) = &entry.redaction_flags {
+    // The projection's drift warnings are COLLECTED here but only logged
+    // after COMMIT succeeds: inside the transaction "the audit row is
+    // committed" would not yet be true, and a failed commit rolls the
+    // projection back with it.
+    let redaction_warnings = if let Some(flags_json) = &entry.redaction_flags {
         // `Transaction` derefs to `Connection`, so these inserts join the
         // same transaction as the row above. Fail-open by design — see the
         // comment on the transaction and on `insert_redaction_rows` itself.
-        insert_redaction_rows(&tx, flags_json);
-    }
+        insert_redaction_rows(&tx, flags_json)
+    } else {
+        Vec::new()
+    };
 
     tx.commit()
         .map_err(|e| anyhow::anyhow!("failed to commit insert transaction: {e}"))?;
+
+    for warning in redaction_warnings {
+        tracing::warn!("{warning}");
+    }
 
     Ok(hash)
 }
@@ -185,8 +195,15 @@ impl DbHandle {
                 }
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.dropped.record();
-                tracing::warn!("audit log entry dropped, writer unavailable");
+                // Same throttle as the queue-full branch: if handles outlive
+                // a dead writer, every remaining tool call would otherwise
+                // turn into its own warning.
+                let prev = self.dropped.record();
+                if prev == 0 {
+                    tracing::warn!("audit log entry dropped, writer unavailable");
+                } else if (prev + 1).is_multiple_of(1000) {
+                    tracing::warn!("writer unavailable; {} entries dropped so far", prev + 1);
+                }
             }
         }
     }

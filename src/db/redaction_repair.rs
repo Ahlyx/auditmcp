@@ -23,21 +23,26 @@ INSERT INTO redactions (tool_call_id, pattern, severity, secret_sha256) VALUES (
 "#;
 
 /// Fail-open projection into the `redactions` index: any failure here is
-/// warned about loudly (stderr, like every other fail-open path) but never
-/// propagated, so the primary `tool_calls` row still commits. The warning
-/// names the consequence explicitly — index drift, i.e. `unmask` may not
-/// resolve this row's hashes — and points at `verify`, which detects drift
-/// after the fact (see `check_redaction_consistency`).
-pub(crate) fn insert_redaction_rows(conn: &Connection, flags_json: &str) {
+/// collected and returned rather than propagated, so the primary
+/// `tool_calls` row can still commit. The caller logs the returned warnings
+/// ONLY after its transaction commits -- inside the transaction the row is
+/// not yet durable, and a warning claiming "the audit row itself is
+/// committed and intact" would be false if the COMMIT then failed and
+/// rolled everything back. The warnings name the consequence explicitly --
+/// index drift, i.e. `unmask` may not resolve this row's hashes -- and
+/// point at `verify`, which detects drift after the fact (see
+/// `check_redaction_consistency`).
+pub(crate) fn insert_redaction_rows(conn: &Connection, flags_json: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
     let records: Vec<RedactionEntry> = match serde_json::from_str(flags_json) {
         Ok(records) => records,
         Err(e) => {
-            tracing::warn!(
+            warnings.push(format!(
                 "redactions index drift: failed to parse redaction_flags for the indexed projection \
                  (the audit row itself is committed and intact, but `unmask` will not resolve this row's \
                  secret hashes; run `auditmcp verify` to see all drifted rows): {e}"
-            );
-            return;
+            ));
+            return warnings;
         }
     };
 
@@ -47,13 +52,14 @@ pub(crate) fn insert_redaction_rows(conn: &Connection, flags_json: &str) {
             INSERT_REDACTION_SQL,
             params![tool_call_id, r.pattern, r.severity, r.sha256],
         ) {
-            tracing::warn!(
+            warnings.push(format!(
                 "redactions index drift: failed to insert index row for tool_call {tool_call_id} \
                  (the audit row itself is committed and intact, but `unmask` will not resolve this hash; \
                  run `auditmcp verify` to see all drifted rows): {e}"
-            );
+            ));
         }
     }
+    warnings
 }
 
 /// One detected mismatch between `tool_calls.redaction_flags` (the source
@@ -244,8 +250,13 @@ fn diff_triples(
     (missing, remaining)
 }
 
+/// Boundary-safe on purpose: `secret_sha256` is read straight out of the
+/// database, and this project's threat model explicitly assumes an
+/// adversary with DB write access. A tampered multi-byte value must not
+/// crash the very tool that detects the tampering.
 fn short_triple(t: &RedactionTriple) -> String {
-    format!("{}({}…)", t.0, &t.2[..t.2.len().min(12)])
+    let end = crate::truncate::snap_boundary(&t.2, 12);
+    format!("{}({}…)", t.0, &t.2[..end])
 }
 
 /// What `verify --repair-index` would do (dry run) or did (apply) for one
