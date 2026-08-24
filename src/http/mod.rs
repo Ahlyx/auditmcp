@@ -116,6 +116,9 @@ pub(crate) struct Listener {
     /// `endpoint` event back at ourselves.
     local_addr: std::net::SocketAddr,
     allowed_origins: Vec<String>,
+    /// Bound on time-to-response-head for upstream requests; body
+    /// streaming is never subject to it. See `proxy_once`.
+    request_timeout: std::time::Duration,
     config: Arc<Config>,
     db: DbHandle,
     patterns: Arc<PatternSet>,
@@ -151,7 +154,7 @@ mod tests {
     /// recorded here or not at all.
     async fn drain_sessions(listeners: &[Arc<Listener>]) {
         for listener in listeners {
-            for session in listener.sessions.take_all().await {
+            for session in listener.sessions.take_all() {
                 for call in session.drain_abandoned() {
                     log_timeout(listener, &session, call);
                 }
@@ -549,7 +552,7 @@ mod tests {
     }
 
     /// The rewrite replaces the payload and nothing else: other fields,
-    /// ordering and the line-ending style all survive.
+    /// ordering, and each line's own line-ending style all survive.
     #[test]
     fn replacing_event_data_preserves_the_rest_of_the_frame() {
         assert_eq!(
@@ -564,6 +567,42 @@ mod tests {
             replace_event_data(b"id: 9\nevent: endpoint\ndata: OLD\nretry: 50\n\n", "NEW"),
             b"id: 9\nevent: endpoint\ndata: NEW\nretry: 50\n\n".to_vec()
         );
+    }
+
+    /// A mixed-style frame is spec-legal, and the rewrite must preserve
+    /// each line's own ending rather than normalize the frame to whichever
+    /// style it noticed first -- altering bytes outside the data payload
+    /// would break the forwarding guarantee.
+    #[test]
+    fn replacing_event_data_preserves_mixed_line_endings() {
+        assert_eq!(
+            replace_event_data(b"event: endpoint\ndata: OLD\r\n\r\n", "NEW"),
+            b"event: endpoint\ndata: NEW\r\n\r\n".to_vec()
+        );
+    }
+
+    /// The SSE spec's terminator grammar allows a LF line followed by a
+    /// CRLF blank line; that mixed form must end the event instead of
+    /// stalling the parser until it merges with the next event's bytes.
+    #[test]
+    fn sse_parser_handles_the_mixed_lf_crlf_terminator() {
+        let mut p = SseParser::default();
+        assert_eq!(
+            datas(p.feed(b"data: one\n\r\ndata: two\n\n")),
+            ["one", "two"]
+        );
+    }
+
+    /// Per spec, when a field repeats inside one event the LAST value wins.
+    /// Taking the first made an `event: message` + `event: endpoint` frame
+    /// forward unrewritten, letting legacy clients bypass the proxy.
+    #[test]
+    fn repeated_field_takes_the_last_value() {
+        let mut p = SseParser::default();
+        let events = p.feed(b"event: message\nevent: endpoint\ndata: /x?sid=1\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name.as_deref(), Some("endpoint"));
+        assert_eq!(events[0].data.as_deref(), Some("/x?sid=1"));
     }
 
     /// The inverse of the rewrite, at the unit level: an event that is not

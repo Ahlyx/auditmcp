@@ -150,9 +150,20 @@ pub struct ServerConfig {
     /// servers can never silently collide on one port. The documented
     /// convention is to start at 8787 and count upward.
     pub listen: String,
+    /// How long to wait for an upstream's response HEADERS before giving
+    /// up on that request (the registered call is then recorded as a
+    /// timeout when its connection closes). Body streaming is never
+    /// subject to this: a long-lived SSE stream is normal traffic, not a
+    /// stall. Defaults to 60s; hyper's client itself configures none.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
     /// Origins accepted on inbound requests. Defaults to loopback only.
     #[serde(default)]
     pub allowed_origins: Option<Vec<String>>,
+}
+
+fn default_request_timeout_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize)]

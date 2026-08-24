@@ -54,9 +54,11 @@ pub(crate) struct Tee {
     /// Set once a legacy `endpoint` event has been seen, so the binding
     /// is released when the stream ends.
     endpoint_key: Option<String>,
-    /// Correlation key from the request, used when the response body is
-    /// not parseable JSON-RPC and therefore carries no id of its own.
-    pending_key: Option<String>,
+    /// Correlation keys from the request side, used when the response body
+    /// carries no resolvable id of its own (a batch whose responses went
+    /// elsewhere, a body that isn't JSON-RPC at all). One per tool call in
+    /// the request, so a batched POST falls back coherently.
+    pending_keys: Vec<String>,
     succeeded: bool,
     bytes_out: i64,
     mode: TeeMode,
@@ -86,7 +88,7 @@ impl TeeBody {
         inner: Incoming,
         listener: Arc<Listener>,
         session: Arc<Session>,
-        pending_key: Option<String>,
+        pending_keys: Vec<String>,
         succeeded: bool,
         is_event_stream: bool,
     ) -> Self {
@@ -97,7 +99,7 @@ impl TeeBody {
                 listener,
                 session,
                 endpoint_key: None,
-                pending_key,
+                pending_keys,
                 succeeded,
                 bytes_out: 0,
                 mode: if is_event_stream {
@@ -187,6 +189,18 @@ impl Drop for TeeBody {
     }
 }
 
+/// Classifies an over-cap captured copy. HTTP status alone decides the
+/// recorded status EXCEPT where the copy itself carries contrary evidence:
+/// MCP reports a tool's own failure as `isError: true` inside a
+/// success-shaped result, and when that marker is visible in the part we
+/// did capture, recording `Success` would log a failed destructive call as
+/// clean -- strictly worse than admitting our copy is incomplete.
+fn capture_truncated_outcome(http_succeeded: bool, captured: &[u8], bytes_out: i64) -> CallOutcome {
+    let text = String::from_utf8_lossy(captured);
+    let saw_tool_error = text.contains("\"isError\":true") || text.contains("\"isError\": true");
+    CallOutcome::capture_truncated(http_succeeded && !saw_tool_error, bytes_out)
+}
+
 impl Tee {
     /// Called with each frame *after* it has been handed onward. Bounded
     /// work only: a copy for the whole-body case, an incremental parse for
@@ -234,11 +248,11 @@ impl Tee {
         }
 
         if let Some(payload) = event.data.as_deref() {
-            // Each event carries its own JSON-RPC message, so correlation
-            // is per message rather than per stream -- which is what lets
-            // one response close one call while notifications flow past
-            // unlogged.
-            if let Ok(msg) = serde_json::from_str::<RpcMessage>(payload) {
+            // Each event carries its own JSON-RPC message -- or a batch of
+            // them -- so correlation is per message rather than per stream,
+            // which is what lets one response close one call while
+            // notifications flow past unlogged.
+            for msg in RpcMessage::parse_batch(payload.as_bytes()) {
                 if let Some(call) = msg.id_key().and_then(|k| self.session.resolve(&k)) {
                     let outcome = CallOutcome::from_rpc(&msg, payload.len() as i64);
                     log_entry(&self.listener, &self.session, call, outcome);
@@ -268,11 +282,17 @@ impl Tee {
         // all that survives its own resolution of a relative URI.
         match endpoint_key(effective) {
             Some(key) => {
-                let listener = Arc::clone(&self.listener);
                 self.endpoint_key = Some(key.clone());
-                tokio::spawn(async move {
-                    listener.sessions.bind_endpoint(key, session).await;
-                });
+                // Bound synchronously (the registry is std-Mutex): binding
+                // from a spawned task raced a fast client's first POST,
+                // which could arrive before the spawn ran and fall back to
+                // the connection session -- an answered call logged as a
+                // timeout. `poll_frame` cannot await; the registry's
+                // critical sections are single statements, so this blocks
+                // for nanoseconds, not across I/O.
+                self.listener
+                    .sessions
+                    .bind_endpoint(key, Arc::clone(&session));
             }
             None => tracing::warn!(
                 "server {}: could not derive an endpoint key from {advertised}; \
@@ -295,20 +315,22 @@ impl Tee {
         }
     }
 
-    fn finish(self) {
+    fn finish(mut self) {
         // A legacy stream ending takes its endpoint with it: the client
         // must reconnect to get a new one, and leaving the binding would
-        // let a later POST resolve against a dead session.
+        // let a later POST resolve against a dead session. Identity-checked:
+        // if the server re-advertised this endpoint key to a newer stream,
+        // that newer binding stays.
         if let Some(key) = self.endpoint_key.clone() {
-            let listener = Arc::clone(&self.listener);
-            let session = Arc::clone(&self.session);
-            tokio::spawn(async move {
-                if listener.sessions.unbind_endpoint(&key).await.is_some() {
-                    for call in session.drain_abandoned() {
-                        log_timeout(&listener, &session, call);
-                    }
+            if self
+                .listener
+                .sessions
+                .unbind_endpoint_if(&key, &self.session)
+            {
+                for call in self.session.drain_abandoned() {
+                    log_timeout(&self.listener, &self.session, call);
                 }
-            });
+            }
         }
 
         let TeeMode::Whole {
@@ -321,26 +343,52 @@ impl Tee {
             return;
         };
 
-        let parsed = serde_json::from_slice::<RpcMessage>(&captured).ok();
-        let id_key = parsed
-            .as_ref()
-            .and_then(|m| m.id_key())
-            .or(self.pending_key);
-        let Some(call) = id_key.and_then(|k| self.session.resolve(&k)) else {
+        // Resolve every response the captured copy carries -- one body may
+        // be a batch closing several calls at once.
+        let messages = RpcMessage::parse_batch(&captured);
+        let mut any_resolved = false;
+        for msg in &messages {
+            let Some(call) = msg.id_key().and_then(|k| self.session.resolve(&k)) else {
+                continue;
+            };
+            // A parsed message is authoritative regardless of `truncated`:
+            // JSON validity implies the whole envelope made it into the
+            // copy, so the recorded status reflects the call rather than
+            // being flattened into "success/error by HTTP class". Before
+            // this existed, any over-cap response was logged purely by HTTP
+            // status -- recording a failed call as Success whenever its
+            // error rode in an over-cap 200.
+            log_entry(
+                &self.listener,
+                &self.session,
+                call,
+                CallOutcome::from_rpc(msg, self.bytes_out),
+            );
+            any_resolved = true;
+        }
+        if any_resolved {
+            return;
+        }
+
+        // Nothing resolved by id. Fall back to the request-side keys --
+        // the shape legacy transport answers rely on when the id isn't
+        // visible here -- and classify the body once.
+        let Some(id_key) = self.pending_keys.pop() else {
+            return;
+        };
+        let Some(call) = self.session.resolve(&id_key) else {
             return;
         };
 
-        let outcome = match (parsed, truncated) {
-            (Some(msg), false) => CallOutcome::from_rpc(&msg, self.bytes_out),
-            // Over the cap: the client got everything, our copy did not.
-            (_, true) => CallOutcome::capture_truncated(self.succeeded, self.bytes_out),
-            // Complete, and not JSON-RPC at all: a gateway error page or a
-            // wrong Content-Type. Kept as evidence and scanned like any
-            // other payload, because such pages echo request headers.
-            (None, false) => CallOutcome::non_json(
-                String::from_utf8_lossy(&captured).into_owned(),
-                self.bytes_out,
-            ),
+        let outcome = match truncated {
+            true => capture_truncated_outcome(self.succeeded, &captured, self.bytes_out),
+            false => match messages.first() {
+                Some(msg) => CallOutcome::from_rpc(msg, self.bytes_out),
+                None => CallOutcome::non_json(
+                    String::from_utf8_lossy(&captured).into_owned(),
+                    self.bytes_out,
+                ),
+            },
         };
         log_entry(&self.listener, &self.session, call, outcome);
     }

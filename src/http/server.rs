@@ -40,6 +40,10 @@ use super::ProxyBody;
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
+    // Windows: holds the console-close/shutdown teardown grace open while
+    // the drain below runs, instead of racing a forced kill. No-op on Unix.
+    crate::shutdown::install_blocking_close_handler();
+
     let config = Arc::new(Config::load(config_path)?);
     let servers = config.http_servers()?;
 
@@ -179,7 +183,7 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     // still be resolving. Calls left open on connections that were cut off
     // are recorded here rather than vanishing.
     for listener in &listeners {
-        for session in listener.sessions.take_all().await {
+        for session in listener.sessions.take_all() {
             for call in session.drain_abandoned() {
                 log_timeout(listener, &session, call);
             }
@@ -206,7 +210,11 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     // the writer's channel can close.
     drop(listeners);
     drop(db);
-    match writer.wait_for_drain(DRAIN_TIMEOUT) {
+    let drain = writer.wait_for_drain(DRAIN_TIMEOUT);
+    // Either way the queue has been written or given up on; the blocking
+    // close/shutdown handler must stop holding the OS grace open.
+    crate::shutdown::note_drain_complete();
+    match drain {
         db::DrainOutcome::Drained { dropped: 0 } => Ok(()),
         db::DrainOutcome::Drained { dropped } => Err(anyhow::anyhow!(
             "audit log incomplete: {dropped} tool call(s) were not recorded this \
@@ -252,6 +260,7 @@ pub(crate) fn build_listener(
             .allowed_origins
             .clone()
             .unwrap_or_else(default_allowed_origins),
+        request_timeout: std::time::Duration::from_secs(s.request_timeout_secs),
         config: Arc::clone(config),
         db: db.clone(),
         patterns: Arc::clone(patterns),
@@ -307,7 +316,7 @@ pub(crate) async fn accept_loop(
 
         let listener = Arc::clone(&listener);
         connections.spawn(async move {
-            let (key, session) = listener.sessions.open().await;
+            let (key, session) = listener.sessions.open();
             let io = TokioIo::new(stream);
 
             let svc = {
@@ -326,10 +335,16 @@ pub(crate) async fn accept_loop(
             // A connection that ends with calls still open means the client
             // went away mid-request. Those calls happened and were never
             // answered, which is exactly what `timeout` records.
-            for call in listener.sessions.close(key).await {
+            for call in listener.sessions.close(key) {
                 log_timeout(&listener, &session, call);
             }
         });
+
+        // Reap finished connection tasks as we go. Each task self-cleans
+        // (closes its session, logs its timeouts), but its finished entry
+        // stayed in the JoinSet until shutdown -- a small unbounded leak
+        // for a daemon measured in weeks, one entry per connection.
+        while connections.try_join_next().is_some() {}
     }
 
     // Aborts every in-flight connection and waits for them to unwind, so no
@@ -382,14 +397,42 @@ async fn proxy_once(
     }
 
     let (parts, body) = req.into_parts();
-    let body = match Limited::new(body, MAX_REQUEST_BYTES).collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => {
-            return Ok(error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "auditmcp: request body exceeds the proxy's size limit",
-            ))
+    // Collected frame by frame rather than through `Limited::collect`, so
+    // an over-cap body (the client's fault) is distinguishable from a
+    // transport error mid-body (nobody's fault): the first is refused with
+    // 413, the second reported as a bad gateway. Collapsing both into 413,
+    // as before, mislabeled every client abort as "request too large."
+    let mut collected: Vec<u8> = Vec::new();
+    let body = {
+        use http_body_util::BodyExt as _;
+        let mut stream = Limited::new(body, MAX_REQUEST_BYTES);
+        while let Some(frame) = stream.frame().await {
+            match frame {
+                Ok(frame) => {
+                    let Some(data) = frame.data_ref() else {
+                        continue;
+                    };
+                    if collected.len() + data.len() > MAX_REQUEST_BYTES {
+                        return Ok(error_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "auditmcp: request body exceeds the proxy's size limit",
+                        ));
+                    }
+                    collected.extend_from_slice(data);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "server '{}': request body read failed: {e}",
+                        listener.server_name
+                    );
+                    return Ok(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "auditmcp: request body could not be read",
+                    ));
+                }
+            }
         }
+        Bytes::from(collected)
     };
 
     // Legacy HTTP+SSE posts to an endpoint the server advertised on a
@@ -399,7 +442,7 @@ async fn proxy_once(
     // where request and response share a connection anyway.
     let mut via_legacy_endpoint = false;
     let session_arc: Arc<Session> = match parts.uri.path_and_query().map(|pq| pq.to_string()) {
-        Some(key) => match listener.sessions.session_for_endpoint(&key).await {
+        Some(key) => match listener.sessions.session_for_endpoint(&key) {
             Some(bound) => {
                 via_legacy_endpoint = true;
                 bound
@@ -412,13 +455,22 @@ async fn proxy_once(
 
     // Register before forwarding, so a call is tracked even if the upstream
     // never answers.
-    let pending_key = register_if_tool_call(listener, session, &parts, &body);
+    let pending_keys = register_if_tool_call(listener, session, &parts, &body);
 
     // Origin-level mirror: only scheme and authority change. Headers pass
     // through untouched -- Authorization, MCP-Protocol-Version, Mcp-Method,
     // Mcp-Name and any Mcp-Param-* included, the last of which MCP requires
     // intermediaries to forward and which servers reject requests over if
     // they disagree with the body.
+    //
+    // Deliberately including connection-class headers (`Connection`,
+    // `Keep-Alive`, `TE`, `Trailer`): hyper 1 strips framing-conflicting
+    // fields in both directions and re-derives all framing itself, so
+    // forwarding them verbatim is compliant in practice, and "headers pass
+    // through untouched" stays literally true -- the transparency invariant
+    // this proxy exists on. The one exception on the request side is Host
+    // below, and the one on the response side is the legacy endpoint
+    // rewrite documented in `sse.rs`.
     let mut upstream_req = Request::builder()
         .method(parts.method.clone())
         .uri(rewrite_uri(&listener.upstream, &parts.uri))
@@ -436,17 +488,35 @@ async fn proxy_once(
     // DNS rebinding expects to see.
     upstream_req.headers_mut().remove(hyper::header::HOST);
 
-    let upstream_resp = listener.client.request(upstream_req).await?;
+    // Bounded on purpose: hyper's legacy client configures no timeouts, so
+    // an upstream that accepts the connection and never answers would hang
+    // this request -- and its registered call -- forever. This bounds only
+    // time-to-response-HEAD; once headers arrive, the body streams without
+    // any such limit, because a long-lived event stream is normal traffic
+    // here, not a stall.
+    let upstream_resp = tokio::time::timeout(listener.request_timeout, async {
+        listener.client.request(upstream_req).await
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "upstream did not respond within {}s",
+            listener.request_timeout.as_secs()
+        )
+    })??;
     let (resp_parts, resp_body) = upstream_resp.into_parts();
 
-    // Headers are returned to the client now, before a single body byte has
-    // been read. An event stream's first event therefore reaches the client
-    // when the upstream emits it, not when the stream ends.
+    // Media types are case-insensitive per RFC 9110; matching only the
+    // exact lowercase spelling misrouted `Text/Event-Stream` responses to
+    // whole-body mode, where a multi-event stream fails to parse as one
+    // JSON-RPC message and a delivered call gets logged as a non_json
+    // error.
     let is_event_stream = resp_parts
         .headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim_start().starts_with("text/event-stream"))
+        .and_then(|v| v.split(';').next())
+        .map(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
         .unwrap_or(false);
 
     // Whether this response is where the call's answer is expected.
@@ -465,7 +535,15 @@ async fn proxy_once(
         resp_body,
         Arc::clone(listener_arc),
         session_arc,
-        pending_key.filter(|_| answer_expected_here),
+        // On a legacy acknowledgement (or any non-answer response), the
+        // registered keys stay on the session for the stream's event path;
+        // handing them to this body's fallback would mis-attribute the ack
+        // body as the call's outcome.
+        if answer_expected_here {
+            pending_keys
+        } else {
+            Vec::new()
+        },
         resp_parts.status.is_success(),
         is_event_stream,
     );
@@ -474,51 +552,70 @@ async fn proxy_once(
         .status(resp_parts.status)
         .body(BoxBody::new(tee))?;
     *out.headers_mut() = resp_parts.headers;
+    // Events mode may rewrite one event's payload (the legacy endpoint
+    // URI), changing the stream's total length. A copied `Content-Length`
+    // would then disagree with the body actually sent -- hyper trusts the
+    // header for a length-delimited body, so a longer stream aborts
+    // mid-body and a shorter one leaves the client waiting. Event streams
+    // are delimited by framing, not by length; dropping the header restores
+    // that. Whole mode forwards bytes unchanged and keeps it.
+    if is_event_stream {
+        out.headers_mut().remove(hyper::header::CONTENT_LENGTH);
+    }
     Ok(out)
 }
 
-/// Records a `tools/call` request so its response can be matched to it.
-/// Returns the correlation key, or `None` for anything that is not a tool
-/// call — those are forwarded and not logged, exactly as on stdio.
+/// Records every `tools/call` request in the body -- a single message or a
+/// top-level batch array (permitted by 2025-03-26) -- so responses can be
+/// matched to them. Returns one correlation key per registered call.
 ///
-/// If a call is already pending under this same id (the client reused a
-/// JSON-RPC id before the earlier call's response arrived), that earlier
+/// Before batch support existed, a top-level array failed to parse as a
+/// single object and was forwarded with no registration and no warning:
+/// tool calls happened and left no trace in an audit log whose whole job is
+/// showing they happened.
+///
+/// If a call is already pending under a reused id, that earlier
 /// `PendingCall` is displaced -- see `Session::register`. Rather than let
 /// its eventual response find nothing to resolve and vanish from the log,
-/// it is logged here as a timeout, same as any other call this proxy never
-/// saw an answer for.
+/// it is logged as a timeout, same as any other call this proxy never saw
+/// an answer for.
 fn register_if_tool_call(
     listener: &Listener,
     session: &Session,
     parts: &http::request::Parts,
     body: &Bytes,
-) -> Option<String> {
+) -> Vec<String> {
     if parts.method != hyper::Method::POST {
-        return None;
+        return Vec::new();
     }
-    let msg: RpcMessage = serde_json::from_slice(body).ok()?;
-    if !msg.is_tool_call_request() {
-        return None;
+    let mut keys = Vec::new();
+    for msg in RpcMessage::parse_batch(body) {
+        if !msg.is_tool_call_request() {
+            continue;
+        }
+        let (Some(id_key), Some(tool_name)) = (msg.id_key(), msg.tool_name()) else {
+            continue;
+        };
+        if let Some(stale) = session.register(
+            id_key.clone(),
+            PendingCall {
+                tool_name,
+                args: msg.arguments().cloned(),
+                bytes_in: body.len() as i64,
+                started: Instant::now(),
+            },
+        ) {
+            tracing::warn!(
+                "server '{}': JSON-RPC id reused for tool '{}' before its previous response \
+                 arrived; logging the earlier call as a timeout rather than dropping it",
+                listener.server_name,
+                stale.tool_name
+            );
+            log_timeout(listener, session, stale);
+        }
+        keys.push(id_key);
     }
-    let (id_key, tool_name) = (msg.id_key()?, msg.tool_name()?);
-    if let Some(stale) = session.register(
-        id_key.clone(),
-        PendingCall {
-            tool_name,
-            args: msg.arguments().cloned(),
-            bytes_in: body.len() as i64,
-            started: Instant::now(),
-        },
-    ) {
-        tracing::warn!(
-            "server '{}': JSON-RPC id reused for tool '{}' before its previous response \
-             arrived; logging the earlier call as a timeout rather than dropping it",
-            listener.server_name,
-            stale.tool_name
-        );
-        log_timeout(listener, session, stale);
-    }
-    Some(id_key)
+    keys
 }
 
 pub(crate) fn log_timeout(listener: &Listener, session: &Session, call: PendingCall) {
