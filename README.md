@@ -24,7 +24,7 @@ You need the [Rust toolchain](https://rustup.rs/) (stable) to build, and
 Python 3 only if you want to exercise the bundled fake MCP server.
 
 ```bash
-git clone <this repo>
+git clone https://github.com/Ahlyx/auditmcp
 cd auditmcp
 cargo build --release
 ```
