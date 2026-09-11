@@ -417,10 +417,11 @@ pub struct Hit {
     is_heuristic: bool,
 }
 
-/// Recursively walks a parsed JSON value, scanning every string leaf
-/// (with its parent object key as context, when available) and redacting
-/// matches in place — except allowlisted ones, which are left as-is.
-/// Returns every hit found, including allowlisted ones.
+/// Recursively walks a parsed JSON value, scanning every string leaf and
+/// every object key (with the parent object key as context, when
+/// available) and redacting matches in place — except allowlisted ones,
+/// which are left as-is. Returns every hit found, including allowlisted
+/// ones.
 pub fn scan_and_redact_json(
     value: &mut serde_json::Value,
     patterns: &PatternSet,
@@ -454,6 +455,43 @@ fn walk_json(
             }
         }
         serde_json::Value::Object(map) => {
+            // Keys are scanned too, not just values. A tool that returns
+            // `{"<token>": {"scope": "repo"}}` -- the normal shape for
+            // credential- and quota-listing endpoints -- would otherwise
+            // write the secret verbatim, and with no hit recorded nothing
+            // downstream (tier escalation, `redaction_flags`) would flag
+            // it either. The parent key is the context here, the same
+            // context this object's values get.
+            let mut renames: Vec<(String, String)> = Vec::new();
+            for k in map.keys() {
+                let found = patterns.scan_str(k, key_name, allowlist);
+                if found.is_empty() {
+                    continue;
+                }
+                let redacted = redact_ranges(k, &found);
+                hits.extend(found);
+                // Allowlisted-only hits redact to the original string;
+                // nothing to rewrite in that case.
+                if redacted != *k {
+                    renames.push((k.clone(), redacted));
+                }
+            }
+            for (old_key, new_key) in renames {
+                let Some(v) = map.remove(&old_key) else {
+                    continue;
+                };
+                // Two distinct secrets under the same pattern redact to
+                // the same marker. Suffixing keeps the second value from
+                // silently replacing the first; leaving the key unredacted
+                // to avoid the collision is not an option.
+                let mut candidate = new_key.clone();
+                let mut n = 2;
+                while map.contains_key(&candidate) {
+                    candidate = format!("{new_key} #{n}");
+                    n += 1;
+                }
+                map.insert(candidate, v);
+            }
             for (k, v) in map.iter_mut() {
                 walk_json(v, Some(k.as_str()), patterns, allowlist, hits);
             }
@@ -710,6 +748,58 @@ mod tests {
         assert!(redacted.contains("[REDACTED:aws_access_key_id]"));
         assert_eq!(value["auth"]["headers"][0], "x");
         assert_eq!(value["auth"]["headers"][2], "y");
+    }
+
+    #[test]
+    fn redacts_a_secret_used_as_an_object_key() {
+        let patterns = PatternSet::bundled().unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(r#"{"AKIAABCDEFGHIJKLMNOP":{"scope":"repo"}}"#).unwrap();
+
+        let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
+
+        assert_eq!(hits.len(), 1, "a key-position secret must be recorded");
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(
+            !serialized.contains("AKIAABCDEFGHIJKLMNOP"),
+            "secret survived in key position: {serialized}"
+        );
+        let (key, v) = value.as_object().unwrap().iter().next().unwrap();
+        assert!(key.contains("[REDACTED:aws_access_key_id]"));
+        assert_eq!(v["scope"], "repo", "the value must be carried over intact");
+    }
+
+    #[test]
+    fn two_secret_keys_redacting_to_the_same_marker_keep_both_values() {
+        let patterns = PatternSet::bundled().unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(
+            r#"{"AKIAABCDEFGHIJKLMNOP":{"n":1},"AKIAZZZZZZZZZZZZZZZZ":{"n":2}}"#,
+        )
+        .unwrap();
+
+        let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
+
+        assert_eq!(hits.len(), 2);
+        let map = value.as_object().unwrap();
+        assert_eq!(map.len(), 2, "neither value may be dropped on collision");
+        let ns: std::collections::HashSet<i64> =
+            map.values().map(|v| v["n"].as_i64().unwrap()).collect();
+        assert_eq!(ns, [1, 2].into_iter().collect());
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("AKIA"));
+    }
+
+    #[test]
+    fn ordinary_object_keys_are_left_alone() {
+        let patterns = PatternSet::bundled().unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(r#"{"user":"alice","nested":{"count":3}}"#).unwrap();
+
+        let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
+
+        assert!(hits.is_empty());
+        assert_eq!(value["user"], "alice");
+        assert_eq!(value["nested"]["count"], 3);
     }
 
     #[test]
