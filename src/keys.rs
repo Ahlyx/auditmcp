@@ -181,7 +181,20 @@ impl KeyFile {
     /// same pattern `export.rs` uses for its `--output` writes, so an
     /// interrupted backup never leaves a half-written file at `dest`.
     /// Permissions on the copy are set the same way `save` sets them.
-    pub fn backup(&self, dest: &Path) -> anyhow::Result<()> {
+    ///
+    /// Refuses to replace an existing file unless `force`. The rename
+    /// would otherwise silently destroy whatever was at `dest`, and since
+    /// no plaintext of a root key exists anywhere else, a `dest` typo'd
+    /// onto another database's key file (they are all `<16-hex>.key` in
+    /// one directory, so shell completion makes this easy) leaves that
+    /// chain permanently unverifiable.
+    pub fn backup(&self, dest: &Path, force: bool) -> anyhow::Result<()> {
+        if dest.exists() && !force {
+            return Err(anyhow::anyhow!(
+                "refusing to overwrite existing file {} -- pass --force to replace it.                  (If that is another database's key file, replacing it makes that                  chain permanently unverifiable.)",
+                dest.display()
+            ));
+        }
         let parent = dest.parent().ok_or_else(|| {
             anyhow::anyhow!(
                 "backup destination {} has no parent directory",
@@ -703,10 +716,42 @@ mod tests {
     }
 
     #[test]
+    fn backup_refuses_to_overwrite_without_force() {
+        let dest = temp_key_path("backup_no_clobber");
+        let existing = KeyFile::generate("db-victim");
+        assert!(existing.save_new(&dest).unwrap());
+
+        let err = KeyFile::generate("db-1").backup(&dest, false).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"));
+
+        let still_there = KeyFile::load(&dest).unwrap().unwrap();
+        assert_eq!(
+            still_there.root_key_hex, existing.root_key_hex,
+            "the file at dest must be untouched"
+        );
+
+        cleanup_key_path(&dest);
+    }
+
+    #[test]
+    fn backup_overwrites_when_forced() {
+        let dest = temp_key_path("backup_forced");
+        assert!(KeyFile::generate("db-victim").save_new(&dest).unwrap());
+
+        let replacement = KeyFile::generate("db-1");
+        replacement.backup(&dest, true).unwrap();
+
+        let loaded = KeyFile::load(&dest).unwrap().unwrap();
+        assert_eq!(loaded.root_key_hex, replacement.root_key_hex);
+
+        cleanup_key_path(&dest);
+    }
+
+    #[test]
     fn backup_writes_a_loadable_copy() {
         let dest = temp_key_path("backup");
         let key = KeyFile::generate("db-1");
-        key.backup(&dest).unwrap();
+        key.backup(&dest, false).unwrap();
 
         let loaded = KeyFile::load(&dest).unwrap().unwrap();
         assert_eq!(loaded.root_key_hex, key.root_key_hex);
@@ -717,7 +762,7 @@ mod tests {
     #[test]
     fn backup_never_leaves_a_temp_file_behind() {
         let dest = temp_key_path("backup_notemp");
-        KeyFile::generate("db-1").backup(&dest).unwrap();
+        KeyFile::generate("db-1").backup(&dest, false).unwrap();
 
         let parent = dest.parent().unwrap();
         let stray_temp = std::fs::read_dir(parent)

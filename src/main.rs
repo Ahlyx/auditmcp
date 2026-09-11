@@ -208,11 +208,17 @@ enum KeyAction {
         config_args: ConfigArg,
     },
     /// Atomically copy the key file to `dest`, with the same restrictive
-    /// permissions as the original.
+    /// permissions as the original. Refuses to overwrite an existing file
+    /// unless `--force`.
     Backup {
         #[command(flatten)]
         config_args: ConfigArg,
         dest: PathBuf,
+        /// Replace `dest` if it already exists. Destroys whatever is
+        /// there; if that is another database's key, its chain becomes
+        /// permanently unverifiable.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -323,9 +329,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", key.fingerprint()?);
                 Ok(())
             }
-            KeyAction::Backup { config_args, dest } => {
+            KeyAction::Backup {
+                config_args,
+                dest,
+                force,
+            } => {
                 let (_cfg, key) = load_existing_key(config_args.path())?;
-                key.backup(&dest)?;
+                key.backup(&dest, force)?;
                 println!("Key backed up to {}", dest.display());
                 Ok(())
             }
