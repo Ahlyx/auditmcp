@@ -20,8 +20,45 @@ goes through.
 
 ## How do I run it?
 
-You need the [Rust toolchain](https://rustup.rs/) (stable) to build, and
-Python 3 only if you want to exercise the bundled fake MCP server.
+The simplest install is a portable archive from
+[GitHub Releases](https://github.com/Ahlyx/auditmcp/releases). Choose the
+archive for your machine:
+
+| Platform | Archive |
+|---|---|
+| Windows x64 | `auditmcp-x86_64-pc-windows-msvc.zip` |
+| Linux x64 | `auditmcp-x86_64-unknown-linux-musl.tar.gz` |
+| macOS Intel | `auditmcp-x86_64-apple-darwin.tar.gz` |
+| macOS Apple silicon | `auditmcp-aarch64-apple-darwin.tar.gz` |
+
+On Linux or macOS, extract the archive and install the binary on `PATH`:
+
+```bash
+tar -xzf auditmcp-<target>.tar.gz
+sudo install -m 0755 auditmcp-<target>/auditmcp /usr/local/bin/auditmcp
+auditmcp --version
+```
+
+On Windows, extract the zip, copy `auditmcp.exe` to a directory on `PATH`,
+then open a new terminal:
+
+```powershell
+$installDir = "$env:LOCALAPPDATA\Programs\auditmcp"
+New-Item -ItemType Directory -Force $installDir | Out-Null
+Copy-Item .\auditmcp-x86_64-pc-windows-msvc\auditmcp.exe $installDir
+[Environment]::SetEnvironmentVariable(
+  "Path",
+  [Environment]::GetEnvironmentVariable("Path", "User") + ";$installDir",
+  "User"
+)
+```
+
+Each release includes `SHA256SUMS`, and its archives have a GitHub artifact
+attestation. Windows binaries are not code-signed, so SmartScreen may show a
+first-run warning.
+
+To build from source instead, install the stable
+[Rust toolchain](https://rustup.rs/):
 
 ```bash
 git clone https://github.com/Ahlyx/auditmcp
@@ -30,6 +67,7 @@ cargo build --release
 ```
 
 The binary lands at `target/release/auditmcp` (`auditmcp.exe` on Windows).
+Python 3 is only needed for the repository's fake-server tests and examples.
 
 For a stdio server, no auditmcp config file is required:
 
@@ -232,10 +270,10 @@ mechanism is compiled and unit-adjacent tested, but has not been exercised
 against a real console close.
 
 ³ `SERVICE_CONTROL_STOP` (what `net stop` sends) goes to a service control
-handler, not a console event, so none of the above sees it. Running
-auditmcp as a true Windows Service needs a service dispatcher, which
-belongs with the not-yet-built install/lifecycle work. Until then, stopping
-it that way can lose whatever is still queued.
+handler, not a console event, so none of the above sees it. auditmcp is a
+per-user command-line tool, not a Windows Service; running it as one is
+unsupported. Stopping a hand-wrapped service that way can lose whatever is
+still queued.
 
 Two conditions refuse to start rather than warn, because both would mean
 proxying traffic while silently failing at the job: a database that cannot
@@ -274,16 +312,21 @@ Every other subcommand uses plain 0/1.
 All dependencies are pinned in `Cargo.lock`; `cargo build --locked` is
 reproducible from a clean clone.
 
-**Platforms.** Windows and Linux are both actively tested (see Current
-state). macOS should work without special-casing and is covered by CI, but
-has never been manually exercised. Released Windows binaries will be
-unsigned initially, so SmartScreen may warn on first run.
+**Platforms.** CI tests Windows, Linux, and macOS. Release builds cover
+Windows x64, static Linux x64, macOS Intel, and macOS Apple silicon, with a
+packaged-binary smoke test on each runner. macOS has not been manually
+exercised. Windows binaries are unsigned, so SmartScreen may warn on first
+run.
 
 ---
 
 ## What state is it in?
 
-Phases 1, 2, 3, and 3.5 are complete. Phase 4 is unstarted.
+Version 0.1.0 is feature-complete for its intended scope: a local,
+single-user audit proxy with optional configuration. Phases 1, 2, 3, and
+3.5 are complete. The proposed Phase 4 policy gateway is intentionally
+cancelled; auditmcp records and explains activity but never decides whether
+a tool call is allowed.
 
 ### Working
 
@@ -359,19 +402,28 @@ Phases 1, 2, 3, and 3.5 are complete. Phase 4 is unstarted.
   write-up; legacy Phase 1-3 databases keep working unchanged with a
   visible migration warning.
 
-### Not yet built
+### Deliberately not included
 
 - **`auditmcp watch`** — a live tail of tool calls as they happen, with
-  anomalies highlighted, as suggested in the phased spec alongside
-  `query --anomalous`. `query --anomalous` and `export --anomalous`
-  cover the read-side story today.
-- **A user-updatable patterns file.** The spec calls for one; `patterns.toml`
-  is currently compiled into the binary with `include_str!` and there is no
-  config key pointing at a user copy. Editing `patterns.toml` and rebuilding
-  works; editing it next to an installed binary does nothing. This is also
-  what makes refusing to start on a pattern-load failure correct — that
-  failure can only mean a broken build today, not a user's typo.
-- **Phase 4 — Lua policy layer.** No `mlua` dependency yet, by design.
+  anomalies highlighted. `query --anomalous` and `export --anomalous`
+  provide the same evidence without another long-running interface to
+  maintain.
+- **Runtime-custom secret patterns.** `patterns.toml` is compiled into the
+  binary so a fresh install works consistently with no pattern files or
+  configuration to maintain. Changes belong in a reviewed release.
+- **Phase 4 / Lua policy enforcement.** Blocking, approvals, and embedded
+  policy scripts would turn a small audit tool into a gateway. That is a
+  different product and will not be added here.
+- **Service/daemon installers.** auditmcp is launched by the MCP client that
+  uses it. System-wide lifecycle management is outside the single-user
+  scope.
+
+This is the stopping point: the auditing, redaction, anomaly, verification,
+packaging, and maintenance paths are complete. Further work is maintenance
+(security fixes, dependency updates, protocol compatibility, and bugs found
+by real users), not another planned feature phase. See [RESULTS.md](RESULTS.md)
+for the closeout record and [SECURITY.md](SECURITY.md) for vulnerability
+reporting.
 
 The non-JSON payload path — `truncate::truncate_raw_sampled` and
 `secrets::scan_and_redact_text` — handles HTTP response bodies that aren't
@@ -667,6 +719,26 @@ not a hardened boundary.
 ---
 
 ## Development
+
+The normal local gate is:
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+```
+
+To publish a release, update the version in `Cargo.toml`, merge it with green
+CI, then create and push a matching annotated tag:
+
+```bash
+git tag -a v0.1.0 -m "auditmcp v0.1.0"
+git push origin v0.1.0
+```
+
+The release workflow rejects a tag that disagrees with `Cargo.toml`, builds
+and smoke-tests all four archives, attests them, writes `SHA256SUMS`, and
+publishes the GitHub Release.
 
 ### Troubleshooting
 

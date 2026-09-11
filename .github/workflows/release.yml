@@ -82,6 +82,7 @@ jobs:
           mkdir "$ARCHIVE_NAME"
           cp "target/$TARGET/release/auditmcp" "$ARCHIVE_NAME/"
           cp README.md LICENSE config.example.toml "$ARCHIVE_NAME/"
+          cp RESULTS.md SECURITY.md "$ARCHIVE_NAME/"
           tar -czf "$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME"
 
       - name: Package archive (Windows)
@@ -91,6 +92,7 @@ jobs:
           New-Item -ItemType Directory -Path $env:ARCHIVE_NAME | Out-Null
           Copy-Item "target\$env:TARGET\release\auditmcp.exe" $env:ARCHIVE_NAME
           Copy-Item README.md, LICENSE, config.example.toml $env:ARCHIVE_NAME
+          Copy-Item RESULTS.md, SECURITY.md $env:ARCHIVE_NAME
           Compress-Archive -Path $env:ARCHIVE_NAME -DestinationPath "$env:ARCHIVE_NAME.zip"
 
       - name: Smoke-test packaged archive (Unix)
