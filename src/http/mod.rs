@@ -423,8 +423,71 @@ mod tests {
         assert_eq!(datas(p.feed(b"data: a\ndata: b\n\n")), ["a\nb"]);
     }
 
+    /// The client must receive every byte the upstream sent, oversized
+    /// events included. The parse cap is a limit on what is audited, never
+    /// on what is forwarded: this used to `buf.clear()` and skip the next
+    /// event, so a >1 MiB response was deleted from the stream and the
+    /// caller hung waiting for a reply the upstream had already sent.
+    #[test]
+    fn an_oversized_event_is_still_forwarded_byte_for_byte() {
+        let mut p = SseParser::default();
+        // Comfortably over the cap so the overflow fires at a chunk
+        // boundary, mid-event, rather than the event completing first.
+        let huge = "x".repeat(MAX_SSE_EVENT_BYTES + 20_000);
+        let wire = format!(
+            "data: {huge}
+
+data: after
+
+"
+        );
+
+        let mut forwarded: Vec<u8> = Vec::new();
+        for chunk in wire.as_bytes().chunks(8192) {
+            for ev in p.feed(chunk) {
+                forwarded.extend_from_slice(&ev.raw);
+            }
+        }
+        forwarded.extend_from_slice(&p.take_remainder());
+
+        assert_eq!(
+            forwarded.len(),
+            wire.len(),
+            "forwarded byte count must match the wire exactly"
+        );
+        assert_eq!(forwarded, wire.as_bytes(), "and match byte for byte");
+    }
+
+    /// The other half of the trade: the oversized event is not audited,
+    /// and parsing resumes cleanly on the one after it.
+    #[test]
+    fn an_oversized_event_is_not_audited_but_the_next_one_is() {
+        let mut p = SseParser::default();
+        let huge = "x".repeat(MAX_SSE_EVENT_BYTES + 20_000);
+        let wire = format!(
+            "data: {huge}
+
+data: small
+
+"
+        );
+
+        let mut audited: Vec<String> = Vec::new();
+        for chunk in wire.as_bytes().chunks(8192) {
+            audited.extend(datas(p.feed(chunk)));
+        }
+
+        assert_eq!(
+            audited,
+            ["small"],
+            "the oversized event must yield no audit record, and the next must parse"
+        );
+    }
+
     /// An event that never terminates must not grow the buffer without
-    /// bound; the parser drops it and picks up at the next boundary.
+    /// bound; the parser stops PARSING it and picks up at the next
+    /// boundary. Its bytes are still forwarded -- see
+    /// `an_oversized_event_is_still_forwarded_byte_for_byte`.
     #[test]
     fn sse_parser_resyncs_after_an_oversized_event() {
         let mut p = SseParser::default();
@@ -434,7 +497,7 @@ mod tests {
             p.buf.len() <= MAX_SSE_EVENT_BYTES,
             "buffer must stay bounded"
         );
-        // The remainder of the oversized event is discarded...
+        // The remainder of the oversized event yields no audit record...
         assert!(datas(p.feed(b"trailing junk\n\n")).is_empty());
         // ...and the next event parses normally.
         assert_eq!(datas(p.feed(b"data: recovered\n\n")), ["recovered"]);

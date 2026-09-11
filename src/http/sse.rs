@@ -8,10 +8,19 @@
 //! proxy orchestration (`server`) -- each has its own file in this
 //! directory (see `http/mod.rs`).
 
-/// Cap on a single un-terminated SSE event while parsing. An event that
-/// grows past this is abandoned and the parser resynchronises at the next
-/// event boundary, so a stream that never emits one cannot grow the buffer
-/// without bound.
+/// Cap on a single un-terminated SSE event while PARSING. An event that
+/// grows past this stops being parsed -- the parser hands its bytes back
+/// for forwarding unexamined and resynchronises at the next event boundary
+/// -- so a stream that never emits one cannot grow the buffer without
+/// bound.
+///
+/// This is a limit on what is audited, never on what is forwarded (see the
+/// invariant in `tee.rs`). It previously did both: the buffer was cleared
+/// and the next completed event skipped, so a >1 MiB event was deleted
+/// from the stream the client receives. In Events mode the client sees
+/// only what this parser returns, so a large tool result -- a file read, a
+/// base64 screenshot -- simply vanished and the caller waited forever for
+/// a response the upstream had already sent.
 pub(crate) const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
 /// Incremental Server-Sent Events parser.
@@ -26,8 +35,9 @@ pub(crate) const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 #[derive(Default)]
 pub(crate) struct SseParser {
     pub(crate) buf: Vec<u8>,
-    /// Set when an event outgrew the cap: bytes are discarded until the
-    /// next boundary rather than parsed as a corrupt fragment.
+    /// Set when an event outgrew the cap: bytes are forwarded but not
+    /// parsed until the next boundary, rather than parsed as a corrupt
+    /// fragment.
     resyncing: bool,
 }
 
@@ -45,8 +55,25 @@ pub(crate) struct SseEvent {
     pub(crate) data: Option<String>,
 }
 
+impl SseEvent {
+    /// Bytes to forward verbatim with no audit interpretation: the parser
+    /// gave up on them (they outgrew `MAX_SSE_EVENT_BYTES`), but the
+    /// stream still owes them to the client. With `name` and `data` both
+    /// `None`, `Tee::handle_event` falls straight through to forwarding
+    /// `raw`, which is exactly the intent.
+    fn passthrough(raw: Vec<u8>) -> Self {
+        SseEvent {
+            raw,
+            name: None,
+            data: None,
+        }
+    }
+}
+
 impl SseParser {
-    /// Feeds one chunk and returns every event completed by it.
+    /// Feeds one chunk and returns every event completed by it, plus any
+    /// unparsed bytes that must still be forwarded (see
+    /// `SseEvent::passthrough`).
     pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
@@ -54,7 +81,11 @@ impl SseParser {
         while let Some((body_len, term_len)) = find_event_end(&self.buf) {
             let raw: Vec<u8> = self.buf.drain(..body_len + term_len).collect();
             if self.resyncing {
+                // The tail of an event that outgrew the cap. Its prefix has
+                // already gone out verbatim; this completes it, so it is
+                // forwarded too and parsing resumes at the next boundary.
                 self.resyncing = false;
+                out.push(SseEvent::passthrough(raw));
                 continue;
             }
             let body = &raw[..body_len];
@@ -66,7 +97,16 @@ impl SseParser {
         }
 
         if self.buf.len() > MAX_SSE_EVENT_BYTES {
-            self.buf.clear();
+            // Hand the buffered prefix back for forwarding instead of
+            // dropping it, and stop parsing this event. The client still
+            // receives every byte in order; only the audit record is lost,
+            // which is the trade this cap is allowed to make.
+            let raw = std::mem::take(&mut self.buf);
+            tracing::warn!(
+                bytes = raw.len(),
+                "SSE event exceeded the {MAX_SSE_EVENT_BYTES}-byte parse cap; forwarding it                  to the client unexamined and skipping its audit record"
+            );
+            out.push(SseEvent::passthrough(raw));
             self.resyncing = true;
         }
         out
