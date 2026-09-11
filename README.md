@@ -399,8 +399,8 @@ a tool call is allowed.
   heartbeats with genesis-fixed cadence bounds, an external per-platform
   anchor file, three new `verify` exit codes, `auditmcp key`, and
   `auditmcp reset`. See the "Chain hardening" section below for the full
-  write-up; legacy Phase 1-3 databases keep working unchanged with a
-  visible migration warning.
+  write-up. As of 0.1.2 a legacy Phase 1-3 database is no longer run or
+  verified in place -- see "Migrating a Phase 1-3 (legacy) chain".
 
 ### Deliberately not included
 
@@ -446,7 +446,7 @@ Phase 3's anomaly detection: destination extraction and kind tagging, all
 three rules' arm/fire/silent cases, and rule 3's cooldown (one burst yields
 one flag, with a second burst after the window firing again) — and Phase
 3.5's chain hardening: HKDF subkey derivation and salting, the bootstrap
-decision table (fresh/existing/wrong-key/legacy), heartbeat gap detection
+decision table (fresh/existing/wrong-key/refused), heartbeat gap detection
 within and across sessions, the anchor's own internal chain plus its
 cross-check against the database, torn-tail recovery and lock-file
 serialization for the anchor, and `reset`'s archive-vs-delete behavior.
@@ -625,8 +625,7 @@ torn final line from a crash is repaired on the next append rather than
 wedging every future tick. `verify` checks the
 anchor's own internal chain, then cross-checks every entry against the live
 database — a row the anchor names must still exist with the hash the anchor
-recorded. Anchoring needs a key, so it's unavailable (with a warning, not a
-failure) on a legacy unkeyed chain.
+recorded. Anchoring needs a key, which every runnable chain now has.
 
 **`auditmcp key`** — a deliberately small operational surface:
 
@@ -654,17 +653,34 @@ suffix rather than deleting; either way, a brand-new HMAC-protected chain
 **Migrating a Phase 1-3 (legacy) chain.** There is no in-place upgrade — a
 retrofit would either need the user's blessing on some default key (bad UX)
 or produce a chain mixing hash schemes (bad design), and both are rejected.
-Two supported paths instead:
 
-1. **Keep it as-is.** A chain with no `hmac_version` in `chain_metadata`
-   keeps working exactly as before — `verify` still walks the plain
-   SHA-256 chain — but prints a warning on every `run` and `verify`:
-   > `WARNING: This chain uses legacy unkeyed SHA-256. New rows are being
-   > appended without HMAC protection. Run 'auditmcp reset --keep-old' to
-   > migrate to an HMAC-protected chain.`
-2. **Migrate by resetting.** `auditmcp reset --keep-old` archives the old
-   chain and starts a fresh one with HMAC, heartbeats, and the anchor all
-   enabled.
+**Breaking change in 0.1.2:** a legacy chain is no longer *run* or
+*verified* in place either. `run` refuses to start on a database whose
+`chain_metadata` cannot establish that it is HMAC-protected, and `verify`
+reports it as tamper (exit 1) rather than walking it unkeyed.
+
+The reason is that "legacy" was indistinguishable from "someone deleted the
+metadata." The unkeyed scheme needs no key to produce, so continuing under
+it meant a single `DELETE FROM chain_metadata WHERE key='hmac_version'`
+silently downgraded a protected chain to a forgeable one — and `verify`
+would still exit 0 on a database replaced wholesale by a fabricated legacy
+chain, ignoring the key file and anchor sitting right next to it.
+
+The supported path is now the one that was already recommended:
+`auditmcp reset --keep-old` archives the old chain and starts a fresh one
+with HMAC, heartbeats, and the anchor all enabled. The archived file is
+untouched, so a genuine pre-3.5 chain can still be read with any SQLite
+client and verified with auditmcp 0.1.1 if you need its original checks.
+
+**Genesis-recorded intent (0.1.2).** Whether heartbeats and the anchor were
+enabled is written into `chain_metadata` at genesis and covered by the
+metadata HMAC, alongside the cadence range. `verify` runs a check if
+*either* the live config or the chain's genesis says it was on. The config
+can still turn a check on, never off: config is a plain file, and anyone
+able to edit the database can edit it too, so `enabled = false` used to
+remove the check entirely while `verify` still reported clean. Chains
+created by 0.1.0/0.1.1 (`hmac_version = "1"`) predate these rows, keep
+verifying unchanged, and keep the config-only behavior until reset.
 
 **Config additions**, all optional and default on — see
 [`config.example.toml`](config.example.toml) for the full block with

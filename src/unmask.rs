@@ -44,10 +44,9 @@ pub fn run(config_path: &Path, hash: &str, note: &str) -> anyhow::Result<()> {
 /// `db::open_for_write` would happily create the file and apply the
 /// schema, but only `chain::bootstrap_fresh_chain` writes `chain_metadata`
 /// genesis. A database created here would therefore have no metadata, and
-/// `chain::bootstrap` classifies an existing-but-metadata-less database as
-/// `ChainMode::Legacy` -- permanently, by design. So creating the DB as a
-/// side effect of an allowlist edit would silently cost the user the
-/// HMAC-protected chain and anchoring for the life of that database.
+/// `chain::bootstrap` now refuses such a database outright -- so creating
+/// one as a side effect of an allowlist edit would leave the user with a
+/// `db_path` that `run` will not start against until it is reset.
 /// Allowlisting a hash is meaningful only against recorded history anyway,
 /// so there is nothing to do here before the proxy has run.
 fn ensure_db_exists(db_path: &Path) -> anyhow::Result<()> {
@@ -55,7 +54,9 @@ fn ensure_db_exists(db_path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     Err(anyhow::anyhow!(
-        "no audit database at {} -- run `auditmcp run` at least once before          unmasking. (Creating it here would leave it without chain genesis,          which permanently downgrades the chain to unkeyed SHA-256.)",
+        "no audit database at {} -- run `auditmcp run` at least once before \
+         unmasking. (Creating it here would leave it without chain genesis, \
+         which permanently downgrades the chain to unkeyed SHA-256.)",
         db_path.display()
     ))
 }
@@ -103,7 +104,8 @@ fn resolve_hash(conn: &Connection, input: &str) -> anyhow::Result<Resolved> {
     // never be there.
     if input.len() > 64 {
         return Err(anyhow::anyhow!(
-            "'{input}' is {} characters -- a sha256 hash is 64, so this cannot be one              (a prefix must be shorter than 64)",
+            "'{input}' is {} characters -- a sha256 hash is 64, so this cannot be one \
+             (a prefix must be shorter than 64)",
             input.len()
         ));
     }
@@ -171,9 +173,9 @@ mod tests {
 
     fn cleanup(conn: Connection, path: &std::path::Path) {
         drop(conn);
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("db-wal"));
-        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        for p in db::sidecar_paths(path) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]

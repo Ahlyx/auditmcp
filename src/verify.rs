@@ -114,10 +114,12 @@ pub fn run(config_path: &Path, repair_index: bool, yes: bool) -> anyhow::Result<
     // -- see that module's doc for why the decision must never be made two
     // different ways.
     let metadata = db::read_chain_metadata(&conn)?;
-    let mut anchor_key: Option<[u8; 32]> = None;
-    let mut key_fingerprint: Option<String> = None;
+    // Always set by the one arm that can reach the checks below; every
+    // other arm returns early now that a metadata-less chain is refused.
+    let anchor_key: Option<[u8; 32]>;
+    let key_fingerprint: Option<String>;
     let hash_key = match &metadata {
-        Some(m) if m.hmac_version.as_deref() == Some("1") => {
+        Some(m) if db::is_supported_hmac_version(m.hmac_version.as_deref()) => {
             // Every way of failing to obtain a usable chain key -- missing
             // file, corrupt JSON, wrong-length root key, unresolvable key
             // path -- maps to `Drift`, the code the module contract reserves
@@ -162,12 +164,21 @@ pub fn run(config_path: &Path, repair_index: bool, yes: bool) -> anyhow::Result<
             );
             return Ok(VerifyOutcome::Drift);
         }
+        // No usable `chain_metadata`. This used to print a warning, verify
+        // under the unkeyed legacy scheme and exit 0 -- which meant a
+        // database replaced wholesale by a self-constructed legacy chain
+        // (forgeable by anyone, no key needed) reported Clean. It also left
+        // `anchor_key` as `None`, so the anchor cross-check below was
+        // skipped: the second, out-of-database witness was ignored in
+        // exactly the whole-file-replacement scenario it exists to catch.
         _ => {
-            println!(
-                "WARNING: this chain uses legacy unkeyed SHA-256. Run 'auditmcp reset \
-                 --keep-old' to migrate to an HMAC-protected chain."
+            eprintln!(
+                "FAILED: this database has no usable chain_metadata (no hmac_version), so \
+                 there is nothing to verify it against. A pre-3.5 database is no longer \
+                 verifiable in place; if this database was HMAC-protected, its metadata \
+                 has been removed. Either way, treat this as tamper."
             );
-            HashKey::Legacy
+            return Ok(VerifyOutcome::Tampered);
         }
     };
 
@@ -287,7 +298,28 @@ fn finish_clean(
         return Ok(VerifyOutcome::AuditGap);
     }
 
-    if config.heartbeat.enabled {
+    // Genesis intent OR live config, never config alone. Both of these
+    // checks used to be gated purely on the config file -- which anyone who
+    // can edit the database can edit beside it, so flipping
+    // `heartbeat.enabled = false` removed the gap check entirely and
+    // `verify` still reported Clean. A chain created with the check on
+    // keeps it on. The other direction is harmless: turning a check on for
+    // a chain that was created without it is not an attack, so the config
+    // can still enable it.
+    //
+    // `heartbeat_enabled` is `None` on an `hmac_version = "1"` chain, which
+    // predates the recorded intent; those fall back to config-only and keep
+    // the lever until they are reset.
+    let genesis_heartbeat = metadata
+        .as_ref()
+        .and_then(|m| m.heartbeat_enabled)
+        .unwrap_or(false);
+    let genesis_anchor = metadata
+        .as_ref()
+        .and_then(|m| m.anchor_enabled)
+        .unwrap_or(false);
+
+    if config.heartbeat.enabled || genesis_heartbeat {
         let cadence_max = metadata
             .as_ref()
             .and_then(|m| m.heartbeat_cadence_max_secs)
@@ -309,7 +341,7 @@ fn finish_clean(
         }
     }
 
-    if config.anchor.enabled {
+    if config.anchor.enabled || genesis_anchor {
         if let Some(anchor_key) = anchor_key {
             let anchor_path = crate::anchor::resolve_anchor_path(&config.anchor.path)?;
             let entries = crate::anchor::read_entries(&anchor_path)?;
@@ -389,7 +421,9 @@ fn print_plan(plan: &db::RepairPlan, add_verb: &str, remove_verb: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_support::{remove_db_files, seed_chain, seed_redacted_row, temp_db_path};
+    use crate::db::test_support::{
+        remove_db_files, seed_chain_with_key, seed_redacted_row_with_key, temp_db_path,
+    };
 
     const SHA: &str = "1a87c48fe71852d0a7d47d36fba37625aecb7d4df1c9753fcbcb57f3a66e5598";
 
@@ -399,12 +433,19 @@ mod tests {
     struct Fixture {
         db_path: std::path::PathBuf,
         config_path: std::path::PathBuf,
+        key_path: std::path::PathBuf,
+        /// The key this fixture's chain was bootstrapped under. Rows must
+        /// be seeded with it: a database without valid `chain_metadata` is
+        /// refused by `verify::run` now, so these fixtures cannot use the
+        /// unkeyed scheme.
+        hash_key: db::HashKey,
     }
 
     impl Fixture {
         fn new(label: &str) -> Self {
             let db_path = temp_db_path(label);
             let config_path = db_path.with_extension("toml");
+            let key_path = db_path.with_extension("key");
             // `[target]` is required by the current schema even though
             // `verify` never reads it, so a valid config must include it.
             // db_path is absolute and may contain backslashes on Windows,
@@ -413,14 +454,23 @@ mod tests {
             std::fs::write(
                 &config_path,
                 format!(
-                    "[target]\n[logging]\ndb_path = '{}'\n",
-                    db_path.to_string_lossy()
+                    "[target]\n[logging]\ndb_path = '{}'\n[chain]\nkey_path = '{}'\n",
+                    db_path.to_string_lossy(),
+                    key_path.to_string_lossy()
                 ),
+            )
+            .unwrap();
+            let mode = crate::chain::bootstrap(
+                &db_path,
+                &key_path,
+                crate::chain::GenesisSettings::default(),
             )
             .unwrap();
             Fixture {
                 db_path,
                 config_path,
+                key_path,
+                hash_key: mode.hash_key(),
             }
         }
 
@@ -437,6 +487,7 @@ mod tests {
         fn drop(&mut self) {
             remove_db_files(&self.db_path);
             let _ = std::fs::remove_file(&self.config_path);
+            let _ = std::fs::remove_file(&self.key_path);
         }
     }
 
@@ -462,7 +513,7 @@ mod tests {
     fn intact_chain_is_clean() {
         let fx = Fixture::new("verify_clean");
         let mut conn = fx.open();
-        seed_chain(&mut conn, 3);
+        seed_chain_with_key(&mut conn, 3, &fx.hash_key);
         drop(conn);
 
         assert_eq!(fx.run(false, false).unwrap(), VerifyOutcome::Clean);
@@ -483,17 +534,53 @@ mod tests {
         entry.tool_name = db::AUDIT_GAP_TOOL_NAME.to_string();
         entry.status = "error".to_string();
         entry.args_json = Some(r#"{"type":"audit_gap","dropped_entries":2}"#.to_string());
-        db::insert_row(&mut conn, &entry).unwrap();
+        db::insert_row_with_key(&mut conn, &entry, &fx.hash_key).unwrap();
         drop(conn);
 
         assert_eq!(fx.run(false, false).unwrap(), VerifyOutcome::AuditGap);
+    }
+
+    /// The whole-database-replacement case. A legacy chain needs no key to
+    /// construct, so before this was refused an attacker could swap in a
+    /// self-made unkeyed chain and `verify` would print a warning and exit
+    /// 0 -- while the real key file and anchor sat next to it, unconsulted,
+    /// because the legacy arm left `anchor_key` as `None`.
+    #[test]
+    fn a_chain_with_no_metadata_reports_tampered_not_clean() {
+        let fx = Fixture::new("verify_forged_legacy");
+        {
+            let mut conn = fx.open();
+            seed_chain_with_key(&mut conn, 3, &fx.hash_key);
+            // Strip the metadata, leaving rows that hash-chain cleanly
+            // under a scheme nothing can now attest to.
+            conn.execute("DELETE FROM chain_metadata", []).unwrap();
+        }
+
+        let outcome = fx.run(false, false).unwrap();
+        assert_eq!(outcome, VerifyOutcome::Tampered);
+        assert_eq!(outcome.exit_code(), 1, "must not exit 0");
+    }
+
+    /// Deleting only `hmac_version` leaves the rest of the metadata intact,
+    /// which used to drop `verify` into the same unkeyed fallback.
+    #[test]
+    fn deleting_hmac_version_reports_tampered() {
+        let fx = Fixture::new("verify_no_hmac_version");
+        {
+            let mut conn = fx.open();
+            seed_chain_with_key(&mut conn, 3, &fx.hash_key);
+            conn.execute("DELETE FROM chain_metadata WHERE key = 'hmac_version'", [])
+                .unwrap();
+        }
+
+        assert_eq!(fx.run(false, false).unwrap(), VerifyOutcome::Tampered);
     }
 
     #[test]
     fn altered_row_reports_tampered() {
         let fx = Fixture::new("verify_tampered");
         let mut conn = fx.open();
-        seed_chain(&mut conn, 3);
+        seed_chain_with_key(&mut conn, 3, &fx.hash_key);
         conn.execute("UPDATE tool_calls SET tool_name='innocuous' WHERE id=2", [])
             .unwrap();
         drop(conn);
@@ -505,7 +592,7 @@ mod tests {
     fn deleted_middle_row_reports_tampered() {
         let fx = Fixture::new("verify_deleted");
         let mut conn = fx.open();
-        seed_chain(&mut conn, 3);
+        seed_chain_with_key(&mut conn, 3, &fx.hash_key);
         conn.execute("DELETE FROM tool_calls WHERE id=2", [])
             .unwrap();
         drop(conn);
@@ -519,7 +606,7 @@ mod tests {
     fn index_drift_reports_drift_not_tampered() {
         let fx = Fixture::new("verify_drift");
         let mut conn = fx.open();
-        let id = seed_redacted_row(&mut conn, SHA);
+        let id = seed_redacted_row_with_key(&mut conn, SHA, &fx.hash_key);
         conn.execute("DELETE FROM redactions WHERE tool_call_id=?1", [id])
             .unwrap();
         drop(conn);
@@ -533,7 +620,7 @@ mod tests {
     fn repair_dry_run_reports_drift_and_changes_nothing() {
         let fx = Fixture::new("verify_dry");
         let mut conn = fx.open();
-        let id = seed_redacted_row(&mut conn, SHA);
+        let id = seed_redacted_row_with_key(&mut conn, SHA, &fx.hash_key);
         conn.execute("DELETE FROM redactions WHERE tool_call_id=?1", [id])
             .unwrap();
         drop(conn);
@@ -551,7 +638,7 @@ mod tests {
     fn repair_with_yes_rebuilds_the_index_and_returns_clean() {
         let fx = Fixture::new("verify_repair");
         let mut conn = fx.open();
-        let id = seed_redacted_row(&mut conn, SHA);
+        let id = seed_redacted_row_with_key(&mut conn, SHA, &fx.hash_key);
         conn.execute("DELETE FROM redactions WHERE tool_call_id=?1", [id])
             .unwrap();
         drop(conn);
@@ -577,7 +664,7 @@ mod tests {
     fn repair_refuses_when_the_chain_is_tampered() {
         let fx = Fixture::new("verify_tampered_repair");
         let mut conn = fx.open();
-        let id = seed_redacted_row(&mut conn, SHA);
+        let id = seed_redacted_row_with_key(&mut conn, SHA, &fx.hash_key);
         conn.execute("DELETE FROM redactions WHERE tool_call_id=?1", [id])
             .unwrap();
         conn.execute(
@@ -645,7 +732,15 @@ mod tests {
         }
 
         fn bootstrap(&self) -> crate::chain::ChainMode {
-            crate::chain::bootstrap(&self.db_path, &self.key_path, 1, 90).unwrap()
+            crate::chain::bootstrap(
+                &self.db_path,
+                &self.key_path,
+                crate::chain::GenesisSettings {
+                    heartbeat_cadence_min_secs: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
         }
 
         fn run(&self) -> anyhow::Result<VerifyOutcome> {
@@ -770,6 +865,51 @@ mod tests {
         drop(conn);
 
         assert_eq!(fx.run().unwrap(), VerifyOutcome::HeartbeatGap);
+    }
+
+    /// The config lever finding #6 closed: the heartbeat check used to be
+    /// gated purely on `config.heartbeat.enabled`, so anyone able to edit
+    /// the database could edit the config beside it, set `enabled = false`,
+    /// and make a truncation gap invisible while `verify` still exited 0.
+    /// Genesis now records the intent under the metadata HMAC.
+    #[test]
+    fn disabling_heartbeat_in_config_does_not_hide_a_gap() {
+        let fx = HmacFixture::new("hmac_hb_config_lever", 1, false);
+        let mode = fx.bootstrap();
+        {
+            let mut conn = db::open_for_write(&fx.db_path).unwrap();
+            let mut hb1 = crate::heartbeat::heartbeat_entry("s1", "srv", 1, chrono::Utc::now());
+            let mut hb2 = crate::heartbeat::heartbeat_entry("s1", "srv", 2, chrono::Utc::now());
+            hb1.timestamp = "2026-01-01T00:00:00Z".to_string();
+            hb2.timestamp = "2026-01-01T00:05:00Z".to_string();
+            db::insert_row_with_key(&mut conn, &hb1, &mode.hash_key()).unwrap();
+            db::insert_row_with_key(&mut conn, &hb2, &mode.hash_key()).unwrap();
+        }
+
+        // The attacker's edit: turn the check off in the config file.
+        let cfg = std::fs::read_to_string(&fx.config_path).unwrap();
+        std::fs::write(
+            &fx.config_path,
+            cfg.replace(
+                "[heartbeat]
+enabled = true",
+                "[heartbeat]
+enabled = false",
+            ),
+        )
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&fx.config_path)
+                .unwrap()
+                .contains("enabled = false"),
+            "the test's own config edit must have applied, or this proves nothing"
+        );
+
+        assert_eq!(
+            fx.run().unwrap(),
+            VerifyOutcome::HeartbeatGap,
+            "genesis recorded heartbeats as enabled, so the config must not switch the check off"
+        );
     }
 
     #[test]

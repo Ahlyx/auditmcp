@@ -125,8 +125,7 @@ fn last_anchor_hmac(path: &Path) -> anyhow::Result<Option<String>> {
     let len = file.metadata()?.len();
     let start = len.saturating_sub(TAIL_WINDOW_BYTES);
     file.seek(SeekFrom::Start(start))?;
-    let mut tail = String::new();
-    file.read_to_string(&mut tail)
+    let tail = read_tail_lossy(&mut file)
         .map_err(|e| anyhow::anyhow!("failed to read anchor file {}: {e}", path.display()))?;
 
     // Drop a trailing fragment that was never newline-terminated: it is by
@@ -180,8 +179,7 @@ fn repair_torn_tail(path: &Path) -> anyhow::Result<()> {
     // Find where the last complete line ends, within the tail window.
     let start = len.saturating_sub(TAIL_WINDOW_BYTES);
     file.seek(SeekFrom::Start(start))?;
-    let mut tail = String::new();
-    file.read_to_string(&mut tail)?;
+    let tail = read_tail_lossy(&mut file)?;
     match tail.rfind('\n') {
         Some(pos) => {
             let keep = start + pos as u64 + 1;
@@ -284,6 +282,25 @@ pub fn append_entry(
     Ok(())
 }
 
+/// Reads from the current position to EOF as text, replacing any invalid
+/// UTF-8 rather than failing.
+///
+/// The two callers seek to `len - TAIL_WINDOW_BYTES`, an arbitrary byte
+/// offset that can land in the middle of a multi-byte character -- or
+/// inside garbage appended by a partially-successful tamper, or a
+/// disk-corrupted region. `read_to_string` rejects that with `InvalidData`,
+/// and in `repair_torn_tail` the error propagated unmapped, so every
+/// subsequent anchor tick failed and the second witness went permanently
+/// silent while the proxy still reported healthy. Byte positions are what
+/// matter here -- the callers split on newlines and parse whole lines -- so
+/// a replacement character in a window prefix is harmless: a mangled line
+/// fails JSON parsing, which is reported, instead of disabling the anchor.
+fn read_tail_lossy(file: &mut std::fs::File) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// How long `AnchorLock::acquire` waits for another process's live lock
 /// before proceeding without it -- fail-open, per the module contract.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -292,9 +309,20 @@ const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Advisory lock serializing the anchor's read-modify-append cycle across
-/// processes. Held via RAII: dropping removes the file.
+/// processes. Held via RAII: dropping removes the file -- but only if the
+/// file still carries THIS lock's token.
+///
+/// The token matters. Stale-lock takeover cannot be made a single atomic
+/// step, so two processes can both decide a lock is stale; without an
+/// owner check, the second one's `remove_file` deletes the lock the first
+/// had just created, both then believe they hold it, and they append
+/// entries chaining from the same `prev_anchor_hmac` -- a permanent
+/// `AnchorChainBroken` that no later append can heal. The same applies on
+/// the way out: a holder whose lock was force-broken would otherwise
+/// delete its successor's lock when it drops.
 struct AnchorLock {
     path: PathBuf,
+    token: String,
 }
 
 impl AnchorLock {
@@ -306,6 +334,7 @@ impl AnchorLock {
                 .map(|e| format!("{e}.lock"))
                 .unwrap_or_else(|| "lock".to_string()),
         );
+        let token = uuid::Uuid::new_v4().to_string();
         let deadline = std::time::Instant::now() + LOCK_WAIT;
         loop {
             match std::fs::OpenOptions::new()
@@ -313,7 +342,17 @@ impl AnchorLock {
                 .write(true)
                 .open(&lock_path)
             {
-                Ok(_) => return Ok(AnchorLock { path: lock_path }),
+                Ok(mut f) => {
+                    // Best-effort: a lock whose token cannot be written is
+                    // still exclusive (create_new won it), it just cannot
+                    // be proven ours later, so `drop` leaves it to go stale
+                    // rather than risk deleting a successor's.
+                    let _ = f.write_all(token.as_bytes());
+                    return Ok(AnchorLock {
+                        path: lock_path,
+                        token,
+                    });
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => {
                     return Err(anyhow::anyhow!(
@@ -330,7 +369,15 @@ impl AnchorLock {
                 .and_then(|modified| modified.elapsed().ok())
                 .is_some_and(|age| age > LOCK_STALE_AFTER);
             if stale {
-                let _ = std::fs::remove_file(&lock_path);
+                // Take it over by RENAMING, not removing: rename is atomic
+                // and names a specific file, so if two processes both see
+                // the lock as stale exactly one rename succeeds and the
+                // loser gets NotFound instead of silently deleting whatever
+                // the winner has since created.
+                let claimed = lock_path.with_extension(format!("stale-{token}"));
+                if std::fs::rename(&lock_path, &claimed).is_ok() {
+                    let _ = std::fs::remove_file(&claimed);
+                }
                 continue;
             }
             if std::time::Instant::now() >= deadline {
@@ -350,7 +397,16 @@ impl AnchorLock {
 
 impl Drop for AnchorLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only remove a lock that is still ours. If our lock was declared
+        // stale and taken over, the file now belongs to another process and
+        // deleting it would hand a third process a lock the second still
+        // thinks it holds.
+        match std::fs::read_to_string(&self.path) {
+            Ok(on_disk) if on_disk.trim() == self.token => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -545,6 +601,71 @@ mod tests {
 
     fn key(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    /// A non-ASCII byte in the tail window used to make `read_to_string`
+    /// fail with InvalidData, which `repair_torn_tail` propagated unmapped
+    /// -- permanently disabling every later anchor tick while the proxy
+    /// still looked healthy.
+    #[test]
+    fn a_non_utf8_byte_in_the_tail_does_not_disable_the_anchor() {
+        let path = temp_anchor_path("bad_utf8");
+        append_entry(&path, &key(1), 1, "hash1").unwrap();
+
+        // Garbage appended after a complete line, as a partially-successful
+        // tamper or a corrupted region would leave it.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(&[0xff, 0xfe, 0x80]).unwrap();
+        }
+
+        append_entry(&path, &key(1), 2, "hash2")
+            .expect("a later tick must still succeed after invalid UTF-8 in the tail");
+
+        let entries = read_entries(&path).unwrap();
+        assert_eq!(entries.len(), 2, "both entries should be readable");
+        assert_eq!(entries[1].chain_last_id, 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A lock whose owner token does not match must not be removed on drop:
+    /// deleting a successor's lock is what produces two writers chaining
+    /// from the same `prev_anchor_hmac`.
+    #[test]
+    fn dropping_a_taken_over_lock_leaves_the_new_owners_lock_alone() {
+        let path = temp_anchor_path("lock_owner");
+        let lock = AnchorLock::acquire(&path).unwrap();
+        let lock_path = lock.path.clone();
+
+        // Simulate takeover: someone else replaced the file's contents.
+        std::fs::write(&lock_path, "a-different-owner").unwrap();
+        drop(lock);
+
+        assert!(
+            lock_path.exists(),
+            "the new owner's lock must survive the old holder's drop"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            "a-different-owner"
+        );
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dropping_our_own_lock_removes_it() {
+        let path = temp_anchor_path("lock_own");
+        let lock = AnchorLock::acquire(&path).unwrap();
+        let lock_path = lock.path.clone();
+        assert!(lock_path.exists());
+        drop(lock);
+        assert!(!lock_path.exists());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

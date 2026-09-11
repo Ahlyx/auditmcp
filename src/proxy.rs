@@ -78,18 +78,19 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     let chain_mode = crate::chain::bootstrap(
         db_path,
         &key_path,
-        config.heartbeat.cadence_min_secs,
-        config.heartbeat.cadence_max_secs,
+        crate::chain::GenesisSettings {
+            heartbeat_cadence_min_secs: config.heartbeat.cadence_min_secs,
+            heartbeat_cadence_max_secs: config.heartbeat.cadence_max_secs,
+            heartbeat_enabled: config.heartbeat.enabled,
+            anchor_enabled: config.anchor.enabled,
+        },
     )?;
 
     // Refuses to start if the database can't be opened -- see
     // `db::spawn_writer` for why that is not a fail-open case.
     let (db, writer) = db::spawn_writer_with_key(db_path, chain_mode.hash_key())?;
 
-    let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence(
-        config.heartbeat.cadence_min_secs,
-        config.heartbeat.cadence_max_secs,
-    );
+    let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence();
     if config.heartbeat.enabled {
         db.log(crate::heartbeat::session_start_entry(
             session.id(),

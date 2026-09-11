@@ -79,7 +79,11 @@ impl PatternSet {
             // exactly what the hints were written to prevent.
             if !p.requires_entropy_check && !p.key_name_hints.is_empty() {
                 return Err(anyhow::anyhow!(
-                    "pattern '{}' sets key_name_hints but not requires_entropy_check.                      Hints are only consulted during the entropy gate, so as written                      they would be ignored and the pattern would fire on every match,                      regardless of key name. Set requires_entropy_check = true, or                      drop the hints.",
+                    "pattern '{}' sets key_name_hints but not requires_entropy_check. \
+                     Hints are only consulted during the entropy gate, so as written \
+                     they would be ignored and the pattern would fire on every match, \
+                     regardless of key name. Set requires_entropy_check = true, or \
+                     drop the hints.",
                     p.name
                 ));
             }
