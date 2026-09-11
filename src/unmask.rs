@@ -17,7 +17,9 @@ pub fn run(config_path: &Path, hash: &str, note: &str) -> anyhow::Result<()> {
     validate_note(note)?;
 
     let config = Config::load(config_path)?;
-    let conn = db::open_for_write(Path::new(&config.logging.db_path))?;
+    let db_path = Path::new(&config.logging.db_path);
+    ensure_db_exists(db_path)?;
+    let conn = db::open_for_write(db_path)?;
 
     let resolved = resolve_hash(&conn, hash)?;
     let added_at = db::add_to_allowlist(&conn, &resolved.sha256, note)?;
@@ -35,6 +37,27 @@ pub fn run(config_path: &Path, hash: &str, note: &str) -> anyhow::Result<()> {
     println!("Future occurrences of this exact secret value will no longer be redacted.");
 
     Ok(())
+}
+
+/// Refuses to run against a database that does not exist yet.
+///
+/// `db::open_for_write` would happily create the file and apply the
+/// schema, but only `chain::bootstrap_fresh_chain` writes `chain_metadata`
+/// genesis. A database created here would therefore have no metadata, and
+/// `chain::bootstrap` classifies an existing-but-metadata-less database as
+/// `ChainMode::Legacy` -- permanently, by design. So creating the DB as a
+/// side effect of an allowlist edit would silently cost the user the
+/// HMAC-protected chain and anchoring for the life of that database.
+/// Allowlisting a hash is meaningful only against recorded history anyway,
+/// so there is nothing to do here before the proxy has run.
+fn ensure_db_exists(db_path: &Path) -> anyhow::Result<()> {
+    if db_path.exists() {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "no audit database at {} -- run `auditmcp run` at least once before          unmasking. (Creating it here would leave it without chain genesis,          which permanently downgrades the chain to unkeyed SHA-256.)",
+        db_path.display()
+    ))
 }
 
 #[derive(Debug)]
@@ -190,6 +213,28 @@ mod tests {
         let (conn, path) = temp_db();
         let err = resolve_hash(&conn, "not-hex!!").unwrap_err();
         assert!(err.to_string().contains("not a valid sha256"));
+        cleanup(conn, &path);
+    }
+
+    #[test]
+    fn refuses_when_db_does_not_exist() {
+        let missing = std::env::temp_dir().join(format!(
+            "auditmcp_unmask_absent_{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(!missing.exists());
+
+        let err = ensure_db_exists(&missing).unwrap_err();
+        assert!(err.to_string().contains("no audit database at"));
+        // The refusal must not be the kind that creates what it complains
+        // about: a database here would have no chain genesis.
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn accepts_an_existing_db() {
+        let (conn, path) = temp_db();
+        assert!(ensure_db_exists(&path).is_ok());
         cleanup(conn, &path);
     }
 
