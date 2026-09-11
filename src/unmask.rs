@@ -96,6 +96,17 @@ fn resolve_hash(conn: &Connection, input: &str) -> anyhow::Result<Resolved> {
             "'{input}' is not a valid sha256 hash or prefix (expected hex characters only)"
         ));
     }
+    // Rejected here rather than falling through to prefix matching: a
+    // sha256 is 64 hex characters, so anything longer cannot be one. The
+    // prefix path would run `LIKE '<65 chars>%'`, match nothing, and send
+    // the user off to `query --verbose` to look for a hash that could
+    // never be there.
+    if input.len() > 64 {
+        return Err(anyhow::anyhow!(
+            "'{input}' is {} characters -- a sha256 hash is 64, so this cannot be one              (a prefix must be shorter than 64)",
+            input.len()
+        ));
+    }
 
     if input.len() == 64 {
         let pattern = db::find_secret_hash_exact(conn, &input)?;
@@ -205,6 +216,22 @@ mod tests {
         let (conn, path) = temp_db();
         let err = resolve_hash(&conn, "deadbeef").unwrap_err();
         assert!(err.to_string().contains("no known secret hash"));
+        cleanup(conn, &path);
+    }
+
+    #[test]
+    fn rejects_input_longer_than_a_sha256() {
+        let (conn, path) = temp_db();
+        let too_long = "a".repeat(65);
+
+        let err = resolve_hash(&conn, &too_long).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("65 characters"), "got: {msg}");
+        assert!(
+            !msg.contains("no known secret hash"),
+            "must not send the user hunting in the database: {msg}"
+        );
+
         cleanup(conn, &path);
     }
 
