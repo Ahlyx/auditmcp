@@ -33,13 +33,11 @@ for shared databases, reusable commands, logging tiers, and HTTP upstreams.
 - A packaged Windows binary completed a configless end-to-end smoke test:
   proxy the fake MCP server, record and redact a test key, query the row, and
   verify the resulting chain.
-- CI is configured to repeat formatting, tests, and linting on Windows,
-  Linux, and macOS; run RustSec auditing; and build and smoke-test release
-  archives for Windows x64, static Linux x64, macOS Intel, and macOS Apple
+- [PR #1](https://github.com/Ahlyx/auditmcp/pull/1) passed its complete CI
+  suite on 2026-09-10: formatting and clippy, RustSec auditing, tests and the
+  end-to-end smoke test on Windows/Linux/macOS, plus packaged-binary smoke
+  tests for Windows x64, static Linux x64, macOS Intel, and macOS Apple
   silicon.
-
-The branch/PR CI run is the remaining independent confirmation before the
-first release tag. This file does not claim that pending run has passed.
 
 ## Produced artifacts
 
