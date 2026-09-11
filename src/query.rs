@@ -169,11 +169,10 @@ pub(crate) fn normalize_status_filter(status: Option<&str>) -> anyhow::Result<Op
 /// score and reasons columns NULL, so absence and presence are the exact
 /// filter contract, not a comparison against zero.
 ///
-/// `include_synthetic` controls Phase 3.5's `__`-prefixed rows
-/// (`__heartbeat`, `__session_start`, `__session_end` -- see
-/// `heartbeat.rs`): `false` is `query`'s default, since those rows are
-/// chain-integrity plumbing rather than tool-call activity and would
-/// otherwise clutter every listing. `export` always passes `true` --
+/// `include_synthetic` controls `__`-prefixed rows (`__heartbeat`,
+/// `__session_start`, `__session_end`, `__audit_gap`): `false` is `query`'s
+/// default, since those rows are audit plumbing rather than tool-call
+/// activity and would otherwise clutter every listing. `export` always passes `true` --
 /// an export is a complete record for downstream tooling, and hiding rows
 /// there would undermine the very completeness an export exists to prove.
 #[allow(clippy::too_many_arguments)]

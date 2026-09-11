@@ -24,6 +24,11 @@ use std::sync::Arc;
 /// kind of failure.
 const CHANNEL_CAPACITY: usize = 10_000;
 
+/// Durable marker written after one or more ordinary entries could not be
+/// recorded. Query hides it with the other synthetic rows by default;
+/// export includes it and verify gives it a dedicated outcome.
+pub const AUDIT_GAP_TOOL_NAME: &str = "__audit_gap";
+
 const INSERT_SQL: &str = r#"
 INSERT INTO tool_calls (
   timestamp, session_id, agent_id, tool_name, server_name, args_json, result_json,
@@ -359,8 +364,9 @@ pub fn spawn_writer_with_key(
     let tally = DropTally::default();
 
     let writer_tally = tally.clone();
+    let writer_session_id = format!("writer:{}", uuid::Uuid::new_v4());
     let handle = std::thread::spawn(move || {
-        writer_loop(conn, rx, writer_tally, hash_key);
+        writer_loop(conn, rx, writer_tally, hash_key, writer_session_id);
         let _ = done_tx.send(());
     });
 
@@ -387,6 +393,7 @@ fn writer_loop(
     rx: Receiver<ToolCallEntry>,
     dropped: DropTally,
     hash_key: HashKey,
+    writer_session_id: String,
 ) {
     // No "database unavailable" branch here any more: `spawn_writer` opens
     // the connection before this thread exists, so reaching this function
@@ -399,7 +406,15 @@ fn writer_loop(
     // to chain against is the one `insert_row` reads under its own write
     // lock. The cost is one indexed point query per insert, noise next to
     // the SHA-256 and the disk write.
+    let mut recorded_drops = 0;
     for entry in rx.iter() {
+        persist_audit_gap(
+            &mut conn,
+            &hash_key,
+            &dropped,
+            &mut recorded_drops,
+            &writer_session_id,
+        );
         let tool_name = entry.tool_name.clone();
         if let Err(e) = insert_row_with_key(&mut conn, &entry, &hash_key) {
             // Counted, not just warned. This is a genuine loss -- the
@@ -411,5 +426,113 @@ fn writer_loop(
             dropped.record();
             tracing::warn!("failed to write audit log entry for tool '{tool_name}': {e}");
         }
+    }
+    // An INSERT failure on the last queued entry has no later iteration to
+    // trigger recovery, so make one final best effort after the channel is
+    // closed. If the database is still unavailable, the stderr warning and
+    // nonzero shutdown result remain the out-of-band signal.
+    persist_audit_gap(
+        &mut conn,
+        &hash_key,
+        &dropped,
+        &mut recorded_drops,
+        &writer_session_id,
+    );
+}
+
+fn persist_audit_gap(
+    conn: &mut Connection,
+    hash_key: &HashKey,
+    dropped: &DropTally,
+    recorded_drops: &mut u64,
+    writer_session_id: &str,
+) {
+    let observed = dropped.count();
+    if observed <= *recorded_drops {
+        return;
+    }
+    let newly_dropped = observed - *recorded_drops;
+    let entry = audit_gap_entry(writer_session_id, newly_dropped);
+    match insert_row_with_key(conn, &entry, hash_key) {
+        Ok(_) => {
+            *recorded_drops = observed;
+            tracing::warn!(
+                "persisted audit-gap marker for {newly_dropped} dropped entr{}",
+                if newly_dropped == 1 { "y" } else { "ies" }
+            );
+        }
+        Err(e) => tracing::warn!(
+            "could not persist audit-gap marker for {newly_dropped} dropped entries: {e}"
+        ),
+    }
+}
+
+fn audit_gap_entry(writer_session_id: &str, dropped_entries: u64) -> ToolCallEntry {
+    ToolCallEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: writer_session_id.to_string(),
+        agent_id: None,
+        tool_name: AUDIT_GAP_TOOL_NAME.to_string(),
+        server_name: Some("auditmcp".to_string()),
+        args_json: Some(
+            serde_json::json!({
+                "type": "audit_gap",
+                "dropped_entries": dropped_entries,
+            })
+            .to_string(),
+        ),
+        result_json: None,
+        status: "error".to_string(),
+        error_message: Some(format!(
+            "{dropped_entries} audit log entr{} could not be recorded",
+            if dropped_entries == 1 { "y" } else { "ies" }
+        )),
+        duration_ms: None,
+        bytes_in: None,
+        bytes_out: None,
+        source: None,
+        destination: None,
+        redaction_flags: Some("[]".to_string()),
+        redaction_count: 0,
+        anomaly_score: None,
+        anomaly_reasons: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovered_writer_persists_a_gap_before_the_next_surviving_entry() {
+        let path = crate::db::test_support::temp_db_path("durable_gap");
+        let conn = open_db(&path).unwrap();
+        let (tx, rx) = sync_channel(2);
+        let tally = DropTally::default();
+        tally.record();
+        tally.record();
+        tx.send(crate::db::test_support::sample_entry()).unwrap();
+        drop(tx);
+
+        writer_loop(conn, rx, tally, HashKey::Legacy, "writer:test".to_string());
+
+        let conn = crate::db::open_readonly(&path).unwrap();
+        let rows = crate::db::read_all_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].entry.tool_name, AUDIT_GAP_TOOL_NAME);
+        assert!(rows[0]
+            .entry
+            .args_json
+            .as_deref()
+            .unwrap()
+            .contains("\"dropped_entries\":2"));
+        assert_eq!(rows[1].entry.tool_name, "echo");
+        assert_eq!(
+            crate::db::verify_chain(&conn).unwrap(),
+            Ok(2),
+            "the marker and surviving entry must form one valid chain"
+        );
+        drop(conn);
+        crate::db::test_support::remove_db_files(&path);
     }
 }

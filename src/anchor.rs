@@ -83,52 +83,12 @@ fn compute_anchor_hmac(
     Ok(hex_encode(&digest))
 }
 
-/// The per-platform default anchor path, used when `[anchor].path` is
-/// empty in the config.
-///
-/// - Linux:   `${XDG_STATE_HOME:-$HOME/.local/state}/auditmcp/anchor.log`
-/// - macOS:   `~/Library/Application Support/auditmcp/anchor.log`
-/// - Windows: `%LOCALAPPDATA%\auditmcp\anchor.log`
-pub fn default_anchor_path() -> anyhow::Result<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        let base = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
-            anyhow::anyhow!("%LOCALAPPDATA% is not set; cannot resolve the default anchor path")
-        })?;
-        Ok(PathBuf::from(base).join("auditmcp").join("anchor.log"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            anyhow::anyhow!("$HOME is not set; cannot resolve the default anchor path")
-        })?;
-        Ok(PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("auditmcp")
-            .join("anchor.log"))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
-            return Ok(PathBuf::from(xdg).join("auditmcp").join("anchor.log"));
-        }
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            anyhow::anyhow!("$HOME is not set; cannot resolve the default anchor path")
-        })?;
-        Ok(PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("auditmcp")
-            .join("anchor.log"))
-    }
-}
-
-/// Resolves the configured anchor path, or the platform default if
-/// `configured_path` is empty (the `[anchor].path = ""` convention).
+/// Resolves the anchor path already finalized by `Config::load`.
 pub fn resolve_anchor_path(configured_path: &str) -> anyhow::Result<PathBuf> {
     if configured_path.is_empty() {
-        default_anchor_path()
+        Err(anyhow::anyhow!(
+            "anchor path was not resolved while loading configuration"
+        ))
     } else {
         crate::keys::expand_tilde(configured_path)
     }

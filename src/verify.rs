@@ -61,6 +61,9 @@ pub enum VerifyOutcome {
     /// An anchor entry references a chain row that no longer exists, or
     /// exists with a different `hash` than the anchor recorded.
     AnchorMismatch,
+    /// The chain is internally intact, but one or more durable
+    /// `__audit_gap` markers prove calls were dropped before persistence.
+    AuditGap,
 }
 
 impl VerifyOutcome {
@@ -72,6 +75,7 @@ impl VerifyOutcome {
             VerifyOutcome::HeartbeatGap => 3,
             VerifyOutcome::AnchorChainBroken => 4,
             VerifyOutcome::AnchorMismatch => 5,
+            VerifyOutcome::AuditGap => 6,
         }
     }
 }
@@ -272,6 +276,17 @@ fn finish_clean(
 ) -> anyhow::Result<VerifyOutcome> {
     let rows = db::read_all_rows(conn)?;
 
+    let audit_gap_count = rows
+        .iter()
+        .filter(|row| row.entry.tool_name == db::AUDIT_GAP_TOOL_NAME)
+        .count();
+    if audit_gap_count > 0 {
+        eprintln!(
+            "FAILED: {audit_gap_count} durable audit-gap marker(s) show that one or more tool calls were not recorded."
+        );
+        return Ok(VerifyOutcome::AuditGap);
+    }
+
     if config.heartbeat.enabled {
         let cadence_max = metadata
             .as_ref()
@@ -430,6 +445,10 @@ mod tests {
         assert_eq!(VerifyOutcome::Clean.exit_code(), 0);
         assert_eq!(VerifyOutcome::Tampered.exit_code(), 1);
         assert_eq!(VerifyOutcome::Drift.exit_code(), 2);
+        assert_eq!(VerifyOutcome::HeartbeatGap.exit_code(), 3);
+        assert_eq!(VerifyOutcome::AnchorChainBroken.exit_code(), 4);
+        assert_eq!(VerifyOutcome::AnchorMismatch.exit_code(), 5);
+        assert_eq!(VerifyOutcome::AuditGap.exit_code(), 6);
     }
 
     #[test]
@@ -454,6 +473,20 @@ mod tests {
         let fx = Fixture::new("verify_empty");
         drop(fx.open());
         assert_eq!(fx.run(false, false).unwrap(), VerifyOutcome::Clean);
+    }
+
+    #[test]
+    fn durable_audit_gap_has_a_distinct_verify_outcome() {
+        let fx = Fixture::new("verify_audit_gap");
+        let mut conn = fx.open();
+        let mut entry = crate::db::test_support::sample_entry();
+        entry.tool_name = db::AUDIT_GAP_TOOL_NAME.to_string();
+        entry.status = "error".to_string();
+        entry.args_json = Some(r#"{"type":"audit_gap","dropped_entries":2}"#.to_string());
+        db::insert_row(&mut conn, &entry).unwrap();
+        drop(conn);
+
+        assert_eq!(fx.run(false, false).unwrap(), VerifyOutcome::AuditGap);
     }
 
     #[test]

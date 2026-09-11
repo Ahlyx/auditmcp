@@ -29,24 +29,13 @@ pub struct Config {
     pub anchor: AnchorConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ChainConfig {
     /// Path to the HMAC root key file. `~` expands to the home directory.
-    /// Auto-generated on first run if the database does not exist yet.
-    #[serde(default = "default_key_path_string")]
+    /// Empty means a per-database file under the platform state directory;
+    /// `Config::load` resolves that default before returning.
+    #[serde(default)]
     pub key_path: String,
-}
-
-impl Default for ChainConfig {
-    fn default() -> Self {
-        ChainConfig {
-            key_path: default_key_path_string(),
-        }
-    }
-}
-
-fn default_key_path_string() -> String {
-    "~/.auditmcp/keys/audit.key".to_string()
 }
 
 impl ChainConfig {
@@ -86,8 +75,8 @@ fn default_heartbeat_cadence_max() -> u64 {
 pub struct AnchorConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Empty string means "use the per-platform default" -- see
-    /// `anchor::default_anchor_path`.
+    /// Empty means a per-database file under the platform state directory;
+    /// `Config::load` resolves that default before returning.
     #[serde(default)]
     pub path: String,
     #[serde(default = "default_anchor_cadence")]
@@ -189,24 +178,109 @@ fn default_tier() -> Tier {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        if path.as_os_str().is_empty() {
+            let db_path = crate::paths::default_db_path()?;
+            let key_path = crate::paths::default_key_path(&db_path)?;
+            let anchor_path = crate::paths::default_anchor_path(&db_path)?;
+            let config = Config {
+                target: TargetConfig::default(),
+                server: Vec::new(),
+                logging: LoggingConfig {
+                    db_path: db_path.to_string_lossy().into_owned(),
+                    default_tier: default_tier(),
+                    tool_overrides: HashMap::new(),
+                },
+                chain: ChainConfig {
+                    key_path: key_path.to_string_lossy().into_owned(),
+                },
+                heartbeat: HeartbeatConfig::default(),
+                anchor: AnchorConfig {
+                    path: anchor_path.to_string_lossy().into_owned(),
+                    ..AnchorConfig::default()
+                },
+            };
+            config.validate().map_err(|e| anyhow::anyhow!(e))?;
+            return Ok(config);
+        }
+
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("failed to read config file {}: {e}", path.display()))?;
-        let config: Config = toml::from_str(&raw)
+        let mut config: Config = toml::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("failed to parse config file {}: {e}", path.display()))?;
         config
-            .validate_servers()
+            .validate()
             .map_err(|e| anyhow::anyhow!("invalid config file {}: {e}", path.display()))?;
+        let absolute_config_path = std::path::absolute(path)?;
+        let config_dir = absolute_config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let db_path = crate::paths::resolve_config_path(&config.logging.db_path, config_dir)?;
+        config.logging.db_path = db_path.to_string_lossy().into_owned();
+
+        let key_path = if config.chain.key_path.is_empty() {
+            crate::paths::default_key_path(&db_path)?
+        } else {
+            crate::paths::resolve_config_path(&config.chain.key_path, config_dir)?
+        };
+        config.chain.key_path = key_path.to_string_lossy().into_owned();
+
+        let anchor_path = if config.anchor.path.is_empty() {
+            crate::paths::default_anchor_path(&db_path)?
+        } else {
+            crate::paths::resolve_config_path(&config.anchor.path, config_dir)?
+        };
+        config.anchor.path = anchor_path.to_string_lossy().into_owned();
+
         Ok(config)
     }
 
-    /// Checks every `[[server]]` before anything binds or proxies.
+    /// Checks every user-controlled value before paths are resolved or any
+    /// listener, child process, writer, or timer starts.
     ///
     /// All of these are startup errors rather than runtime surprises: a
     /// duplicate name silently merges two servers' rows, a duplicate port
     /// fails on the second bind after the first is already serving, and a
     /// non-loopback bind turns a single-user audit tool into an
     /// unauthenticated open proxy to someone's MCP servers.
-    fn validate_servers(&self) -> Result<(), String> {
+    fn validate(&self) -> Result<(), String> {
+        if self.logging.db_path.trim().is_empty() {
+            return Err("[logging].db_path cannot be empty".to_string());
+        }
+        if !self.chain.key_path.is_empty() && self.chain.key_path.trim().is_empty() {
+            return Err("[chain].key_path cannot contain only whitespace".to_string());
+        }
+        if !self.anchor.path.is_empty() && self.anchor.path.trim().is_empty() {
+            return Err("[anchor].path cannot contain only whitespace".to_string());
+        }
+        if self.heartbeat.cadence_min_secs == 0 || self.heartbeat.cadence_max_secs == 0 {
+            return Err("heartbeat cadence values must be greater than zero".to_string());
+        }
+        if self.heartbeat.cadence_min_secs > self.heartbeat.cadence_max_secs {
+            return Err(format!(
+                "[heartbeat].cadence_min_secs ({}) cannot exceed cadence_max_secs ({})",
+                self.heartbeat.cadence_min_secs, self.heartbeat.cadence_max_secs
+            ));
+        }
+        if self.anchor.cadence_secs == 0 {
+            return Err("[anchor].cadence_secs must be greater than zero".to_string());
+        }
+        if self
+            .target
+            .server_name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err("[target].server_name cannot be empty".to_string());
+        }
+        if self
+            .logging
+            .tool_overrides
+            .keys()
+            .any(|name| name.trim().is_empty())
+        {
+            return Err("[logging.tool_overrides] cannot contain an empty tool name".to_string());
+        }
+
         let mut names = HashSet::new();
         let mut addrs = HashSet::new();
 
@@ -218,6 +292,12 @@ impl Config {
                 return Err(format!(
                     "two [[server]] entries are both named '{}'; their rows would be \
                      indistinguishable in the log",
+                    s.name
+                ));
+            }
+            if s.request_timeout_secs == 0 {
+                return Err(format!(
+                    "[[server]] '{}' has request_timeout_secs = 0; it must be greater than zero",
                     s.name
                 ));
             }
@@ -339,6 +419,13 @@ impl ServerConfig {
 mod tests {
     use super::*;
 
+    fn temp_config_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "auditmcp_config_{label}_{}.toml",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
     const MINIMAL_TOML: &str = r#"
 [target]
 command = ["python", "server.py"]
@@ -361,7 +448,7 @@ db_path = "./test.db"
     fn servers_toml(body: &str) -> Result<Config, String> {
         let cfg: Config =
             toml::from_str(&format!("{body}\n[logging]\ndb_path = './t.db'\n")).unwrap();
-        cfg.validate_servers()?;
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -381,7 +468,7 @@ db_path = "./test.db"
     #[test]
     fn stdio_only_config_still_parses_and_has_no_servers() {
         let cfg: Config = toml::from_str(MINIMAL_TOML).unwrap();
-        cfg.validate_servers().unwrap();
+        cfg.validate().unwrap();
         assert!(cfg.server.is_empty());
         assert!(
             cfg.http_servers().is_err(),
@@ -461,6 +548,39 @@ db_path = "./test.db"
     }
 
     #[test]
+    fn invalid_operational_values_are_rejected_before_startup() {
+        let cases = [
+            ("[logging]\ndb_path = ''\n", "db_path"),
+            (
+                "[logging]\ndb_path = './a.db'\n[heartbeat]\ncadence_min_secs = 0\n",
+                "greater than zero",
+            ),
+            (
+                "[logging]\ndb_path = './a.db'\n[heartbeat]\ncadence_min_secs = 90\ncadence_max_secs = 30\n",
+                "cannot exceed",
+            ),
+            (
+                "[logging]\ndb_path = './a.db'\n[anchor]\ncadence_secs = 0\n",
+                "anchor",
+            ),
+            (
+                "[target]\nserver_name = '  '\n[logging]\ndb_path = './a.db'\n",
+                "server_name",
+            ),
+            (
+                "[[server]]\nname = 'a'\nupstream = 'http://a.test'\nlisten = '127.0.0.1:8787'\nrequest_timeout_secs = 0\n[logging]\ndb_path = './a.db'\n",
+                "request_timeout_secs",
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            let config: Config = toml::from_str(raw).unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(err.contains(expected), "expected {expected:?} in {err:?}");
+        }
+    }
+
+    #[test]
     fn cli_trailing_args_win_over_config_command() {
         let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
         let resolved = config
@@ -474,6 +594,59 @@ db_path = "./test.db"
         let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
         let resolved = config.resolve_target(vec![]).unwrap();
         assert_eq!(resolved, vec!["python", "server.py"]);
+    }
+
+    #[test]
+    fn configless_defaults_are_fully_resolved() {
+        let config = Config::load(Path::new("")).unwrap();
+        assert!(Path::new(&config.logging.db_path).is_absolute());
+        assert!(Path::new(&config.chain.key_path).is_absolute());
+        assert!(Path::new(&config.anchor.path).is_absolute());
+        assert!(config.target.command.is_empty());
+    }
+
+    #[test]
+    fn relative_state_paths_are_resolved_from_the_config_directory() {
+        let config_path = temp_config_path("relative_paths");
+        let config_dir = config_path.parent().unwrap();
+        std::fs::write(
+            &config_path,
+            "[logging]\ndb_path = './data/audit.db'\n\
+             [chain]\nkey_path = './private/audit.key'\n\
+             [anchor]\npath = './witness/anchor.log'\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(
+            Path::new(&config.logging.db_path),
+            config_dir.join("data/audit.db")
+        );
+        assert_eq!(
+            Path::new(&config.chain.key_path),
+            config_dir.join("private/audit.key")
+        );
+        assert_eq!(
+            Path::new(&config.anchor.path),
+            config_dir.join("witness/anchor.log")
+        );
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn omitted_key_and_anchor_paths_are_unique_per_database() {
+        let config_a = temp_config_path("db_a");
+        let config_b = temp_config_path("db_b");
+        std::fs::write(&config_a, "[logging]\ndb_path = './a.db'\n").unwrap();
+        std::fs::write(&config_b, "[logging]\ndb_path = './b.db'\n").unwrap();
+
+        let a = Config::load(&config_a).unwrap();
+        let b = Config::load(&config_b).unwrap();
+        assert_ne!(a.chain.key_path, b.chain.key_path);
+        assert_ne!(a.anchor.path, b.anchor.path);
+
+        let _ = std::fs::remove_file(config_a);
+        let _ = std::fs::remove_file(config_b);
     }
 
     /// Both sources empty is a hard error, not a silent no-op: there would

@@ -69,9 +69,9 @@ server_name = "fake_server"
 # # request_timeout_secs = 60
 
 [logging]
-# Point every server's config at the same file (see note above). Prefer an
-# absolute path when sharing, so configs run from different directories
-# still agree on which file this is.
+# Point every server's config at the same file (see note above). Relative
+# paths are resolved from this config file's directory, not the MCP client's
+# working directory.
 db_path = "./auditmcp.db"
 default_tier = "minimal"
 
@@ -87,8 +87,9 @@ default_tier = "minimal"
 
 [chain]
 # Path to the HMAC root key file. Auto-generated on first run against a
-# database that doesn't exist yet; `~` expands to your home directory.
-# key_path = "~/.auditmcp/keys/audit.key"
+# database that doesn't exist yet. Omit this for a per-database file under
+# the platform state directory; `~` expands to your home directory.
+# key_path = "~/.auditmcp/keys/custom.key"
 
 [heartbeat]
 # Synthetic chain rows written at a randomized cadence so within-session
@@ -103,5 +104,5 @@ default_tier = "minimal"
 # the database, so a whole-database truncate-and-replace attack also has to
 # find and rewrite this file to stay undetected.
 # enabled = true
-# path = ""   # empty = per-platform default; see the README
+# path = ""   # empty = per-database platform default; see the README
 # cadence_secs = 300

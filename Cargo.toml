@@ -4,6 +4,21 @@ version = "0.1.0"
 edition = "2021"
 description = "Local-first audit logging proxy for MCP tool calls"
 license = "MIT"
+repository = "https://github.com/Ahlyx/auditmcp"
+readme = "README.md"
+include = [
+    "/src/**",
+    "/test-fixtures/*.py",
+    "/docs/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/RESULTS.md",
+    "/SECURITY.md",
+    "/LICENSE",
+    "/config.example.toml",
+    "/patterns.toml",
+]
 
 [[bin]]
 name = "auditmcp"

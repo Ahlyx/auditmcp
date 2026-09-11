@@ -1,0 +1,168 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Match Cargo version to tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test "$actual" = "$expected" || {
+            echo "Cargo.toml version $actual does not match tag $GITHUB_REF_NAME" >&2
+            exit 1
+          }
+
+  build:
+    name: Package ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs_on: windows-latest
+            target: x86_64-pc-windows-msvc
+            windows: true
+          - runs_on: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            windows: false
+          - runs_on: macos-15-intel
+            target: x86_64-apple-darwin
+            windows: false
+          - runs_on: macos-latest
+            target: aarch64-apple-darwin
+            windows: false
+    runs-on: ${{ matrix.runs_on }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE_NAME: auditmcp-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package archive (Unix)
+        if: matrix.windows == false
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$ARCHIVE_NAME"
+          cp "target/$TARGET/release/auditmcp" "$ARCHIVE_NAME/"
+          cp README.md LICENSE config.example.toml "$ARCHIVE_NAME/"
+          cp RESULTS.md SECURITY.md "$ARCHIVE_NAME/"
+          tar -czf "$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME"
+
+      - name: Package archive (Windows)
+        if: matrix.windows == true
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path $env:ARCHIVE_NAME | Out-Null
+          Copy-Item "target\$env:TARGET\release\auditmcp.exe" $env:ARCHIVE_NAME
+          Copy-Item README.md, LICENSE, config.example.toml $env:ARCHIVE_NAME
+          Copy-Item RESULTS.md, SECURITY.md $env:ARCHIVE_NAME
+          Compress-Archive -Path $env:ARCHIVE_NAME -DestinationPath "$env:ARCHIVE_NAME.zip"
+
+      - name: Smoke-test packaged archive (Unix)
+        if: matrix.windows == false
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir smoke
+          tar -xzf "$ARCHIVE_NAME.tar.gz" -C smoke
+          binary="$PWD/smoke/$ARCHIVE_NAME/auditmcp"
+          export HOME="$PWD/smoke-home"
+          export XDG_STATE_HOME="$PWD/smoke-state"
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"leak_secret","arguments":{}}}' \
+            | "$binary" run -- python3 test-fixtures/fake_server.py >/dev/null
+          "$binary" query --verbose | grep -q 'openai_api_key(high)'
+          "$binary" verify
+          "$binary" --version
+
+      - name: Smoke-test packaged archive (Windows)
+        if: matrix.windows == true
+        shell: pwsh
+        run: |
+          Expand-Archive "$env:ARCHIVE_NAME.zip" -DestinationPath smoke
+          $binary = "$PWD\smoke\$env:ARCHIVE_NAME\auditmcp.exe"
+          $env:LOCALAPPDATA = "$PWD\smoke-state"
+          @(
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"leak_secret","arguments":{}}}'
+          ) | & $binary run -- python test-fixtures/fake_server.py | Out-Null
+          $query = (& $binary query --verbose) -join "`n"
+          if ($query -notmatch 'openai_api_key\(high\)') {
+            throw "packaged binary did not record and redact the smoke-test call"
+          }
+          & $binary verify
+          & $binary --version
+
+      - name: Attest release archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest@v4
+        with:
+          subject-path: auditmcp-${{ matrix.target }}.*
+
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: auditmcp-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum auditmcp-* > SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
