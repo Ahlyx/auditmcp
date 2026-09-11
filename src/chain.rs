@@ -293,9 +293,21 @@ fn classify_existing_chain(
 /// but no tool_calls row yet -- e.g. a process crashed between genesis and
 /// its first insert) has nothing to check and is treated as verified.
 ///
-/// Walks the whole chain rather than only row 1: cheap at startup (this
-/// runs once, not per-row), and it means a chain that was tampered with
-/// anywhere is caught here rather than only surfacing later via `verify`.
+/// Walks the whole chain rather than only row 1, deliberately: a chain
+/// tampered with anywhere is caught at startup rather than only surfacing
+/// later via `verify`, and refusing to start beats appending to a chain
+/// already known to be broken.
+///
+/// That is not free, and the cost is linear in database size, not a
+/// constant: `verify_chain_with_key` calls `read_all_rows`, which
+/// materializes every row including `args_json` and `result_json`.
+/// Measured on this machine, a 20k-row / 87 MiB database adds ~385ms and
+/// roughly its own size in peak memory to every `auditmcp run` startup.
+/// Tolerable at that scale, clearly not at 1 GB. Fixing it means making
+/// the walk stream instead of collect -- a change to the most
+/// security-sensitive function here, which should be made and reviewed on
+/// its own rather than folded into unrelated work. The security property
+/// is not the part to trade away if this is revisited.
 fn verify_first_row(conn: &rusqlite::Connection, chain_key: &[u8; 32]) -> anyhow::Result<()> {
     match db::verify_chain_with_key(conn, &HashKey::Hmac(*chain_key))? {
         Ok(_) => Ok(()),
