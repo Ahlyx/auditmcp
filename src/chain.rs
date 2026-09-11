@@ -107,11 +107,9 @@ pub fn bootstrap(
         // reused rather than treated as a conflict -- there is no
         // "wrong key" concept until a chain exists to disagree with it.
         //
-        // If genesis fails after we created the file, remove what we just
-        // created: leaving a half-initialized database behind means every
-        // later start refuses it (no `chain_metadata`), which is safe but
-        // needs a manual `reset` to clear. Failing loudly now keeps the
-        // bootstrap table honest.
+        // Genesis failure is handled by `recover_or_clean_up`, which
+        // decides whether the database is actually ours to remove -- see
+        // its doc for the concurrent-start case where it is not.
         match bootstrap_fresh_chain(
             &mut conn,
             key_path,
@@ -119,23 +117,55 @@ pub fn bootstrap(
             default_heartbeat_cadence_max_secs,
         ) {
             Ok(mode) => Ok(mode),
-            Err(e) => {
-                // Close the connection FIRST. SQLite does not open with
-                // FILE_SHARE_DELETE, so on Windows every one of these
-                // removals fails with a sharing violation while `conn` is
-                // alive -- and the errors are discarded, so the
-                // half-initialized database survived exactly the cleanup
-                // written to prevent it.
-                drop(conn);
-                for path in db::sidecar_paths(db_path) {
-                    let _ = std::fs::remove_file(path);
-                }
-                Err(e)
-            }
+            Err(e) => recover_or_clean_up(conn, e, key_path, db_path),
         }
     } else {
         classify_existing_chain(&conn, key_path, db_path)
     }
+}
+
+/// Handles a failed `bootstrap_fresh_chain`.
+///
+/// The failure is not necessarily ours to clean up. `db_existed` is sampled
+/// before `open_for_write` with no cross-process lock, and several MCP
+/// servers sharing one `db_path` is a supported setup (see `config.rs`), so
+/// two processes starting together can both take the `!db_existed` branch.
+/// The loser's `write_chain_metadata_genesis` then hits the `chain_metadata`
+/// PRIMARY KEY conflict -- and deleting the database at that point destroys
+/// the winner's live chain. On Linux the unlink even succeeds while the
+/// winner keeps writing to an unlinked inode, losing every row with no
+/// error anywhere.
+///
+/// So: if usable genesis metadata is present after the failure, someone
+/// else wrote it. Adopt their chain instead of removing it. Only when no
+/// metadata exists -- nobody else got there, the database really is the
+/// half-initialized one we just made -- is it ours to delete.
+fn recover_or_clean_up(
+    conn: rusqlite::Connection,
+    e: anyhow::Error,
+    key_path: &Path,
+    db_path: &Path,
+) -> anyhow::Result<ChainMode> {
+    if let Ok(Some(m)) = db::read_chain_metadata(&conn) {
+        if m.hmac_version.is_some() {
+            tracing::debug!(
+                "genesis lost a race against another process on the same db_path; \
+                 adopting the chain it created"
+            );
+            return classify_existing_chain(&conn, key_path, db_path);
+        }
+    }
+
+    // Close the connection FIRST. SQLite does not open with
+    // FILE_SHARE_DELETE, so on Windows every one of these removals fails
+    // with a sharing violation while `conn` is alive -- and the errors are
+    // discarded, so the half-initialized database survived exactly the
+    // cleanup written to prevent it.
+    drop(conn);
+    for path in db::sidecar_paths(db_path) {
+        let _ = std::fs::remove_file(path);
+    }
+    Err(e)
 }
 
 /// The `!db_existed` branch of `bootstrap`: new uuid, new (or reused) key,
@@ -402,6 +432,71 @@ mod tests {
 
         let _ = std::fs::remove_dir(&fx.key_path);
         remove_db_files(&fx.db_path);
+    }
+
+    /// The concurrent-start case: a genesis failure with someone else's
+    /// genesis already committed must adopt that chain, not delete the
+    /// database out from under the process actively writing it.
+    #[test]
+    fn a_genesis_race_loser_adopts_the_winners_chain_instead_of_deleting_it() {
+        let fx = Fixture::new("genesis_race");
+        // Stand in for the winner: a fully bootstrapped chain.
+        bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+        let rows_before = {
+            let mut conn = db::open_for_write(&fx.db_path).unwrap();
+            let mode = classify_existing_chain(&conn, &fx.key_path, &fx.db_path).unwrap();
+            db::insert_row_with_key(
+                &mut conn,
+                &db::test_support::sample_entry(),
+                &mode.hash_key(),
+            )
+            .unwrap();
+            1
+        };
+
+        // Now the loser: its genesis INSERT failed, and it is deciding what
+        // to do with a database that already has metadata.
+        let conn = db::open_for_write(&fx.db_path).unwrap();
+        let mode = recover_or_clean_up(
+            conn,
+            anyhow::anyhow!("chain_metadata PRIMARY KEY conflict"),
+            &fx.key_path,
+            &fx.db_path,
+        )
+        .expect("must adopt the existing chain, not propagate the error");
+        assert!(matches!(mode, ChainMode::Hmac { .. }));
+
+        assert!(
+            fx.db_path.exists(),
+            "the winner's database must not be deleted"
+        );
+        let conn = db::open_readonly(&fx.db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM tool_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, rows_before, "the winner's rows must survive");
+        drop(conn);
+        remove_db_files(&fx.db_path);
+        let _ = std::fs::remove_file(&fx.key_path);
+    }
+
+    /// The genuine case: no metadata means nobody else got there, so the
+    /// half-initialized database really is ours to remove.
+    #[test]
+    fn cleanup_still_removes_a_database_with_no_metadata() {
+        let fx = Fixture::new("genesis_no_meta");
+        let conn = db::open_for_write(&fx.db_path).unwrap();
+        assert!(fx.db_path.exists());
+
+        let err = recover_or_clean_up(
+            conn,
+            anyhow::anyhow!("key file unwritable"),
+            &fx.key_path,
+            &fx.db_path,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("key file unwritable"));
+        assert!(!fx.db_path.exists());
     }
 
     #[test]
