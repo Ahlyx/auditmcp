@@ -10,7 +10,9 @@ use super::{read_all_rows, ToolCallEntry};
 use crate::hex::hex_encode;
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection, OptionalExtension};
-use sha2::{Digest, Sha256};
+#[cfg(test)]
+use sha2::Digest;
+use sha2::Sha256;
 
 /// Sentinel written into the `hash` INPUT (never into the `prev_hash`
 /// column, which stays SQL NULL) for the first row of a chain. Any fixed,
@@ -29,6 +31,7 @@ pub const GENESIS_PREV_HASH: &str = "GENESIS";
 /// This is deliberately not `Option<&str>` — the caller must be explicit
 /// about which case they're in rather than letting `None` silently become
 /// `""`.
+#[cfg(test)]
 pub fn compute_hash(prev_hash: &str, entry: &ToolCallEntry) -> anyhow::Result<String> {
     let canonical = serde_json::to_string(entry)
         .map_err(|e| anyhow::anyhow!("failed to canonicalize entry for hashing: {e}"))?;
@@ -65,14 +68,19 @@ fn compute_hash_hmac(
     Ok(hex_encode(&digest))
 }
 
-/// Which hashing scheme a chain write or verification uses. `Legacy` is
-/// the unkeyed Phase 1-3 SHA-256 chain (see `compute_hash`); `Hmac` is
-/// Phase 3.5's keyed chain (see `compute_hash_hmac`). A single database's
-/// chain is one or the other for its entire lifetime -- see
-/// `chain::bootstrap` and the "No in-place upgrade" section of the Phase
-/// 3.5 spec for why there is no in-between state.
+/// Which hashing scheme a chain write or verification uses. `Hmac` is
+/// Phase 3.5's keyed chain (see `compute_hash_hmac`) and is the only
+/// scheme any production path selects: `chain::bootstrap` refuses a
+/// database whose `chain_metadata` cannot prove it is HMAC-protected.
+///
+/// `Legacy` is the unkeyed Phase 1-3 SHA-256 chain (see `compute_hash`),
+/// kept `#[cfg(test)]` because the large pre-3.5 test suite is pinned to
+/// unkeyed golden hashes and building those chains needs no key file. The
+/// gate says plainly that nothing in production can produce one, rather
+/// than leaving it looking like a reachable mode.
 #[derive(Clone, Copy)]
 pub enum HashKey {
+    #[cfg(test)]
     Legacy,
     Hmac([u8; 32]),
 }
@@ -80,6 +88,7 @@ pub enum HashKey {
 impl HashKey {
     pub(crate) fn compute(&self, prev_hash: &str, entry: &ToolCallEntry) -> anyhow::Result<String> {
         match self {
+            #[cfg(test)]
             HashKey::Legacy => compute_hash(prev_hash, entry),
             HashKey::Hmac(key) => compute_hash_hmac(key, prev_hash, entry),
         }
@@ -87,9 +96,11 @@ impl HashKey {
 }
 
 /// One `chain_metadata` row's worth of genesis configuration, read back.
-/// `hmac_version` is `None` for a legacy (pre-Phase-3.5) chain -- its
-/// absence, not a special value, is what marks legacy, matching how the
-/// table is documented in `SCHEMA`.
+/// `hmac_version` is `None` when the row is absent -- either a
+/// pre-Phase-3.5 database or one whose row was removed. Callers cannot
+/// tell those apart and must not try: both `chain::bootstrap` and
+/// `verify::run` refuse such a database rather than falling back to the
+/// unkeyed scheme.
 #[derive(Debug, Clone)]
 pub struct ChainMetadata {
     pub db_uuid: String,

@@ -86,10 +86,7 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // `db::spawn_writer` for why that is not a fail-open case.
     let (db, writer) = db::spawn_writer_with_key(db_path, chain_mode.hash_key())?;
 
-    let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence(
-        config.heartbeat.cadence_min_secs,
-        config.heartbeat.cadence_max_secs,
-    );
+    let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence();
     if config.heartbeat.enabled {
         db.log(crate::heartbeat::session_start_entry(
             session.id(),

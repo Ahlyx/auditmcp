@@ -76,10 +76,7 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     let serve_session_id = format!("serve:{}", uuid::Uuid::new_v4());
     const SERVE_HEARTBEAT_SERVER_NAME: &str = "auditmcp-serve";
 
-    let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence(
-        config.heartbeat.cadence_min_secs,
-        config.heartbeat.cadence_max_secs,
-    );
+    let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence();
     if config.heartbeat.enabled {
         db.log(crate::heartbeat::session_start_entry(
             &serve_session_id,

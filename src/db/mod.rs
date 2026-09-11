@@ -19,15 +19,20 @@ mod writer;
 // (non-test) build of this barrel module even though they are load-bearing
 // for `cargo test` -- hence the blanket allow, the standard shape for a
 // re-export module whose consumers live elsewhere.
+/// The unkeyed pre-3.5 hash, test-only along with `HashKey::Legacy` -- no
+/// production path can select that scheme any more.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub use chain_hash::compute_hash;
 #[cfg(test)]
 pub use chain_hash::verify_chain;
 #[allow(unused_imports)]
+pub(crate) use chain_hash::{last_hash, HashKey};
+#[allow(unused_imports)]
 pub use chain_hash::{
-    compute_hash, read_chain_metadata, verify_chain_metadata_hmac, verify_chain_with_key,
+    read_chain_metadata, verify_chain_metadata_hmac, verify_chain_with_key,
     write_chain_metadata_genesis, ChainIssue, ChainMetadata, GENESIS_PREV_HASH,
 };
-#[allow(unused_imports)]
-pub(crate) use chain_hash::{last_hash, HashKey};
 
 #[allow(unused_imports)]
 pub use redaction_repair::{
@@ -101,10 +106,11 @@ CREATE INDEX IF NOT EXISTS idx_redactions_tool_call_id ON redactions(tool_call_i
 
 -- SCHEMA CHANGE (Phase 3.5, chain hardening): per-database chain
 -- configuration, populated once at genesis and never mutated afterward.
--- Absence of the `hmac_version` key marks the chain as a pre-Phase-3.5
--- (Phase 1-3) legacy chain -- unkeyed SHA-256, no HMAC, no heartbeats, no
--- anchor. A row's presence here is what tells `run`/`verify` which hashing
--- scheme applies to THIS database; see `chain::bootstrap`.
+-- `hmac_version` is what tells `run`/`verify` which hashing scheme applies
+-- to THIS database; see `chain::bootstrap`. Its absence no longer means
+-- "pre-3.5 legacy chain, proceed unkeyed" -- both `run` and `verify` now
+-- refuse a database that cannot establish it is HMAC-protected, since that
+-- state is indistinguishable from someone having deleted the row.
 CREATE TABLE IF NOT EXISTS chain_metadata (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -481,11 +487,19 @@ pub(crate) mod test_support {
     /// Inserts `n` entries (each with a distinct tool_name so tests can
     /// tell rows apart) and returns their ids in order.
     pub(crate) fn seed_chain(conn: &mut Connection, n: usize) -> Vec<i64> {
+        seed_chain_with_key(conn, n, &HashKey::Legacy)
+    }
+
+    /// `seed_chain`, hashing under an explicit key. Tests that go through
+    /// `verify::run` need this: a chain with no `chain_metadata` is now
+    /// refused outright, so they must seed under the same HMAC key the
+    /// database was bootstrapped with.
+    pub(crate) fn seed_chain_with_key(conn: &mut Connection, n: usize, key: &HashKey) -> Vec<i64> {
         let mut ids = Vec::new();
         for i in 0..n {
             let mut entry = sample_entry();
             entry.tool_name = format!("tool_{i}");
-            insert_row(conn, &entry).unwrap();
+            insert_row_with_key(conn, &entry, key).unwrap();
             let id: i64 = conn
                 .query_row(
                     "SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1",
@@ -499,17 +513,21 @@ pub(crate) mod test_support {
     }
 
     /// Seeds one row carrying `redaction_flags`, which also populates the
-    /// derived `redactions` index. Returns the new row's id. Used by drift
-    /// tests, which then delete from the index to simulate the fail-open
-    /// gap `verify` is meant to detect.
-    pub(crate) fn seed_redacted_row(conn: &mut Connection, sha256: &str) -> i64 {
+    /// derived `redactions` index, hashing under `key`. Returns the new
+    /// row's id. Used by drift tests, which then delete from the index to
+    /// simulate the fail-open gap `verify` is meant to detect.
+    pub(crate) fn seed_redacted_row_with_key(
+        conn: &mut Connection,
+        sha256: &str,
+        key: &HashKey,
+    ) -> i64 {
         let mut entry = sample_entry();
         entry.tool_name = "leak_secret".to_string();
         entry.redaction_flags = Some(format!(
             r#"[{{"pattern":"openai_api_key","severity":"high","sha256":"{sha256}"}}]"#
         ));
         entry.redaction_count = 1;
-        insert_row(conn, &entry).unwrap();
+        insert_row_with_key(conn, &entry, key).unwrap();
         conn.query_row(
             "SELECT id FROM tool_calls ORDER BY id DESC LIMIT 1",
             [],

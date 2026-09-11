@@ -1,7 +1,13 @@
 //! Phase 3.5 bootstrap: decides, once at `auditmcp run` startup, whether a
-//! database's chain is a fresh HMAC-keyed one, an existing HMAC-keyed one,
-//! or a legacy (Phase 1-3) unkeyed one -- and enforces the refuse-to-start
-//! rules that make the HMAC key meaningful.
+//! database's chain is a fresh HMAC-keyed one or an existing HMAC-keyed
+//! one -- and enforces the refuse-to-start rules that make the HMAC key
+//! meaningful.
+//!
+//! There is no third answer. A database whose `chain_metadata` cannot
+//! establish that it is HMAC-protected is refused, not run unkeyed: the
+//! legacy scheme is forgeable by anyone (it has no key), so continuing
+//! under it turned the whole protection into something a single `DELETE`
+//! could switch off.
 //!
 //! This is deliberately the ONLY place that makes this decision. Splitting
 //! "is this chain legacy or HMAC" logic between `run` and `verify` would
@@ -17,7 +23,7 @@
 //! | DB exists, key missing                         | Refuse to start              |
 //! | DB exists, key present, first-row HMAC fails   | Refuse to start              |
 //! | DB exists, key present, first-row HMAC verifies| Proceed                      |
-//! | DB has rows but no `hmac_version` metadata     | Legacy chain, warn, proceed   |
+//! | DB has rows but no valid `chain_metadata`      | Refuse to start (tamper)     |
 
 use crate::db::{self, HashKey};
 use crate::keys::KeyFile;
@@ -38,43 +44,36 @@ pub enum ChainMode {
         heartbeat_cadence_min_secs: u64,
         heartbeat_cadence_max_secs: u64,
     },
-    /// A pre-Phase-3.5 database: no `chain_metadata.hmac_version`, at
-    /// least one row already present. Continues on the old unkeyed
-    /// SHA-256 chain -- see the module doc's "No in-place upgrade" stance.
-    Legacy,
 }
 
 impl ChainMode {
     pub fn hash_key(&self) -> HashKey {
         match self {
             ChainMode::Hmac { chain_key, .. } => HashKey::Hmac(*chain_key),
-            ChainMode::Legacy => HashKey::Legacy,
         }
     }
 
-    /// The anchor key, if this chain has one. `None` for a legacy chain --
-    /// the external anchor is an HMAC mechanism and has nothing meaningful
-    /// to key itself with on a chain that has no root key at all.
+    /// This chain's anchor key. Every chain a session can run against is
+    /// HMAC-protected now, so this is always `Some`; the `Option` is kept
+    /// so callers that read "no anchor key" as "skip the anchor" need no
+    /// change.
     pub fn anchor_key(&self) -> Option<[u8; 32]> {
         match self {
             ChainMode::Hmac { anchor_key, .. } => Some(*anchor_key),
-            ChainMode::Legacy => None,
         }
     }
 
-    /// The heartbeat cadence range this session should use. For an HMAC
-    /// chain this is the range fixed at that chain's genesis (see
-    /// `db::write_chain_metadata_genesis`); a legacy chain has no
-    /// genesis-fixed range to defend (there is no key protecting it
-    /// either), so it falls back to whatever the live config says.
-    pub fn heartbeat_cadence(&self, config_min_secs: u64, config_max_secs: u64) -> (u64, u64) {
+    /// The heartbeat cadence range this session should use: always the
+    /// range fixed at this chain's genesis and covered by the metadata
+    /// HMAC (see `db::write_chain_metadata_genesis`), never the live
+    /// config, which anyone able to edit the database can edit too.
+    pub fn heartbeat_cadence(&self) -> (u64, u64) {
         match self {
             ChainMode::Hmac {
                 heartbeat_cadence_min_secs,
                 heartbeat_cadence_max_secs,
                 ..
             } => (*heartbeat_cadence_min_secs, *heartbeat_cadence_max_secs),
-            ChainMode::Legacy => (config_min_secs, config_max_secs),
         }
     }
 }
@@ -109,10 +108,9 @@ pub fn bootstrap(
         // "wrong key" concept until a chain exists to disagree with it.
         //
         // If genesis fails after we created the file, remove what we just
-        // created: leaving it behind means the next start classifies this
-        // half-initialized database as LEGACY (no `chain_metadata`) and --
-        // permanently, by design -- appends unkeyed rows to what was meant
-        // to be an HMAC-protected chain. Failing loudly now keeps the
+        // created: leaving a half-initialized database behind means every
+        // later start refuses it (no `chain_metadata`), which is safe but
+        // needs a manual `reset` to clear. Failing loudly now keeps the
         // bootstrap table honest.
         match bootstrap_fresh_chain(
             &mut conn,
@@ -219,14 +217,22 @@ fn classify_existing_chain(
              start rather than write rows under an assumption that may be wrong.",
             m.hmac_version
         )),
-        _ => {
-            tracing::warn!(
-                "This chain uses legacy unkeyed SHA-256. New rows are being appended \
-                 without HMAC protection. Run 'auditmcp reset --keep-old' to migrate to \
-                 an HMAC-protected chain."
-            );
-            Ok(ChainMode::Legacy)
-        }
+        // Reached when `chain_metadata` is absent entirely, or present but
+        // missing `hmac_version`. This used to warn and continue on the
+        // unkeyed legacy scheme, which made the protection opt-out:
+        // deleting one row dropped `run` into Legacy and appended unkeyed
+        // rows, and the metadata-HMAC guard meant to catch exactly that
+        // lives inside the `hmac_version == "1"` arm, so it never ran. A
+        // database that cannot prove which scheme it was written under
+        // gets no benefit of the doubt.
+        _ => Err(anyhow::anyhow!(
+            "this database has no usable chain_metadata (no hmac_version), so the \
+             hashing scheme its rows were written under cannot be established. \
+             Refusing to start. This is either a pre-3.5 database, which is no longer \
+             supported in place, or a chain_metadata table that was edited or \
+             truncated. Either way the supported path is `auditmcp reset --keep-old`, \
+             which archives what is there and starts a fresh HMAC-protected chain."
+        )),
     }
 }
 
@@ -295,7 +301,6 @@ mod tests {
                 assert_eq!(heartbeat_cadence_min_secs, 30);
                 assert_eq!(heartbeat_cadence_max_secs, 90);
             }
-            ChainMode::Legacy => panic!("fresh database must not be legacy"),
         }
 
         let conn = db::open_readonly(&fx.db_path).unwrap();
@@ -450,24 +455,51 @@ mod tests {
         assert!(err.to_string().contains("HMAC verification"), "{err}");
     }
 
-    /// A pre-Phase-3.5 database: rows exist, but there is no
-    /// `chain_metadata` row at all (the table itself is created idempotently
-    /// by `SCHEMA`, but genesis was never written by this module).
+    /// A database with rows but no `chain_metadata` row at all: either a
+    /// pre-Phase-3.5 database, or an HMAC chain whose metadata was deleted.
+    /// The two are indistinguishable from here, so both are refused rather
+    /// than silently continuing unkeyed.
     #[test]
-    fn legacy_database_with_rows_and_no_metadata_proceeds_as_legacy() {
+    fn a_database_with_rows_and_no_metadata_refuses_to_start() {
         let fx = Fixture::new("legacy");
         {
             let mut conn = db::open_for_write(&fx.db_path).unwrap();
             db::insert_row(&mut conn, &db::test_support::sample_entry()).unwrap();
         }
-        // No key file exists and none should be required.
         assert!(!fx.key_path.exists());
 
-        let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
-        assert!(matches!(mode, ChainMode::Legacy));
+        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        assert!(
+            err.to_string().contains("no usable chain_metadata"),
+            "{err}"
+        );
         assert!(
             !fx.key_path.exists(),
-            "a legacy chain must never generate a key file"
+            "refusing to start must not generate a key file"
         );
+        remove_db_files(&fx.db_path);
+    }
+
+    /// The downgrade lever this strictness exists to close: an HMAC chain
+    /// whose single `hmac_version` row is deleted used to fall through to
+    /// `ChainMode::Legacy` and append unkeyed rows, because the
+    /// metadata-HMAC guard only runs inside the `hmac_version == "1"` arm.
+    #[test]
+    fn deleting_hmac_version_does_not_downgrade_to_legacy() {
+        let fx = Fixture::new("drop_hmac_version");
+        bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+
+        {
+            let conn = db::open_for_write(&fx.db_path).unwrap();
+            conn.execute("DELETE FROM chain_metadata WHERE key = 'hmac_version'", [])
+                .unwrap();
+        }
+
+        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        assert!(
+            err.to_string().contains("no usable chain_metadata"),
+            "{err}"
+        );
+        remove_db_files(&fx.db_path);
     }
 }
