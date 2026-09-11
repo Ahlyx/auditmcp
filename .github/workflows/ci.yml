@@ -19,7 +19,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -38,7 +38,7 @@ jobs:
         # (see README "Current state") -- CI is what backs that claim.
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
@@ -47,7 +47,7 @@ jobs:
       # End-to-end smoke test against the bundled fake MCP server: proves the
       # binary actually proxies, logs, and produces a verifiable hash chain on
       # this OS -- not just that the unit tests pass.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.x'
       - name: End-to-end smoke test
@@ -86,3 +86,14 @@ jobs:
             exit 1
           }
           echo "smoke test OK"
+
+  audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+          fallback: none
+      - run: cargo audit
