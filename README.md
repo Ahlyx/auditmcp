@@ -634,6 +634,7 @@ failure) on a legacy unkeyed chain.
 auditmcp key path                         # print the resolved key file path
 auditmcp key fingerprint                  # sha256(root_key)[:16] -- safe to share
 auditmcp key backup <dest>                # atomic copy, same 0600/0700 perms
+auditmcp key backup <dest> --force        # ... replacing an existing file at <dest>
 ```
 
 No `key generate` (automatic on first run against a new database), no `key

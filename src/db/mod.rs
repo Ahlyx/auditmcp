@@ -242,9 +242,15 @@ pub fn open_readonly(path: &Path) -> anyhow::Result<Connection> {
 
 /// Opens the audit DB for a one-off write from a CLI command (currently
 /// just `unmask`), reusing the same pragmas/schema setup as the proxy's
-/// writer thread. Unlike `open_readonly`, this creates the DB (and applies
-/// the schema, which is idempotent) if it doesn't exist yet, since running
-/// `unmask` before ever running the proxy is a legitimate if unusual order.
+/// writer thread. This creates the DB and applies the schema (idempotent)
+/// if it doesn't exist.
+///
+/// Callers must not rely on that creation to bootstrap a usable database:
+/// it writes no `chain_metadata` genesis, and `chain::bootstrap` treats an
+/// existing database without metadata as `ChainMode::Legacy` permanently.
+/// `unmask` therefore checks the file exists first (`unmask::ensure_db_exists`)
+/// and refuses rather than creating one here. Creation remains for tests,
+/// which build throwaway databases that never carry a chain.
 pub fn open_for_write(path: &Path) -> anyhow::Result<Connection> {
     open_db(path)
 }

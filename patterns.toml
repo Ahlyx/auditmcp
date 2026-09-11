@@ -21,7 +21,12 @@
 #                           `contains`); if a pattern with entropy checking
 #                           set defines hints, key-name proximity is
 #                           REQUIRED (not just informative) for it to fire —
-#                           entropy alone never fires this class of pattern
+#                           entropy alone never fires this class of pattern.
+#                           Hints are consulted ONLY during the entropy
+#                           gate, so `key_name_hints` without
+#                           `requires_entropy_check = true` is rejected at
+#                           load: the hints would be silently ignored and
+#                           the pattern would fire on every match.
 
 [[pattern]]
 name = "aws_access_key_id"

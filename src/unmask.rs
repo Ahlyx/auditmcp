@@ -17,7 +17,9 @@ pub fn run(config_path: &Path, hash: &str, note: &str) -> anyhow::Result<()> {
     validate_note(note)?;
 
     let config = Config::load(config_path)?;
-    let conn = db::open_for_write(Path::new(&config.logging.db_path))?;
+    let db_path = Path::new(&config.logging.db_path);
+    ensure_db_exists(db_path)?;
+    let conn = db::open_for_write(db_path)?;
 
     let resolved = resolve_hash(&conn, hash)?;
     let added_at = db::add_to_allowlist(&conn, &resolved.sha256, note)?;
@@ -35,6 +37,27 @@ pub fn run(config_path: &Path, hash: &str, note: &str) -> anyhow::Result<()> {
     println!("Future occurrences of this exact secret value will no longer be redacted.");
 
     Ok(())
+}
+
+/// Refuses to run against a database that does not exist yet.
+///
+/// `db::open_for_write` would happily create the file and apply the
+/// schema, but only `chain::bootstrap_fresh_chain` writes `chain_metadata`
+/// genesis. A database created here would therefore have no metadata, and
+/// `chain::bootstrap` classifies an existing-but-metadata-less database as
+/// `ChainMode::Legacy` -- permanently, by design. So creating the DB as a
+/// side effect of an allowlist edit would silently cost the user the
+/// HMAC-protected chain and anchoring for the life of that database.
+/// Allowlisting a hash is meaningful only against recorded history anyway,
+/// so there is nothing to do here before the proxy has run.
+fn ensure_db_exists(db_path: &Path) -> anyhow::Result<()> {
+    if db_path.exists() {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "no audit database at {} -- run `auditmcp run` at least once before          unmasking. (Creating it here would leave it without chain genesis,          which permanently downgrades the chain to unkeyed SHA-256.)",
+        db_path.display()
+    ))
 }
 
 #[derive(Debug)]
@@ -71,6 +94,17 @@ fn resolve_hash(conn: &Connection, input: &str) -> anyhow::Result<Resolved> {
     if input.is_empty() || !input.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(anyhow::anyhow!(
             "'{input}' is not a valid sha256 hash or prefix (expected hex characters only)"
+        ));
+    }
+    // Rejected here rather than falling through to prefix matching: a
+    // sha256 is 64 hex characters, so anything longer cannot be one. The
+    // prefix path would run `LIKE '<65 chars>%'`, match nothing, and send
+    // the user off to `query --verbose` to look for a hash that could
+    // never be there.
+    if input.len() > 64 {
+        return Err(anyhow::anyhow!(
+            "'{input}' is {} characters -- a sha256 hash is 64, so this cannot be one              (a prefix must be shorter than 64)",
+            input.len()
         ));
     }
 
@@ -186,10 +220,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_input_longer_than_a_sha256() {
+        let (conn, path) = temp_db();
+        let too_long = "a".repeat(65);
+
+        let err = resolve_hash(&conn, &too_long).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("65 characters"), "got: {msg}");
+        assert!(
+            !msg.contains("no known secret hash"),
+            "must not send the user hunting in the database: {msg}"
+        );
+
+        cleanup(conn, &path);
+    }
+
+    #[test]
     fn rejects_non_hex_input() {
         let (conn, path) = temp_db();
         let err = resolve_hash(&conn, "not-hex!!").unwrap_err();
         assert!(err.to_string().contains("not a valid sha256"));
+        cleanup(conn, &path);
+    }
+
+    #[test]
+    fn refuses_when_db_does_not_exist() {
+        let missing = std::env::temp_dir().join(format!(
+            "auditmcp_unmask_absent_{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(!missing.exists());
+
+        let err = ensure_db_exists(&missing).unwrap_err();
+        assert!(err.to_string().contains("no audit database at"));
+        // The refusal must not be the kind that creates what it complains
+        // about: a database here would have no chain genesis.
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn accepts_an_existing_db() {
+        let (conn, path) = temp_db();
+        assert!(ensure_db_exists(&path).is_ok());
         cleanup(conn, &path);
     }
 

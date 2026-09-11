@@ -70,6 +70,19 @@ impl PatternSet {
         for p in file.pattern {
             let regex = Regex::new(&p.regex)
                 .map_err(|e| anyhow::anyhow!("pattern '{}' has invalid regex: {e}", p.name))?;
+            // `passes_entropy_gate` returns early on
+            // `!requires_entropy_check` and never consults the hints, so
+            // this combination is a pattern that fires on every match
+            // everywhere while reading as if it were key-name-scoped.
+            // Rejecting is better than silently dropping the hints: the
+            // failure mode is over-firing on a loose regex, which is
+            // exactly what the hints were written to prevent.
+            if !p.requires_entropy_check && !p.key_name_hints.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "pattern '{}' sets key_name_hints but not requires_entropy_check.                      Hints are only consulted during the entropy gate, so as written                      they would be ignored and the pattern would fire on every match,                      regardless of key name. Set requires_entropy_check = true, or                      drop the hints.",
+                    p.name
+                ));
+            }
             patterns.push(Pattern {
                 name: p.name,
                 severity: p.severity,
@@ -417,10 +430,11 @@ pub struct Hit {
     is_heuristic: bool,
 }
 
-/// Recursively walks a parsed JSON value, scanning every string leaf
-/// (with its parent object key as context, when available) and redacting
-/// matches in place — except allowlisted ones, which are left as-is.
-/// Returns every hit found, including allowlisted ones.
+/// Recursively walks a parsed JSON value, scanning every string leaf and
+/// every object key (with the parent object key as context, when
+/// available) and redacting matches in place — except allowlisted ones,
+/// which are left as-is. Returns every hit found, including allowlisted
+/// ones.
 pub fn scan_and_redact_json(
     value: &mut serde_json::Value,
     patterns: &PatternSet,
@@ -454,6 +468,43 @@ fn walk_json(
             }
         }
         serde_json::Value::Object(map) => {
+            // Keys are scanned too, not just values. A tool that returns
+            // `{"<token>": {"scope": "repo"}}` -- the normal shape for
+            // credential- and quota-listing endpoints -- would otherwise
+            // write the secret verbatim, and with no hit recorded nothing
+            // downstream (tier escalation, `redaction_flags`) would flag
+            // it either. The parent key is the context here, the same
+            // context this object's values get.
+            let mut renames: Vec<(String, String)> = Vec::new();
+            for k in map.keys() {
+                let found = patterns.scan_str(k, key_name, allowlist);
+                if found.is_empty() {
+                    continue;
+                }
+                let redacted = redact_ranges(k, &found);
+                hits.extend(found);
+                // Allowlisted-only hits redact to the original string;
+                // nothing to rewrite in that case.
+                if redacted != *k {
+                    renames.push((k.clone(), redacted));
+                }
+            }
+            for (old_key, new_key) in renames {
+                let Some(v) = map.remove(&old_key) else {
+                    continue;
+                };
+                // Two distinct secrets under the same pattern redact to
+                // the same marker. Suffixing keeps the second value from
+                // silently replacing the first; leaving the key unredacted
+                // to avoid the collision is not an option.
+                let mut candidate = new_key.clone();
+                let mut n = 2;
+                while map.contains_key(&candidate) {
+                    candidate = format!("{new_key} #{n}");
+                    n += 1;
+                }
+                map.insert(candidate, v);
+            }
             for (k, v) in map.iter_mut() {
                 walk_json(v, Some(k.as_str()), patterns, allowlist, hits);
             }
@@ -463,19 +514,47 @@ fn walk_json(
 }
 
 /// Splices `[REDACTED:<pattern>]` markers into `s` at each non-allowlisted
-/// hit's byte range, working right-to-left so earlier ranges stay valid as
-/// later ones are spliced.
+/// hit's byte range.
+///
+/// Builds the result in one left-to-right pass rather than splicing into a
+/// buffer per hit. `replace_range` memmoves the whole tail on every call,
+/// which is quadratic in hit count: the generic `[A-Za-z0-9_/+=.-]{20,256}`
+/// pattern tiles a high-entropy body into ~4096 non-overlapping 256-char
+/// matches with nothing for `merge_overlapping_hits` to collapse, so a
+/// 1 MiB body (`tee::MAX_CAPTURE_BYTES`) moves ~10^9 bytes.
+///
+/// Measured on that worst case, this is ~16ms -> ~0.5ms. Worth having, but
+/// keep the scale honest: scanning the same body costs ~320ms, so the
+/// splice was never the bottleneck it looked like on paper.
 fn redact_ranges(s: &str, hits: &[Hit]) -> String {
-    let mut out = s.to_string();
-    let mut sorted: Vec<&Hit> = hits.iter().collect();
-    sorted.sort_by_key(|h| std::cmp::Reverse(h.matched_range.0));
-    for hit in sorted {
-        if hit.allowlisted {
+    let mut active: Vec<&Hit> = hits.iter().filter(|h| !h.allowlisted).collect();
+    if active.is_empty() {
+        return s.to_string();
+    }
+    active.sort_by_key(|h| h.matched_range.0);
+
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    for hit in active {
+        let (start, end) = hit.matched_range;
+        // `merge_overlapping_hits` runs upstream, so ranges arrive
+        // disjoint and in bounds; skip anything that isn't rather than
+        // panic on a bad slice.
+        if start < cursor
+            || end > s.len()
+            || start > end
+            || !s.is_char_boundary(start)
+            || !s.is_char_boundary(end)
+        {
             continue;
         }
-        let (start, end) = hit.matched_range;
-        out.replace_range(start..end, &format!("[REDACTED:{}]", hit.pattern_name));
+        out.push_str(&s[cursor..start]);
+        out.push_str("[REDACTED:");
+        out.push_str(&hit.pattern_name);
+        out.push(']');
+        cursor = end;
     }
+    out.push_str(&s[cursor..]);
     out
 }
 
@@ -549,6 +628,49 @@ mod tests {
         assert!(hits.iter().any(|h| h.pattern_name == "github_token"));
         assert!(!redacted.contains("ghp_123456789012345678901234567890123456"));
         assert!(redacted.contains("[REDACTED:github_token]"));
+    }
+
+    #[test]
+    fn hints_without_entropy_check_are_rejected() {
+        let raw = r#"
+[[pattern]]
+name = "loose_with_hints"
+regex = "[A-Za-z0-9]{8,}"
+severity = "high"
+requires_entropy_check = false
+key_name_hints = ["token"]
+"#;
+        let msg = match PatternSet::from_str(raw) {
+            Ok(_) => panic!("hints without requires_entropy_check must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("loose_with_hints"), "got: {msg}");
+        assert!(msg.contains("requires_entropy_check"), "got: {msg}");
+    }
+
+    #[test]
+    fn hints_with_entropy_check_are_accepted() {
+        let raw = r#"
+[[pattern]]
+name = "scoped"
+regex = "[A-Za-z0-9]{8,}"
+severity = "high"
+requires_entropy_check = true
+key_name_hints = ["token"]
+"#;
+        assert!(PatternSet::from_str(raw).is_ok());
+    }
+
+    #[test]
+    fn no_hints_without_entropy_check_is_fine() {
+        let raw = r#"
+[[pattern]]
+name = "exact_format"
+regex = "AKIA[0-9A-Z]{16}"
+severity = "high"
+requires_entropy_check = false
+"#;
+        assert!(PatternSet::from_str(raw).is_ok());
     }
 
     #[test]
@@ -710,6 +832,106 @@ mod tests {
         assert!(redacted.contains("[REDACTED:aws_access_key_id]"));
         assert_eq!(value["auth"]["headers"][0], "x");
         assert_eq!(value["auth"]["headers"][2], "y");
+    }
+
+    #[test]
+    fn redacts_a_secret_used_as_an_object_key() {
+        let patterns = PatternSet::bundled().unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(r#"{"AKIAABCDEFGHIJKLMNOP":{"scope":"repo"}}"#).unwrap();
+
+        let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
+
+        assert_eq!(hits.len(), 1, "a key-position secret must be recorded");
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(
+            !serialized.contains("AKIAABCDEFGHIJKLMNOP"),
+            "secret survived in key position: {serialized}"
+        );
+        let (key, v) = value.as_object().unwrap().iter().next().unwrap();
+        assert!(key.contains("[REDACTED:aws_access_key_id]"));
+        assert_eq!(v["scope"], "repo", "the value must be carried over intact");
+    }
+
+    #[test]
+    fn two_secret_keys_redacting_to_the_same_marker_keep_both_values() {
+        let patterns = PatternSet::bundled().unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(
+            r#"{"AKIAABCDEFGHIJKLMNOP":{"n":1},"AKIAZZZZZZZZZZZZZZZZ":{"n":2}}"#,
+        )
+        .unwrap();
+
+        let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
+
+        assert_eq!(hits.len(), 2);
+        let map = value.as_object().unwrap();
+        assert_eq!(map.len(), 2, "neither value may be dropped on collision");
+        let ns: std::collections::HashSet<i64> =
+            map.values().map(|v| v["n"].as_i64().unwrap()).collect();
+        assert_eq!(ns, [1, 2].into_iter().collect());
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("AKIA"));
+    }
+
+    #[test]
+    fn redacts_many_hits_in_one_string_correctly_and_quickly() {
+        let patterns = PatternSet::bundled().unwrap();
+        // A high-entropy body of the shape that tiles into many
+        // generic-pattern matches -- the quadratic case. The key name has
+        // to clear `passes_entropy_gate`'s key-name proximity requirement
+        // for the generic pattern to fire at all.
+        let unit = "aB3dE6gH9jK2mN5pQ8sT1vW4xY7zC0fI/+";
+        // ~1 MiB: `tee::MAX_CAPTURE_BYTES`, the largest body that reaches here.
+        let body = unit.repeat(1_048_576 / unit.len());
+        let mut value = serde_json::json!({ "api_key": body });
+
+        let start = std::time::Instant::now();
+        let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
+        let elapsed = start.elapsed();
+
+        assert!(!hits.is_empty(), "this body should produce hits");
+        let out = value["api_key"].as_str().unwrap();
+        assert!(out.contains("[REDACTED:"));
+        // Redaction must still be total: no run long enough to have been a
+        // match may survive.
+        assert!(
+            !out.contains(unit),
+            "an unredacted high-entropy run survived"
+        );
+        // Smoke guard only: this whole call is ~0.35s, dominated by the
+        // regex scan, not the splice. A multi-second result would mean
+        // something genuinely superlinear came back.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "redaction took {elapsed:?}, which suggests a superlinear path is back"
+        );
+    }
+
+    #[test]
+    fn redact_ranges_splices_multiple_hits_in_order() {
+        let patterns = PatternSet::bundled().unwrap();
+        let s = "a AKIAABCDEFGHIJKLMNOP b AKIAZZZZZZZZZZZZZZZZ c";
+        let hits = patterns.scan_str(s, None, &empty_allowlist());
+        assert_eq!(hits.len(), 2);
+
+        let out = redact_ranges(s, &hits);
+        assert_eq!(
+            out,
+            "a [REDACTED:aws_access_key_id] b [REDACTED:aws_access_key_id] c"
+        );
+    }
+
+    #[test]
+    fn ordinary_object_keys_are_left_alone() {
+        let patterns = PatternSet::bundled().unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(r#"{"user":"alice","nested":{"count":3}}"#).unwrap();
+
+        let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
+
+        assert!(hits.is_empty());
+        assert_eq!(value["user"], "alice");
+        assert_eq!(value["nested"]["count"], 3);
     }
 
     #[test]
