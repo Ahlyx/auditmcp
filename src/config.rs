@@ -199,7 +199,7 @@ impl Config {
                     ..AnchorConfig::default()
                 },
             };
-            config.validate_servers().map_err(|e| anyhow::anyhow!(e))?;
+            config.validate().map_err(|e| anyhow::anyhow!(e))?;
             return Ok(config);
         }
 
@@ -207,6 +207,9 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("failed to read config file {}: {e}", path.display()))?;
         let mut config: Config = toml::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("failed to parse config file {}: {e}", path.display()))?;
+        config
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid config file {}: {e}", path.display()))?;
         let absolute_config_path = std::path::absolute(path)?;
         let config_dir = absolute_config_path
             .parent()
@@ -228,20 +231,56 @@ impl Config {
         };
         config.anchor.path = anchor_path.to_string_lossy().into_owned();
 
-        config
-            .validate_servers()
-            .map_err(|e| anyhow::anyhow!("invalid config file {}: {e}", path.display()))?;
         Ok(config)
     }
 
-    /// Checks every `[[server]]` before anything binds or proxies.
+    /// Checks every user-controlled value before paths are resolved or any
+    /// listener, child process, writer, or timer starts.
     ///
     /// All of these are startup errors rather than runtime surprises: a
     /// duplicate name silently merges two servers' rows, a duplicate port
     /// fails on the second bind after the first is already serving, and a
     /// non-loopback bind turns a single-user audit tool into an
     /// unauthenticated open proxy to someone's MCP servers.
-    fn validate_servers(&self) -> Result<(), String> {
+    fn validate(&self) -> Result<(), String> {
+        if self.logging.db_path.trim().is_empty() {
+            return Err("[logging].db_path cannot be empty".to_string());
+        }
+        if !self.chain.key_path.is_empty() && self.chain.key_path.trim().is_empty() {
+            return Err("[chain].key_path cannot contain only whitespace".to_string());
+        }
+        if !self.anchor.path.is_empty() && self.anchor.path.trim().is_empty() {
+            return Err("[anchor].path cannot contain only whitespace".to_string());
+        }
+        if self.heartbeat.cadence_min_secs == 0 || self.heartbeat.cadence_max_secs == 0 {
+            return Err("heartbeat cadence values must be greater than zero".to_string());
+        }
+        if self.heartbeat.cadence_min_secs > self.heartbeat.cadence_max_secs {
+            return Err(format!(
+                "[heartbeat].cadence_min_secs ({}) cannot exceed cadence_max_secs ({})",
+                self.heartbeat.cadence_min_secs, self.heartbeat.cadence_max_secs
+            ));
+        }
+        if self.anchor.cadence_secs == 0 {
+            return Err("[anchor].cadence_secs must be greater than zero".to_string());
+        }
+        if self
+            .target
+            .server_name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err("[target].server_name cannot be empty".to_string());
+        }
+        if self
+            .logging
+            .tool_overrides
+            .keys()
+            .any(|name| name.trim().is_empty())
+        {
+            return Err("[logging.tool_overrides] cannot contain an empty tool name".to_string());
+        }
+
         let mut names = HashSet::new();
         let mut addrs = HashSet::new();
 
@@ -253,6 +292,12 @@ impl Config {
                 return Err(format!(
                     "two [[server]] entries are both named '{}'; their rows would be \
                      indistinguishable in the log",
+                    s.name
+                ));
+            }
+            if s.request_timeout_secs == 0 {
+                return Err(format!(
+                    "[[server]] '{}' has request_timeout_secs = 0; it must be greater than zero",
                     s.name
                 ));
             }
@@ -403,7 +448,7 @@ db_path = "./test.db"
     fn servers_toml(body: &str) -> Result<Config, String> {
         let cfg: Config =
             toml::from_str(&format!("{body}\n[logging]\ndb_path = './t.db'\n")).unwrap();
-        cfg.validate_servers()?;
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -423,7 +468,7 @@ db_path = "./test.db"
     #[test]
     fn stdio_only_config_still_parses_and_has_no_servers() {
         let cfg: Config = toml::from_str(MINIMAL_TOML).unwrap();
-        cfg.validate_servers().unwrap();
+        cfg.validate().unwrap();
         assert!(cfg.server.is_empty());
         assert!(
             cfg.http_servers().is_err(),
@@ -499,6 +544,39 @@ db_path = "./test.db"
             ))
             .unwrap_err();
             assert!(err.contains(expected), "{upstream}: got {err}");
+        }
+    }
+
+    #[test]
+    fn invalid_operational_values_are_rejected_before_startup() {
+        let cases = [
+            ("[logging]\ndb_path = ''\n", "db_path"),
+            (
+                "[logging]\ndb_path = './a.db'\n[heartbeat]\ncadence_min_secs = 0\n",
+                "greater than zero",
+            ),
+            (
+                "[logging]\ndb_path = './a.db'\n[heartbeat]\ncadence_min_secs = 90\ncadence_max_secs = 30\n",
+                "cannot exceed",
+            ),
+            (
+                "[logging]\ndb_path = './a.db'\n[anchor]\ncadence_secs = 0\n",
+                "anchor",
+            ),
+            (
+                "[target]\nserver_name = '  '\n[logging]\ndb_path = './a.db'\n",
+                "server_name",
+            ),
+            (
+                "[[server]]\nname = 'a'\nupstream = 'http://a.test'\nlisten = '127.0.0.1:8787'\nrequest_timeout_secs = 0\n[logging]\ndb_path = './a.db'\n",
+                "request_timeout_secs",
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            let config: Config = toml::from_str(raw).unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(err.contains(expected), "expected {expected:?} in {err:?}");
         }
     }
 
