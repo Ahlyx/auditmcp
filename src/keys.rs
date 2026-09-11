@@ -554,27 +554,6 @@ mod tests {
         cleanup_key_path(&path);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn save_tightens_a_directory_it_creates() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let base = crate::db::test_support::temp_isolated_dir("keys_created_dir");
-        let dir = base.join("keys");
-        let path = dir.join("audit.key");
-
-        KeyFile::generate("db-uuid").save(&path).unwrap();
-
-        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            dir_mode, 0o700,
-            "a directory we created is ours to restrict"
-        );
-
-        cleanup_key_path(&path);
-        let _ = std::fs::remove_dir(&base);
-    }
-
     /// Removes a key file and the isolated directory `temp_key_path`
     /// created for it.
     fn cleanup_key_path(path: &Path) {
@@ -616,24 +595,27 @@ mod tests {
         assert!(KeyFile::load(&path).unwrap().is_none());
     }
 
+    /// The real bootstrap shape: `~/.auditmcp/keys/` does not exist and
+    /// `save` creates it, so both the directory and the file are ours to
+    /// lock down. (`save` deliberately does not narrow a directory it did
+    /// not create -- see `save_does_not_narrow_a_directory_it_did_not_create`.)
     #[cfg(unix)]
     #[test]
     fn saved_key_file_has_0600_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let path = temp_key_path("perms");
+        let base = crate::db::test_support::temp_isolated_dir("perms");
+        let dir = base.join("keys");
+        let path = dir.join("audit.key");
         KeyFile::generate("db-1").save(&path).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
-        let parent_mode = std::fs::metadata(path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let parent_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(parent_mode, 0o700);
 
         cleanup_key_path(&path);
+        let _ = std::fs::remove_dir(&base);
     }
 
     /// Windows equivalent of `saved_key_file_has_0600_permissions`: after
