@@ -37,6 +37,7 @@ pub use redaction_repair::{
 
 #[allow(unused_imports)]
 pub(crate) use writer::insert_row_with_key;
+pub use writer::AUDIT_GAP_TOOL_NAME;
 #[cfg(test)]
 pub(crate) use writer::{insert_row, spawn_writer};
 #[allow(unused_imports)]

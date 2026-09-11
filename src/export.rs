@@ -17,9 +17,9 @@
 //! also atomic (see `write_atomic`): nothing at the destination path
 //! changes.
 //!
-//! Exit codes: unlike `verify` (which has two independently meaningful
-//! nonzero codes -- tamper vs. drift -- and calls `std::process::exit`
-//! itself to keep them distinct), export has exactly one failure shape:
+//! Exit codes: unlike `verify` (which has independently meaningful nonzero
+//! outcomes and calls `std::process::exit` itself to keep them distinct),
+//! export has exactly one failure shape:
 //! "did not produce a complete export." Every error here is a plain `Err`
 //! that propagates out of `run` and out of `main`, which exits 1 via the
 //! standard `anyhow`/`Termination` behavior -- the same path `query`,

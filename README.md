@@ -192,8 +192,10 @@ Add `--config config.toml` to any command when using a custom configuration.
 
 Warnings go to stderr and are on by default, because the things auditmcp
 warns about are the ways your record can be incomplete — an entry dropped
-under load, the redactions index drifting, a pipe error. Set `RUST_LOG` to
-change it:
+under load, the redactions index drifting, a pipe error. When logging recovers
+after a dropped entry, auditmcp also writes a durable `__audit_gap` row;
+`verify` reports it even if the original stderr warning is long gone. Set
+`RUST_LOG` to change diagnostic verbosity:
 
 ```bash
 RUST_LOG=error auditmcp run -- npx -y @some/mcp-server    # quieter
@@ -244,7 +246,7 @@ a configuration problem — the pattern set is compiled into the binary.
 
 ### Exit codes
 
-`verify` uses six distinct codes so a monitoring script can tell these
+`verify` uses seven distinct codes so a monitoring script can tell these
 apart without parsing output:
 
 | Code | Meaning |
@@ -255,6 +257,7 @@ apart without parsing output:
 | 3 | A heartbeat gap within a session exceeded the expected cadence — likely tail truncation |
 | 4 | The anchor file's own internal HMAC chain is broken |
 | 5 | The anchor references chain rows that are missing or have a different hash than it recorded |
+| 6 | The chain is intact, but durable `__audit_gap` markers prove one or more calls were dropped |
 
 Every other subcommand uses plain 0/1.
 
@@ -378,7 +381,7 @@ type). Stdio MCP is JSON-RPC end to end so it never exercises this path;
 
 ### How it has been verified
 
-`cargo test` runs 277 tests covering the hash chain (including concurrent
+`cargo test` runs 285 tests covering the hash chain (including concurrent
 writers against a shared DB and interleaved multi-server chains), secrets
 detection and its false-positive cases, truncation UTF-8 boundary safety,
 export fidelity, unmask hash resolution, `verify` exit codes and

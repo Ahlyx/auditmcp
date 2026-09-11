@@ -96,10 +96,9 @@ enum Command {
         /// this -- it stays clean and safe to glance at or paste elsewhere.
         #[arg(long)]
         verbose: bool,
-        /// Show Phase 3.5's synthetic chain rows (`__heartbeat`,
-        /// `__session_start`, `__session_end`), hidden by default since
-        /// they are chain-integrity plumbing rather than tool-call
-        /// activity.
+        /// Show synthetic chain rows (`__heartbeat`, `__session_start`,
+        /// `__session_end`, `__audit_gap`), hidden by default since they
+        /// are audit plumbing rather than tool-call activity.
         #[arg(long)]
         include_synthetic: bool,
     },
@@ -107,7 +106,8 @@ enum Command {
     /// Exit codes: 0 = clean; 1 = hash-chain tamper/failure; 2 = index
     /// drift or missing/unloadable chain key (chain intact); 3 = heartbeat
     /// gap; 4 = anchor file's internal HMAC chain broken; 5 = anchor
-    /// references rows that are missing or hash differently.
+    /// references rows that are missing or hash differently; 6 = durable
+    /// audit-gap markers prove calls were dropped.
     Verify {
         #[command(flatten)]
         config_args: ConfigArg,
