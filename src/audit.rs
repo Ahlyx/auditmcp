@@ -272,6 +272,14 @@ impl CallOutcome {
 /// across rows. No `allowlisted` field here -- this array is only ever
 /// built from hits already filtered to non-allowlisted ones, so it would
 /// always read `false` and add nothing.
+/// Ceiling on distinct redaction records persisted for one tool call.
+/// Redaction is never capped -- every hit is still redacted out of the
+/// payload -- only how many are itemized in `redaction_flags` and
+/// `redactions`. Generous enough that a real leak is fully described;
+/// small enough that a pathological body cannot write a half-megabyte
+/// column and thousands of index rows.
+const MAX_REDACTION_RECORDS: usize = 256;
+
 #[derive(Serialize)]
 struct RedactionRecord<'a> {
     pattern: &'a str,
@@ -346,15 +354,35 @@ pub(crate) fn build_entry(
     // without ever persisting the plaintext. `query`/`export` parse this as
     // `[{"pattern":..,"severity":..,"sha256":..}, ...]`.
     let redaction_flags = if secrets_fired {
-        let records: Vec<RedactionRecord> = hits
-            .iter()
-            .filter(|h| !h.allowlisted)
-            .map(|h| RedactionRecord {
+        // Deduplicated and capped. A high-entropy 1 MiB body can tile into
+        // thousands of distinct generic-pattern matches, and every one of
+        // them would otherwise become a record in this column *and* a row
+        // in `redactions`. The cap bounds both; the hit count itself is
+        // unaffected, so tier escalation still sees the real total.
+        let mut seen = std::collections::HashSet::new();
+        let mut truncated = 0usize;
+        let mut records: Vec<RedactionRecord> = Vec::new();
+        for h in hits.iter().filter(|h| !h.allowlisted) {
+            if !seen.insert((h.pattern_name.as_str(), h.secret_sha256.as_str())) {
+                continue;
+            }
+            if records.len() == MAX_REDACTION_RECORDS {
+                truncated += 1;
+                continue;
+            }
+            records.push(RedactionRecord {
                 pattern: h.pattern_name.as_str(),
                 severity: h.severity,
                 sha256: h.secret_sha256.as_str(),
-            })
-            .collect();
+            });
+        }
+        if truncated > 0 {
+            tracing::warn!(
+                recorded = MAX_REDACTION_RECORDS,
+                dropped = truncated,
+                "more distinct secrets in one payload than can be recorded;                  redaction itself is unaffected, but this row's redaction_flags                  lists only the first {MAX_REDACTION_RECORDS}"
+            );
+        }
         serde_json::to_string(&records).ok()
     } else {
         None

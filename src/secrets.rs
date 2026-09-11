@@ -501,19 +501,47 @@ fn walk_json(
 }
 
 /// Splices `[REDACTED:<pattern>]` markers into `s` at each non-allowlisted
-/// hit's byte range, working right-to-left so earlier ranges stay valid as
-/// later ones are spliced.
+/// hit's byte range.
+///
+/// Builds the result in one left-to-right pass rather than splicing into a
+/// buffer per hit. `replace_range` memmoves the whole tail on every call,
+/// which is quadratic in hit count: the generic `[A-Za-z0-9_/+=.-]{20,256}`
+/// pattern tiles a high-entropy body into ~4096 non-overlapping 256-char
+/// matches with nothing for `merge_overlapping_hits` to collapse, so a
+/// 1 MiB body (`tee::MAX_CAPTURE_BYTES`) moves ~10^9 bytes.
+///
+/// Measured on that worst case, this is ~16ms -> ~0.5ms. Worth having, but
+/// keep the scale honest: scanning the same body costs ~320ms, so the
+/// splice was never the bottleneck it looked like on paper.
 fn redact_ranges(s: &str, hits: &[Hit]) -> String {
-    let mut out = s.to_string();
-    let mut sorted: Vec<&Hit> = hits.iter().collect();
-    sorted.sort_by_key(|h| std::cmp::Reverse(h.matched_range.0));
-    for hit in sorted {
-        if hit.allowlisted {
+    let mut active: Vec<&Hit> = hits.iter().filter(|h| !h.allowlisted).collect();
+    if active.is_empty() {
+        return s.to_string();
+    }
+    active.sort_by_key(|h| h.matched_range.0);
+
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    for hit in active {
+        let (start, end) = hit.matched_range;
+        // `merge_overlapping_hits` runs upstream, so ranges arrive
+        // disjoint and in bounds; skip anything that isn't rather than
+        // panic on a bad slice.
+        if start < cursor
+            || end > s.len()
+            || start > end
+            || !s.is_char_boundary(start)
+            || !s.is_char_boundary(end)
+        {
             continue;
         }
-        let (start, end) = hit.matched_range;
-        out.replace_range(start..end, &format!("[REDACTED:{}]", hit.pattern_name));
+        out.push_str(&s[cursor..start]);
+        out.push_str("[REDACTED:");
+        out.push_str(&hit.pattern_name);
+        out.push(']');
+        cursor = end;
     }
+    out.push_str(&s[cursor..]);
     out
 }
 
@@ -787,6 +815,54 @@ mod tests {
         assert_eq!(ns, [1, 2].into_iter().collect());
         let serialized = serde_json::to_string(&value).unwrap();
         assert!(!serialized.contains("AKIA"));
+    }
+
+    #[test]
+    fn redacts_many_hits_in_one_string_correctly_and_quickly() {
+        let patterns = PatternSet::bundled().unwrap();
+        // A high-entropy body of the shape that tiles into many
+        // generic-pattern matches -- the quadratic case. The key name has
+        // to clear `passes_entropy_gate`'s key-name proximity requirement
+        // for the generic pattern to fire at all.
+        let unit = "aB3dE6gH9jK2mN5pQ8sT1vW4xY7zC0fI/+";
+        // ~1 MiB: `tee::MAX_CAPTURE_BYTES`, the largest body that reaches here.
+        let body = unit.repeat(1_048_576 / unit.len());
+        let mut value = serde_json::json!({ "api_key": body });
+
+        let start = std::time::Instant::now();
+        let hits = scan_and_redact_json(&mut value, &patterns, &empty_allowlist());
+        let elapsed = start.elapsed();
+
+        assert!(!hits.is_empty(), "this body should produce hits");
+        let out = value["api_key"].as_str().unwrap();
+        assert!(out.contains("[REDACTED:"));
+        // Redaction must still be total: no run long enough to have been a
+        // match may survive.
+        assert!(
+            !out.contains(unit),
+            "an unredacted high-entropy run survived"
+        );
+        // Smoke guard only: this whole call is ~0.35s, dominated by the
+        // regex scan, not the splice. A multi-second result would mean
+        // something genuinely superlinear came back.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "redaction took {elapsed:?}, which suggests a superlinear path is back"
+        );
+    }
+
+    #[test]
+    fn redact_ranges_splices_multiple_hits_in_order() {
+        let patterns = PatternSet::bundled().unwrap();
+        let s = "a AKIAABCDEFGHIJKLMNOP b AKIAZZZZZZZZZZZZZZZZ c";
+        let hits = patterns.scan_str(s, None, &empty_allowlist());
+        assert_eq!(hits.len(), 2);
+
+        let out = redact_ranges(s, &hits);
+        assert_eq!(
+            out,
+            "a [REDACTED:aws_access_key_id] b [REDACTED:aws_access_key_id] c"
+        );
     }
 
     #[test]
