@@ -191,7 +191,9 @@ impl KeyFile {
     pub fn backup(&self, dest: &Path, force: bool) -> anyhow::Result<()> {
         if dest.exists() && !force {
             return Err(anyhow::anyhow!(
-                "refusing to overwrite existing file {} -- pass --force to replace it.                  (If that is another database's key file, replacing it makes that                  chain permanently unverifiable.)",
+                "refusing to overwrite existing file {} -- pass --force to replace it. \
+                 (If that is another database's key file, replacing it makes that \
+                 chain permanently unverifiable.)",
                 dest.display()
             ));
         }

@@ -55,7 +55,9 @@ fn ensure_db_exists(db_path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     Err(anyhow::anyhow!(
-        "no audit database at {} -- run `auditmcp run` at least once before          unmasking. (Creating it here would leave it without chain genesis,          which permanently downgrades the chain to unkeyed SHA-256.)",
+        "no audit database at {} -- run `auditmcp run` at least once before \
+         unmasking. (Creating it here would leave it without chain genesis, \
+         which permanently downgrades the chain to unkeyed SHA-256.)",
         db_path.display()
     ))
 }
@@ -103,7 +105,8 @@ fn resolve_hash(conn: &Connection, input: &str) -> anyhow::Result<Resolved> {
     // never be there.
     if input.len() > 64 {
         return Err(anyhow::anyhow!(
-            "'{input}' is {} characters -- a sha256 hash is 64, so this cannot be one              (a prefix must be shorter than 64)",
+            "'{input}' is {} characters -- a sha256 hash is 64, so this cannot be one \
+             (a prefix must be shorter than 64)",
             input.len()
         ));
     }

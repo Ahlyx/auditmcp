@@ -380,7 +380,9 @@ pub(crate) fn build_entry(
             tracing::warn!(
                 recorded = MAX_REDACTION_RECORDS,
                 dropped = truncated,
-                "more distinct secrets in one payload than can be recorded;                  redaction itself is unaffected, but this row's redaction_flags                  lists only the first {MAX_REDACTION_RECORDS}"
+                "more distinct secrets in one payload than can be recorded; \
+                 redaction itself is unaffected, but this row's redaction_flags \
+                 lists only the first {MAX_REDACTION_RECORDS}"
             );
         }
         serde_json::to_string(&records).ok()
