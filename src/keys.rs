@@ -106,7 +106,11 @@ impl KeyFile {
         Ok(Some(key))
     }
 
-    /// Writes the key file, creating its parent directory if needed.
+    /// Writes the key file, overwriting any existing one, creating its
+    /// parent directory if needed. Test-only: production bootstrap goes
+    /// through `save_new`, which never clobbers. Tests use this to plant a
+    /// deliberately wrong key over a real one.
+    ///
     /// Permissions are set to 0600 on the file always, and 0700 on the
     /// parent directory only when this call created it -- `key_path` is
     /// user-configurable, so a pre-existing directory here can be `$HOME`
@@ -122,6 +126,7 @@ impl KeyFile {
     /// world-readable) and tightening afterwards leaves a window in which
     /// the root key sits on disk readable by every local process. See
     /// `write_restricted`.
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let parent = path.parent().ok_or_else(|| {
             anyhow::anyhow!("key path {} has no parent directory", path.display())
@@ -145,6 +150,31 @@ impl KeyFile {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow::anyhow!("failed to serialize key file: {e}"))?;
         write_restricted(path, &json)
+    }
+
+    /// `save`, but refuses to overwrite: `Ok(false)` means a key file
+    /// appeared at `path` first and this one was not written.
+    fn save_new(&self, path: &Path) -> anyhow::Result<bool> {
+        let parent = path.parent().ok_or_else(|| {
+            anyhow::anyhow!("key path {} has no parent directory", path.display())
+        })?;
+        let parent_existed = parent.exists();
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!("failed to create key directory {}: {e}", parent.display())
+        })?;
+
+        #[cfg(unix)]
+        if !parent_existed {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| anyhow::anyhow!("failed to set key directory permissions: {e}"))?;
+        }
+        #[cfg(not(unix))]
+        let _ = parent_existed;
+
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| anyhow::anyhow!("failed to serialize key file: {e}"))?;
+        write_restricted_new(path, &json)
     }
 
     /// Atomically copies this key to `dest`: write-to-temp then rename,
@@ -193,9 +223,24 @@ impl KeyFile {
         if let Some(key) = Self::load(path)? {
             return Ok(key);
         }
+        // Create-exclusive rather than plain `save`: between the `load`
+        // above and the write, another `auditmcp run` bootstrapping the
+        // same fresh database can generate and save its own key. A
+        // truncating write would clobber it, and whichever process had
+        // already written `chain_metadata` under the overwritten key would
+        // fail `verify_first_row` on next start and refuse to run, with
+        // `reset --keep-old` the only way out. Losing the race is fine --
+        // the winner's key is equally valid -- so adopt it.
         let key = Self::generate(db_uuid);
-        key.save(path)?;
-        Ok(key)
+        if key.save_new(path)? {
+            return Ok(key);
+        }
+        Self::load(path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "key file {} appeared while generating a new key but could not be read back",
+                path.display()
+            )
+        })
     }
 }
 
@@ -348,6 +393,59 @@ fn write_restricted(path: &Path, json: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Like `write_restricted`, but fails rather than clobbering an existing
+/// file: returns `Ok(false)` if `path` already exists. Used by
+/// `load_or_generate`, where two processes bootstrapping the same fresh
+/// database must not each write a different root key.
+fn write_restricted_new(path: &Path, json: &str) -> anyhow::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(mut f) => {
+                f.write_all(json.as_bytes()).map_err(|e| {
+                    anyhow::anyhow!("failed to write key file {}: {e}", path.display())
+                })?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(anyhow::anyhow!(
+                "failed to create key file {}: {e}",
+                path.display()
+            )),
+        }
+    }
+    #[cfg(windows)]
+    {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_handle) => {
+                // Handle dropped: an empty file exists and is ours. Restrict
+                // its DACL before any content goes in, same ordering as
+                // `write_restricted`.
+                restrict_to_current_user_windows(path)?;
+                std::fs::write(path, json).map_err(|e| {
+                    anyhow::anyhow!("failed to write key file {}: {e}", path.display())
+                })?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(anyhow::anyhow!(
+                "failed to create key file {}: {e}",
+                path.display()
+            )),
+        }
+    }
+}
+
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     // Operates on bytes with an explicit nibble table rather than slicing
     // by byte offset into the string: a corrupt or malicious key file whose
@@ -384,6 +482,45 @@ mod tests {
         crate::db::test_support::temp_isolated_dir(label).join("audit.key")
     }
 
+    #[test]
+    fn save_new_refuses_to_overwrite_an_existing_key() {
+        let path = temp_key_path("keys_save_new_exclusive");
+
+        let first = KeyFile::generate("db-uuid");
+        assert!(first.save_new(&path).unwrap(), "first write should win");
+
+        let second = KeyFile::generate("db-uuid");
+        assert!(
+            !second.save_new(&path).unwrap(),
+            "second write must report that it did not write"
+        );
+
+        let on_disk = KeyFile::load(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.root_key_hex, first.root_key_hex,
+            "the first key must survive"
+        );
+        assert_ne!(on_disk.root_key_hex, second.root_key_hex);
+
+        cleanup_key_path(&path);
+    }
+
+    #[test]
+    fn load_or_generate_adopts_a_key_that_already_exists() {
+        let path = temp_key_path("keys_load_or_generate_adopts");
+
+        let planted = KeyFile::generate("db-uuid");
+        assert!(planted.save_new(&path).unwrap());
+
+        let got = KeyFile::load_or_generate(&path, "db-uuid").unwrap();
+        assert_eq!(
+            got.root_key_hex, planted.root_key_hex,
+            "must adopt the existing key rather than generate over it"
+        );
+
+        cleanup_key_path(&path);
+    }
+
     #[cfg(unix)]
     #[test]
     fn save_does_not_narrow_a_directory_it_did_not_create() {
@@ -394,7 +531,7 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = dir.join("audit.key");
 
-        Key::generate("db-uuid").save(&path).unwrap();
+        KeyFile::generate("db-uuid").save(&path).unwrap();
 
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o755, "pre-existing directory must keep its mode");
@@ -413,7 +550,7 @@ mod tests {
         let dir = base.join("keys");
         let path = dir.join("audit.key");
 
-        Key::generate("db-uuid").save(&path).unwrap();
+        KeyFile::generate("db-uuid").save(&path).unwrap();
 
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
