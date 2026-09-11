@@ -18,7 +18,7 @@ jobs:
     name: Validate release version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Match Cargo version to tag
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -59,7 +59,7 @@ jobs:
       TARGET: ${{ matrix.target }}
       ARCHIVE_NAME: auditmcp-${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
