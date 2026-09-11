@@ -322,7 +322,7 @@ run.
 
 ## What state is it in?
 
-Version 0.1.0 is feature-complete for its intended scope: a local,
+The 0.1 release line is feature-complete for its intended scope: a local,
 single-user audit proxy with optional configuration. Phases 1, 2, 3, and
 3.5 are complete. The proposed Phase 4 policy gateway is intentionally
 cancelled; auditmcp records and explains activity but never decides whether
@@ -732,8 +732,8 @@ To publish a release, update the version in `Cargo.toml`, merge it with green
 CI, then create and push a matching annotated tag:
 
 ```bash
-git tag -a v0.1.0 -m "auditmcp v0.1.0"
-git push origin v0.1.0
+git tag -a vX.Y.Z -m "auditmcp vX.Y.Z"
+git push origin vX.Y.Z
 ```
 
 The release workflow rejects a tag that disagrees with `Cargo.toml`, builds
