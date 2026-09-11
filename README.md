@@ -10,7 +10,7 @@ secrets *before* they are ever written to disk. Everything stays on your
 machine: no telemetry, no accounts, no network calls, no cloud dependency.
 
 It is deliberately not an enterprise MCP gateway. There is no Kubernetes, no
-OAuth, no multi-tenancy — it is one binary and one config file.
+OAuth, no multi-tenancy — it is one binary, with configuration optional.
 
 The design contract is **fail-open**: the proxy must never become a blocking
 dependency of the agent it is auditing. If logging fails, the tool call still
@@ -31,20 +31,29 @@ cargo build --release
 
 The binary lands at `target/release/auditmcp` (`auditmcp.exe` on Windows).
 
-Copy the example config and point it at your MCP server:
+For a stdio server, no auditmcp config file is required:
+
+```bash
+auditmcp run -- npx -y @some/mcp-server
+```
+
+Without `--config`, the database, key, and anchor use per-user platform state
+paths. Read commands use that same default automatically:
+
+```bash
+auditmcp query
+auditmcp verify
+```
+
+For custom logging, a reusable target command, or HTTP servers, copy the
+example config. Relative database/key/anchor paths are resolved from the
+config file's directory, not the MCP client's working directory:
 
 ```bash
 cp config.example.toml config.toml
-```
-
-Then run the proxy, the target server command coming either from the config's
-`[target].command` or from trailing args after `--` (trailing args win):
-
-```bash
-# Target from config.toml
 auditmcp run --config config.toml
 
-# Or override it explicitly
+# Trailing arguments override [target].command
 auditmcp run --config config.toml -- python test-fixtures/fake_server.py
 ```
 
@@ -56,8 +65,7 @@ MCP config. A Claude Code `.mcp.json` entry looks like:
   "mcpServers": {
     "my-server": {
       "command": "/absolute/path/to/auditmcp",
-      "args": ["run", "--config", "/absolute/path/to/config.toml",
-               "--", "npx", "-y", "@some/mcp-server"]
+      "args": ["run", "--", "npx", "-y", "@some/mcp-server"]
     }
   }
 }
@@ -164,17 +172,19 @@ server and diffing the two streams, which differ on exactly that one line.
 Then read the log back:
 
 ```bash
-auditmcp query  --config config.toml                    # table of tool calls
-auditmcp query  --config config.toml --verbose          # + what was redacted and why
-auditmcp query  --config config.toml --anomalous        # only rows the Phase 3 rules flagged
-auditmcp query  --config config.toml --include-synthetic # + heartbeat/session-boundary rows
-auditmcp query  --config config.toml --tool delete_file --since 2h --status error
-auditmcp verify --config config.toml                    # walk the hash chain (+ heartbeats, anchor)
-auditmcp export --config config.toml --format jsonl --output audit.jsonl
-auditmcp unmask --config config.toml <sha256> --note "confirmed false positive"
-auditmcp key    fingerprint --config config.toml        # first 16 hex chars of sha256(root_key), safe to share
-auditmcp reset  --config config.toml --yes --keep-old    # archive the chain and start fresh
+auditmcp query                                      # table of tool calls
+auditmcp query --verbose                            # + what was redacted and why
+auditmcp query --anomalous                          # only rows the Phase 3 rules flagged
+auditmcp query --include-synthetic                  # + heartbeat/session-boundary rows
+auditmcp query --tool delete_file --since 2h --status error
+auditmcp verify                                     # walk the hash chain (+ heartbeats, anchor)
+auditmcp export --format jsonl --output audit.jsonl
+auditmcp unmask <sha256> --note "confirmed false positive"
+auditmcp key fingerprint                            # safe 16-character key fingerprint
+auditmcp reset --yes --keep-old                     # archive the chain and start fresh
 ```
+
+Add `--config config.toml` to any command when using a custom configuration.
 
 `--since` takes a duration with a required unit: `45s`, `30m`, `2h`, `1d`.
 
@@ -186,8 +196,8 @@ under load, the redactions index drifting, a pipe error. Set `RUST_LOG` to
 change it:
 
 ```bash
-RUST_LOG=error auditmcp run --config config.toml    # quieter
-RUST_LOG=debug auditmcp run --config config.toml    # louder
+RUST_LOG=error auditmcp run -- npx -y @some/mcp-server    # quieter
+RUST_LOG=debug auditmcp run -- npx -y @some/mcp-server    # louder
 ```
 
 On shutdown, auditmcp stops the target, records any still-in-flight calls
@@ -500,7 +510,7 @@ proves interior integrity but has two gaps: it's **publicly verifiable and
 therefore forgeable** by anyone with database write access, and **tail
 truncation is invisible** to hashing alone (see Known limitations above).
 Phase 3.5 closes both, while staying inside the project's philosophy — local
-first, one binary, one config file, fail-open, no cloud. None of it can ever
+first, one binary, optional config, fail-open, no cloud. None of it can ever
 block a `tools/call`; every new mechanism here is warn-and-continue at
 runtime. Only `auditmcp run`'s startup and `auditmcp verify` are strict.
 
@@ -510,8 +520,8 @@ canonical_json(entry))` for any database created under Phase 3.5 — same
 `chain_key` and a second `anchor_key` are both derived from one root key via
 HKDF-SHA256, salted with the database's own `db_uuid` so the same root key
 never produces the same effective keys across two databases. The root key
-lives at `~/.auditmcp/keys/audit.key` by default (`[chain].key_path`),
-generated automatically the first time `auditmcp run` starts against a
+lives in the platform state directory by default, under a per-database name,
+and is generated automatically the first time `auditmcp run` starts against a
 database that doesn't exist yet, with 0600/0700 permissions on Unix (Windows
 has no POSIX bits; see the caveat under `auditmcp key` below). **There is no
 key rotation** — a deliberate scope cut, not a TODO: rotating would need
@@ -538,16 +548,18 @@ rows are chain-integrity plumbing, not tool-call activity: `query` hides
 them by default (`--include-synthetic` shows them), `export` always
 includes them, and Phase 3's anomaly rules never see them.
 
+**State paths.** Without a config, the database is `audit.db` under the
+platform state directory: `%LOCALAPPDATA%\auditmcp` on Windows,
+`~/Library/Application Support/auditmcp` on macOS, and
+`${XDG_STATE_HOME:-$HOME/.local/state}/auditmcp` on Linux. Default key and
+anchor filenames include a stable identifier derived from the resolved
+database path. Separate databases therefore never share reset-sensitive files
+or one anchor chain. `auditmcp key path` prints the exact key location.
+
 **External anchor.** With `[anchor].enabled = true` (the default), a small
 JSONL file — itself an HMAC chain, keyed by `anchor_key` — is appended to
 every `cadence_secs` (default 300s) outside the database, at a per-platform
-default path unless `[anchor].path` overrides it:
-
-| Platform | Default path |
-|---|---|
-| Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/auditmcp/anchor.log` |
-| macOS | `~/Library/Application Support/auditmcp/anchor.log` |
-| Windows | `%LOCALAPPDATA%\auditmcp\anchor.log` |
+default per-database path unless `[anchor].path` overrides it.
 
 Each line names the chain's current tail (`chain_last_id`, `chain_last_hash`)
 and chains from the previous line's `anchor_hmac`. Writes are serialized
@@ -564,9 +576,9 @@ failure) on a legacy unkeyed chain.
 **`auditmcp key`** — a deliberately small operational surface:
 
 ```bash
-auditmcp key path        --config config.toml   # print the resolved key file path
-auditmcp key fingerprint --config config.toml   # sha256(root_key)[:16] -- safe to share
-auditmcp key backup <dest> --config config.toml # atomic copy, same 0600/0700 perms
+auditmcp key path                         # print the resolved key file path
+auditmcp key fingerprint                  # sha256(root_key)[:16] -- safe to share
+auditmcp key backup <dest>                # atomic copy, same 0600/0700 perms
 ```
 
 No `key generate` (automatic on first run against a new database), no `key
@@ -575,8 +587,8 @@ rotate` (see above), no `key import`.
 **`auditmcp reset`** — the only supported "start fresh" / migration path:
 
 ```bash
-auditmcp reset --config config.toml --yes               # delete DB, key, and anchor; fresh chain
-auditmcp reset --config config.toml --yes --keep-old     # archive them (audit.db.reset-bak-<timestamp>), fresh chain
+auditmcp reset --yes               # delete DB, key, and anchor; fresh chain
+auditmcp reset --yes --keep-old    # archive them (audit.db.reset-bak-<timestamp>), fresh chain
 ```
 
 Refuses to run without `--yes`. `--keep-old` archives with a timestamped
@@ -604,7 +616,7 @@ comments:
 
 ```toml
 [chain]
-key_path = "~/.auditmcp/keys/audit.key"
+# key_path = ""       # empty/omitted = per-database platform default
 
 [heartbeat]
 enabled = true
@@ -613,7 +625,7 @@ cadence_max_secs = 90
 
 [anchor]
 enabled = true
-path = ""          # empty = per-platform default
+path = ""          # empty = per-database platform default
 cadence_secs = 300
 ```
 

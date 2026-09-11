@@ -11,6 +11,7 @@ mod hex;
 mod http;
 mod jsonrpc;
 mod keys;
+mod paths;
 mod proxy;
 mod query;
 mod reset;
@@ -41,9 +42,16 @@ struct Cli {
 /// own CLI.
 #[derive(clap::Args)]
 struct ConfigArg {
-    /// Path to the TOML config file.
+    /// Optional TOML config. Without it, auditmcp uses per-user state paths
+    /// and built-in defaults.
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
+}
+
+impl ConfigArg {
+    fn path(&self) -> &Path {
+        self.config.as_deref().unwrap_or_else(|| Path::new(""))
+    }
 }
 
 #[derive(Subcommand)]
@@ -244,8 +252,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             config_args,
             target,
-        } => proxy::run(&config_args.config, target).await,
-        Command::Serve { config_args } => http::serve(&config_args.config).await,
+        } => proxy::run(config_args.path(), target).await,
+        Command::Serve { config_args } => http::serve(config_args.path()).await,
         Command::Query {
             config_args,
             tool,
@@ -256,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
             verbose,
             include_synthetic,
         } => query::run(
-            &config_args.config,
+            config_args.path(),
             tool,
             session,
             since,
@@ -274,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
             // exit-code policy itself stays testable in `verify::tests`.
             // `Clean` returns normally rather than exiting, keeping the
             // ordinary success path identical to every other subcommand's.
-            let outcome = verify::run(&config_args.config, repair_index, yes)?;
+            let outcome = verify::run(config_args.path(), repair_index, yes)?;
             if outcome != verify::VerifyOutcome::Clean {
                 std::process::exit(outcome.exit_code());
             }
@@ -290,7 +298,7 @@ async fn main() -> anyhow::Result<()> {
             anomalous,
             output,
         } => export::run(
-            &config_args.config,
+            config_args.path(),
             format,
             tool,
             since,
@@ -303,20 +311,20 @@ async fn main() -> anyhow::Result<()> {
             config_args,
             hash,
             note,
-        } => unmask::run(&config_args.config, &hash, &note),
+        } => unmask::run(config_args.path(), &hash, &note),
         Command::Key { action } => match action {
             KeyAction::Path { config_args } => {
-                let cfg = config::Config::load(&config_args.config)?;
+                let cfg = config::Config::load(config_args.path())?;
                 println!("{}", cfg.chain.resolved_key_path()?.display());
                 Ok(())
             }
             KeyAction::Fingerprint { config_args } => {
-                let (_cfg, key) = load_existing_key(&config_args.config)?;
+                let (_cfg, key) = load_existing_key(config_args.path())?;
                 println!("{}", key.fingerprint()?);
                 Ok(())
             }
             KeyAction::Backup { config_args, dest } => {
-                let (_cfg, key) = load_existing_key(&config_args.config)?;
+                let (_cfg, key) = load_existing_key(config_args.path())?;
                 key.backup(&dest)?;
                 println!("Key backed up to {}", dest.display());
                 Ok(())
@@ -326,6 +334,6 @@ async fn main() -> anyhow::Result<()> {
             config_args,
             yes,
             keep_old,
-        } => reset::run(&config_args.config, yes, keep_old),
+        } => reset::run(config_args.path(), yes, keep_old),
     }
 }
