@@ -107,7 +107,11 @@ impl KeyFile {
     }
 
     /// Writes the key file, creating its parent directory if needed.
-    /// Permissions are set to 0600 (file) / 0700 (parent dir) on Unix. On
+    /// Permissions are set to 0600 on the file always, and 0700 on the
+    /// parent directory only when this call created it -- `key_path` is
+    /// user-configurable, so a pre-existing directory here can be `$HOME`
+    /// or a shared project directory, and narrowing one the code did not
+    /// create is not this function's call to make. On
     /// Windows, the file's DACL is rewritten to grant only the current
     /// user access, replacing whatever it inherited -- see
     /// `restrict_to_current_user_windows` for why this can't just be a
@@ -122,16 +126,21 @@ impl KeyFile {
         let parent = path.parent().ok_or_else(|| {
             anyhow::anyhow!("key path {} has no parent directory", path.display())
         })?;
+        // Whether the directory was ours to tighten is only knowable
+        // before `create_dir_all`, which succeeds either way.
+        let parent_existed = parent.exists();
         std::fs::create_dir_all(parent).map_err(|e| {
             anyhow::anyhow!("failed to create key directory {}: {e}", parent.display())
         })?;
 
         #[cfg(unix)]
-        {
+        if !parent_existed {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
                 .map_err(|e| anyhow::anyhow!("failed to set key directory permissions: {e}"))?;
         }
+        #[cfg(not(unix))]
+        let _ = parent_existed;
 
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow::anyhow!("failed to serialize key file: {e}"))?;
@@ -373,6 +382,47 @@ mod tests {
 
     fn temp_key_path(label: &str) -> PathBuf {
         crate::db::test_support::temp_isolated_dir(label).join("audit.key")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_narrow_a_directory_it_did_not_create() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A directory the user already had, group-readable on purpose.
+        let dir = crate::db::test_support::temp_isolated_dir("keys_preexisting_dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("audit.key");
+
+        Key::generate("db-uuid").save(&path).unwrap();
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o755, "pre-existing directory must keep its mode");
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "the key file itself must still be 0600");
+
+        cleanup_key_path(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_tightens_a_directory_it_creates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = crate::db::test_support::temp_isolated_dir("keys_created_dir");
+        let dir = base.join("keys");
+        let path = dir.join("audit.key");
+
+        Key::generate("db-uuid").save(&path).unwrap();
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "a directory we created is ours to restrict"
+        );
+
+        cleanup_key_path(&path);
+        let _ = std::fs::remove_dir(&base);
     }
 
     /// Removes a key file and the isolated directory `temp_key_path`
