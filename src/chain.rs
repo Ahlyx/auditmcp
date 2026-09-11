@@ -120,9 +120,16 @@ pub fn bootstrap(
         ) {
             Ok(mode) => Ok(mode),
             Err(e) => {
-                let _ = std::fs::remove_file(db_path);
-                let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
-                let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+                // Close the connection FIRST. SQLite does not open with
+                // FILE_SHARE_DELETE, so on Windows every one of these
+                // removals fails with a sharing violation while `conn` is
+                // alive -- and the errors are discarded, so the
+                // half-initialized database survived exactly the cleanup
+                // written to prevent it.
+                drop(conn);
+                for path in db::sidecar_paths(db_path) {
+                    let _ = std::fs::remove_file(path);
+                }
                 Err(e)
             }
         }
@@ -372,6 +379,40 @@ mod tests {
         let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
         assert!(err.to_string().contains("chain_metadata"), "{err}");
         remove_db_files(&fx.db_path);
+    }
+
+    /// Genesis failure must leave nothing behind. The cleanup used to run
+    /// with the SQLite connection still open, which on Windows makes every
+    /// `remove_file` fail with a sharing violation -- silently, since the
+    /// results are discarded -- leaving a database that later starts refuse.
+    #[test]
+    fn a_failed_genesis_removes_the_database_it_created() {
+        let fx = Fixture::new("genesis_cleanup");
+        // Force `bootstrap_fresh_chain` to fail after the database file
+        // exists: point key_path at a directory, so writing the key file
+        // cannot succeed.
+        std::fs::create_dir_all(&fx.key_path).unwrap();
+
+        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(
+            !fx.db_path.exists(),
+            "a half-initialized database must not survive a failed genesis"
+        );
+
+        let _ = std::fs::remove_dir(&fx.key_path);
+        remove_db_files(&fx.db_path);
+    }
+
+    #[test]
+    fn sidecar_paths_append_rather_than_replace_the_extension() {
+        let paths = db::sidecar_paths(std::path::Path::new("/tmp/audit.sqlite"));
+        assert!(paths[1].to_string_lossy().ends_with("audit.sqlite-wal"));
+        assert!(paths[2].to_string_lossy().ends_with("audit.sqlite-shm"));
+
+        let bare = db::sidecar_paths(std::path::Path::new("/tmp/auditdb"));
+        assert!(bare[1].to_string_lossy().ends_with("auditdb-wal"));
+        assert!(bare[2].to_string_lossy().ends_with("auditdb-shm"));
     }
 
     #[test]

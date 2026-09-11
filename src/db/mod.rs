@@ -117,6 +117,27 @@ CREATE TABLE IF NOT EXISTS chain_metadata (
 );
 "#;
 
+/// A database file and its two SQLite sidecars, in removal order.
+///
+/// The sidecars are named by APPENDING to the full filename, not by
+/// replacing its extension: SQLite writes `audit.sqlite-wal` beside
+/// `audit.sqlite`. `with_extension("db-wal")` instead produced
+/// `audit.db-wal` -- an unrelated path -- for any `db_path` not ending in
+/// `.db`, and turned an extensionless `auditdb` into `auditdb.db-wal`.
+/// Since `[logging].db_path` is user-configurable, that left the real
+/// sidecars behind next to a freshly recreated database.
+pub fn sidecar_paths(db_path: &Path) -> [std::path::PathBuf; 3] {
+    let mut wal = db_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = db_path.as_os_str().to_os_string();
+    shm.push("-shm");
+    [
+        db_path.to_path_buf(),
+        std::path::PathBuf::from(wal),
+        std::path::PathBuf::from(shm),
+    ]
+}
+
 use serde::Serialize;
 
 /// One row's worth of loggable data, *excluding* `id`, `hash`, and
@@ -479,9 +500,9 @@ pub(crate) mod test_support {
     /// Removes a temp DB and its WAL sidecars. Separate from `cleanup` for
     /// callers that already dropped (or never held) a `Connection`.
     pub(crate) fn remove_db_files(path: &std::path::Path) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("db-wal"));
-        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        for p in super::sidecar_paths(path) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// Inserts `n` entries (each with a distinct tool_name so tests can

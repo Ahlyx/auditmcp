@@ -54,8 +54,7 @@ pub fn run(config_path: &Path, yes: bool, keep_old: bool) -> anyhow::Result<()> 
     // After the checkpoint the sidecars genuinely carry no data that isn't
     // in the main db file, so they're removed rather than archived even
     // under --keep-old; a fresh `bootstrap` below recreates them as needed.
-    for sidecar_ext in ["db-wal", "db-shm"] {
-        let sidecar = db_path.with_extension(sidecar_ext);
+    for sidecar in crate::db::sidecar_paths(&db_path).into_iter().skip(1) {
         let _ = std::fs::remove_file(&sidecar);
     }
 
