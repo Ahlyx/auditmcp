@@ -68,8 +68,12 @@ pub fn run(config_path: &Path, yes: bool, keep_old: bool) -> anyhow::Result<()> 
     crate::chain::bootstrap(
         &db_path,
         &key_path,
-        config.heartbeat.cadence_min_secs,
-        config.heartbeat.cadence_max_secs,
+        crate::chain::GenesisSettings {
+            heartbeat_cadence_min_secs: config.heartbeat.cadence_min_secs,
+            heartbeat_cadence_max_secs: config.heartbeat.cadence_max_secs,
+            heartbeat_enabled: config.heartbeat.enabled,
+            anchor_enabled: config.anchor.enabled,
+        },
     )?;
 
     println!("Reset complete.");
@@ -169,7 +173,12 @@ mod tests {
         }
 
         fn seed(&self) {
-            let mode = crate::chain::bootstrap(&self.db_path, &self.key_path, 30, 90).unwrap();
+            let mode = crate::chain::bootstrap(
+                &self.db_path,
+                &self.key_path,
+                crate::chain::GenesisSettings::default(),
+            )
+            .unwrap();
             let mut conn = crate::db::open_for_write(&self.db_path).unwrap();
             crate::db::insert_row_with_key(
                 &mut conn,

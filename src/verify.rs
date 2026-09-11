@@ -119,7 +119,7 @@ pub fn run(config_path: &Path, repair_index: bool, yes: bool) -> anyhow::Result<
     let anchor_key: Option<[u8; 32]>;
     let key_fingerprint: Option<String>;
     let hash_key = match &metadata {
-        Some(m) if m.hmac_version.as_deref() == Some("1") => {
+        Some(m) if db::is_supported_hmac_version(m.hmac_version.as_deref()) => {
             // Every way of failing to obtain a usable chain key -- missing
             // file, corrupt JSON, wrong-length root key, unresolvable key
             // path -- maps to `Drift`, the code the module contract reserves
@@ -298,7 +298,28 @@ fn finish_clean(
         return Ok(VerifyOutcome::AuditGap);
     }
 
-    if config.heartbeat.enabled {
+    // Genesis intent OR live config, never config alone. Both of these
+    // checks used to be gated purely on the config file -- which anyone who
+    // can edit the database can edit beside it, so flipping
+    // `heartbeat.enabled = false` removed the gap check entirely and
+    // `verify` still reported Clean. A chain created with the check on
+    // keeps it on. The other direction is harmless: turning a check on for
+    // a chain that was created without it is not an attack, so the config
+    // can still enable it.
+    //
+    // `heartbeat_enabled` is `None` on an `hmac_version = "1"` chain, which
+    // predates the recorded intent; those fall back to config-only and keep
+    // the lever until they are reset.
+    let genesis_heartbeat = metadata
+        .as_ref()
+        .and_then(|m| m.heartbeat_enabled)
+        .unwrap_or(false);
+    let genesis_anchor = metadata
+        .as_ref()
+        .and_then(|m| m.anchor_enabled)
+        .unwrap_or(false);
+
+    if config.heartbeat.enabled || genesis_heartbeat {
         let cadence_max = metadata
             .as_ref()
             .and_then(|m| m.heartbeat_cadence_max_secs)
@@ -320,7 +341,7 @@ fn finish_clean(
         }
     }
 
-    if config.anchor.enabled {
+    if config.anchor.enabled || genesis_anchor {
         if let Some(anchor_key) = anchor_key {
             let anchor_path = crate::anchor::resolve_anchor_path(&config.anchor.path)?;
             let entries = crate::anchor::read_entries(&anchor_path)?;
@@ -439,7 +460,12 @@ mod tests {
                 ),
             )
             .unwrap();
-            let mode = crate::chain::bootstrap(&db_path, &key_path, 30, 90).unwrap();
+            let mode = crate::chain::bootstrap(
+                &db_path,
+                &key_path,
+                crate::chain::GenesisSettings::default(),
+            )
+            .unwrap();
             Fixture {
                 db_path,
                 config_path,
@@ -706,7 +732,15 @@ mod tests {
         }
 
         fn bootstrap(&self) -> crate::chain::ChainMode {
-            crate::chain::bootstrap(&self.db_path, &self.key_path, 1, 90).unwrap()
+            crate::chain::bootstrap(
+                &self.db_path,
+                &self.key_path,
+                crate::chain::GenesisSettings {
+                    heartbeat_cadence_min_secs: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
         }
 
         fn run(&self) -> anyhow::Result<VerifyOutcome> {
@@ -831,6 +865,51 @@ mod tests {
         drop(conn);
 
         assert_eq!(fx.run().unwrap(), VerifyOutcome::HeartbeatGap);
+    }
+
+    /// The config lever finding #6 closed: the heartbeat check used to be
+    /// gated purely on `config.heartbeat.enabled`, so anyone able to edit
+    /// the database could edit the config beside it, set `enabled = false`,
+    /// and make a truncation gap invisible while `verify` still exited 0.
+    /// Genesis now records the intent under the metadata HMAC.
+    #[test]
+    fn disabling_heartbeat_in_config_does_not_hide_a_gap() {
+        let fx = HmacFixture::new("hmac_hb_config_lever", 1, false);
+        let mode = fx.bootstrap();
+        {
+            let mut conn = db::open_for_write(&fx.db_path).unwrap();
+            let mut hb1 = crate::heartbeat::heartbeat_entry("s1", "srv", 1, chrono::Utc::now());
+            let mut hb2 = crate::heartbeat::heartbeat_entry("s1", "srv", 2, chrono::Utc::now());
+            hb1.timestamp = "2026-01-01T00:00:00Z".to_string();
+            hb2.timestamp = "2026-01-01T00:05:00Z".to_string();
+            db::insert_row_with_key(&mut conn, &hb1, &mode.hash_key()).unwrap();
+            db::insert_row_with_key(&mut conn, &hb2, &mode.hash_key()).unwrap();
+        }
+
+        // The attacker's edit: turn the check off in the config file.
+        let cfg = std::fs::read_to_string(&fx.config_path).unwrap();
+        std::fs::write(
+            &fx.config_path,
+            cfg.replace(
+                "[heartbeat]
+enabled = true",
+                "[heartbeat]
+enabled = false",
+            ),
+        )
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&fx.config_path)
+                .unwrap()
+                .contains("enabled = false"),
+            "the test's own config edit must have applied, or this proves nothing"
+        );
+
+        assert_eq!(
+            fx.run().unwrap(),
+            VerifyOutcome::HeartbeatGap,
+            "genesis recorded heartbeats as enabled, so the config must not switch the check off"
+        );
     }
 
     #[test]

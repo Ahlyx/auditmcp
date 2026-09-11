@@ -78,20 +78,39 @@ impl ChainMode {
     }
 }
 
+/// Settings a brand-new chain records permanently at genesis.
+///
+/// All four are consulted ONLY when bootstrapping a fresh database; an
+/// existing chain's values come back out of its own `chain_metadata`. They
+/// are covered by the metadata HMAC, which is the point: the live config
+/// is a plain file that anyone able to edit the database can edit too, so
+/// what the chain was created to do has to be remembered by the chain.
+pub struct GenesisSettings {
+    pub heartbeat_cadence_min_secs: u64,
+    pub heartbeat_cadence_max_secs: u64,
+    pub heartbeat_enabled: bool,
+    pub anchor_enabled: bool,
+}
+
+impl Default for GenesisSettings {
+    fn default() -> Self {
+        Self {
+            heartbeat_cadence_min_secs: 30,
+            heartbeat_cadence_max_secs: 90,
+            heartbeat_enabled: true,
+            anchor_enabled: true,
+        }
+    }
+}
+
 /// Resolves a database's `ChainMode`, generating a root key and/or genesis
 /// `chain_metadata` if this is truly a brand-new database. Must be called
 /// before `db::spawn_writer_with_key` so the writer thread inserts under
 /// the correct scheme from row 1.
-///
-/// `heartbeat_cadence_{min,max}_secs` are only consulted for a brand-new
-/// chain (they become that chain's permanent, genesis-fixed range); an
-/// existing chain's range comes back out of its own `chain_metadata`
-/// instead, via `ChainMode::Hmac`.
 pub fn bootstrap(
     db_path: &Path,
     key_path: &Path,
-    default_heartbeat_cadence_min_secs: u64,
-    default_heartbeat_cadence_max_secs: u64,
+    genesis: GenesisSettings,
 ) -> anyhow::Result<ChainMode> {
     // Checked BEFORE opening: opening (via `db::open_for_write`) creates
     // the file and schema if absent, which would make "did the file exist
@@ -110,12 +129,7 @@ pub fn bootstrap(
         // Genesis failure is handled by `recover_or_clean_up`, which
         // decides whether the database is actually ours to remove -- see
         // its doc for the concurrent-start case where it is not.
-        match bootstrap_fresh_chain(
-            &mut conn,
-            key_path,
-            default_heartbeat_cadence_min_secs,
-            default_heartbeat_cadence_max_secs,
-        ) {
+        match bootstrap_fresh_chain(&mut conn, key_path, &genesis) {
             Ok(mode) => Ok(mode),
             Err(e) => recover_or_clean_up(conn, e, key_path, db_path),
         }
@@ -173,8 +187,7 @@ fn recover_or_clean_up(
 fn bootstrap_fresh_chain(
     conn: &mut rusqlite::Connection,
     key_path: &Path,
-    heartbeat_cadence_min_secs: u64,
-    heartbeat_cadence_max_secs: u64,
+    genesis: &GenesisSettings,
 ) -> anyhow::Result<ChainMode> {
     let db_uuid = uuid::Uuid::new_v4().to_string();
     let key = KeyFile::load_or_generate(key_path, &db_uuid)?;
@@ -183,14 +196,16 @@ fn bootstrap_fresh_chain(
         conn,
         &chain_key,
         &db_uuid,
-        heartbeat_cadence_min_secs,
-        heartbeat_cadence_max_secs,
+        genesis.heartbeat_cadence_min_secs,
+        genesis.heartbeat_cadence_max_secs,
+        genesis.heartbeat_enabled,
+        genesis.anchor_enabled,
     )?;
     Ok(ChainMode::Hmac {
         chain_key,
         anchor_key,
-        heartbeat_cadence_min_secs,
-        heartbeat_cadence_max_secs,
+        heartbeat_cadence_min_secs: genesis.heartbeat_cadence_min_secs,
+        heartbeat_cadence_max_secs: genesis.heartbeat_cadence_max_secs,
     })
 }
 
@@ -201,7 +216,7 @@ fn classify_existing_chain(
 ) -> anyhow::Result<ChainMode> {
     let metadata = db::read_chain_metadata(conn)?;
     match metadata {
-        Some(m) if m.hmac_version.as_deref() == Some("1") => {
+        Some(m) if db::is_supported_hmac_version(m.hmac_version.as_deref()) => {
             let key = KeyFile::load(key_path)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "this database is HMAC-protected (Phase 3.5) but its chain key is \
@@ -327,7 +342,7 @@ mod tests {
         assert!(!fx.db_path.exists());
         assert!(!fx.key_path.exists());
 
-        let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+        let mode = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
         assert!(fx.key_path.exists(), "a key file must be generated");
         match mode {
             ChainMode::Hmac {
@@ -342,14 +357,16 @@ mod tests {
 
         let conn = db::open_readonly(&fx.db_path).unwrap();
         let meta = db::read_chain_metadata(&conn).unwrap().unwrap();
-        assert_eq!(meta.hmac_version.as_deref(), Some("1"));
+        assert_eq!(meta.hmac_version.as_deref(), Some("2"));
+        assert_eq!(meta.heartbeat_enabled, Some(true));
+        assert_eq!(meta.anchor_enabled, Some(true));
     }
 
     #[test]
     fn reopening_an_hmac_chain_with_the_same_key_succeeds() {
         let fx = Fixture::new("reopen");
         {
-            let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+            let mode = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
             let mut conn = db::open_for_write(&fx.db_path).unwrap();
             db::insert_row_with_key(
                 &mut conn,
@@ -359,7 +376,7 @@ mod tests {
             .unwrap();
         }
 
-        let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+        let mode = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
         assert!(matches!(mode, ChainMode::Hmac { .. }));
     }
 
@@ -372,7 +389,7 @@ mod tests {
     fn deleting_a_cadence_row_is_caught_by_the_metadata_hmac() {
         for key in ["heartbeat_cadence_max_secs", "heartbeat_cadence_min_secs"] {
             let fx = Fixture::new(&format!("cadence_del_{key}"));
-            bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+            bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
 
             {
                 let conn = db::open_for_write(&fx.db_path).unwrap();
@@ -380,7 +397,7 @@ mod tests {
                     .unwrap();
             }
 
-            let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+            let err = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap_err();
             assert!(
                 err.to_string().contains("chain_metadata"),
                 "deleting {key} must be refused, got: {err}"
@@ -395,7 +412,7 @@ mod tests {
     #[test]
     fn an_unparseable_cadence_row_is_caught_by_the_metadata_hmac() {
         let fx = Fixture::new("cadence_garbage");
-        bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+        bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
 
         {
             let conn = db::open_for_write(&fx.db_path).unwrap();
@@ -406,7 +423,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        let err = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap_err();
         assert!(err.to_string().contains("chain_metadata"), "{err}");
         remove_db_files(&fx.db_path);
     }
@@ -423,7 +440,7 @@ mod tests {
         // cannot succeed.
         std::fs::create_dir_all(&fx.key_path).unwrap();
 
-        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        let err = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap_err();
         assert!(!err.to_string().is_empty());
         assert!(
             !fx.db_path.exists(),
@@ -441,7 +458,7 @@ mod tests {
     fn a_genesis_race_loser_adopts_the_winners_chain_instead_of_deleting_it() {
         let fx = Fixture::new("genesis_race");
         // Stand in for the winner: a fully bootstrapped chain.
-        bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+        bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
         let rows_before = {
             let mut conn = db::open_for_write(&fx.db_path).unwrap();
             let mode = classify_existing_chain(&conn, &fx.key_path, &fx.db_path).unwrap();
@@ -514,7 +531,7 @@ mod tests {
     fn existing_hmac_db_with_missing_key_refuses_to_start() {
         let fx = Fixture::new("missing_key");
         {
-            let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+            let mode = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
             let mut conn = db::open_for_write(&fx.db_path).unwrap();
             db::insert_row_with_key(
                 &mut conn,
@@ -525,7 +542,7 @@ mod tests {
         }
         std::fs::remove_file(&fx.key_path).unwrap();
 
-        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        let err = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap_err();
         assert!(err.to_string().contains("chain key is"), "{err}");
     }
 
@@ -540,7 +557,7 @@ mod tests {
     fn tampered_chain_metadata_refuses_to_start_even_though_tool_calls_is_untouched() {
         let fx = Fixture::new("tampered_metadata");
         {
-            let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+            let mode = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
             let mut conn = db::open_for_write(&fx.db_path).unwrap();
             db::insert_row_with_key(
                 &mut conn,
@@ -561,7 +578,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        let err = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("chain_metadata failed HMAC verification"),
@@ -573,7 +590,7 @@ mod tests {
     fn existing_hmac_db_with_wrong_key_refuses_to_start() {
         let fx = Fixture::new("wrong_key");
         {
-            let mode = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+            let mode = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
             let mut conn = db::open_for_write(&fx.db_path).unwrap();
             db::insert_row_with_key(
                 &mut conn,
@@ -587,7 +604,7 @@ mod tests {
         let bogus = crate::keys::KeyFile::generate("irrelevant");
         bogus.save(&fx.key_path).unwrap();
 
-        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        let err = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap_err();
         assert!(err.to_string().contains("HMAC verification"), "{err}");
     }
 
@@ -604,7 +621,7 @@ mod tests {
         }
         assert!(!fx.key_path.exists());
 
-        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        let err = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap_err();
         assert!(
             err.to_string().contains("no usable chain_metadata"),
             "{err}"
@@ -620,10 +637,56 @@ mod tests {
     /// whose single `hmac_version` row is deleted used to fall through to
     /// `ChainMode::Legacy` and append unkeyed rows, because the
     /// metadata-HMAC guard only runs inside the `hmac_version == "1"` arm.
+    /// A version-1 chain (0.1.0 / 0.1.1) must keep verifying and running:
+    /// its `metadata_hmac` covers fewer fields, and recomputing it with the
+    /// version-2 additions would read as tamper on every existing database.
+    #[test]
+    fn a_version_1_chain_still_bootstraps() {
+        let fx = Fixture::new("v1_compat");
+        bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
+
+        // Rewrite this chain as a v1 one: drop the v2-only rows and
+        // recompute the MAC the way 0.1.1 would have.
+        {
+            let conn = db::open_for_write(&fx.db_path).unwrap();
+            let key = KeyFile::load(&fx.key_path).unwrap().unwrap();
+            let uuid: String = conn
+                .query_row(
+                    "SELECT value FROM chain_metadata WHERE key = 'db_uuid'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let (chain_key, _) = key.derive_subkeys(&uuid).unwrap();
+            let v1_mac = db::test_support::v1_metadata_hmac(&chain_key, &uuid, "30", "90");
+            conn.execute(
+                "DELETE FROM chain_metadata WHERE key IN ('heartbeat_enabled', 'anchor_enabled')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE chain_metadata SET value = '1' WHERE key = 'hmac_version'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE chain_metadata SET value = ?1 WHERE key = 'metadata_hmac'",
+                [v1_mac],
+            )
+            .unwrap();
+        }
+
+        let mode = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default())
+            .expect("a v1 chain must still be usable");
+        assert!(matches!(mode, ChainMode::Hmac { .. }));
+        remove_db_files(&fx.db_path);
+        let _ = std::fs::remove_file(&fx.key_path);
+    }
+
     #[test]
     fn deleting_hmac_version_does_not_downgrade_to_legacy() {
         let fx = Fixture::new("drop_hmac_version");
-        bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+        bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
 
         {
             let conn = db::open_for_write(&fx.db_path).unwrap();
@@ -631,7 +694,7 @@ mod tests {
                 .unwrap();
         }
 
-        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        let err = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap_err();
         assert!(
             err.to_string().contains("no usable chain_metadata"),
             "{err}"

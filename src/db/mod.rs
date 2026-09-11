@@ -27,12 +27,13 @@ pub use chain_hash::compute_hash;
 #[cfg(test)]
 pub use chain_hash::verify_chain;
 #[allow(unused_imports)]
-pub(crate) use chain_hash::{last_hash, HashKey};
-#[allow(unused_imports)]
 pub use chain_hash::{
-    read_chain_metadata, verify_chain_metadata_hmac, verify_chain_with_key,
-    write_chain_metadata_genesis, ChainIssue, ChainMetadata, GENESIS_PREV_HASH,
+    is_supported_hmac_version, read_chain_metadata, verify_chain_metadata_hmac,
+    verify_chain_with_key, write_chain_metadata_genesis, ChainIssue, ChainMetadata,
+    GENESIS_PREV_HASH,
 };
+#[allow(unused_imports)]
+pub(crate) use chain_hash::{last_hash, HashKey};
 
 #[allow(unused_imports)]
 pub use redaction_repair::{
@@ -499,6 +500,8 @@ pub(crate) mod test_support {
 
     /// Removes a temp DB and its WAL sidecars. Separate from `cleanup` for
     /// callers that already dropped (or never held) a `Connection`.
+    pub(crate) use super::chain_hash::v1_metadata_hmac;
+
     pub(crate) fn remove_db_files(path: &std::path::Path) {
         for p in super::sidecar_paths(path) {
             let _ = std::fs::remove_file(p);

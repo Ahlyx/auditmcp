@@ -672,6 +672,16 @@ with HMAC, heartbeats, and the anchor all enabled. The archived file is
 untouched, so a genuine pre-3.5 chain can still be read with any SQLite
 client and verified with auditmcp 0.1.1 if you need its original checks.
 
+**Genesis-recorded intent (0.1.2).** Whether heartbeats and the anchor were
+enabled is written into `chain_metadata` at genesis and covered by the
+metadata HMAC, alongside the cadence range. `verify` runs a check if
+*either* the live config or the chain's genesis says it was on. The config
+can still turn a check on, never off: config is a plain file, and anyone
+able to edit the database can edit it too, so `enabled = false` used to
+remove the check entirely while `verify` still reported clean. Chains
+created by 0.1.0/0.1.1 (`hmac_version = "1"`) predate these rows, keep
+verifying unchanged, and keep the config-only behavior until reset.
+
 **Config additions**, all optional and default on — see
 [`config.example.toml`](config.example.toml) for the full block with
 comments:

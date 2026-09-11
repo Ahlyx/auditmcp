@@ -60,8 +60,12 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     let chain_mode = crate::chain::bootstrap(
         db_path,
         &key_path,
-        config.heartbeat.cadence_min_secs,
-        config.heartbeat.cadence_max_secs,
+        crate::chain::GenesisSettings {
+            heartbeat_cadence_min_secs: config.heartbeat.cadence_min_secs,
+            heartbeat_cadence_max_secs: config.heartbeat.cadence_max_secs,
+            heartbeat_enabled: config.heartbeat.enabled,
+            anchor_enabled: config.anchor.enabled,
+        },
     )?;
 
     // Same refuse-to-start conditions as `run`: an audit tool that cannot
