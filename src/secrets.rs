@@ -70,6 +70,19 @@ impl PatternSet {
         for p in file.pattern {
             let regex = Regex::new(&p.regex)
                 .map_err(|e| anyhow::anyhow!("pattern '{}' has invalid regex: {e}", p.name))?;
+            // `passes_entropy_gate` returns early on
+            // `!requires_entropy_check` and never consults the hints, so
+            // this combination is a pattern that fires on every match
+            // everywhere while reading as if it were key-name-scoped.
+            // Rejecting is better than silently dropping the hints: the
+            // failure mode is over-firing on a loose regex, which is
+            // exactly what the hints were written to prevent.
+            if !p.requires_entropy_check && !p.key_name_hints.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "pattern '{}' sets key_name_hints but not requires_entropy_check.                      Hints are only consulted during the entropy gate, so as written                      they would be ignored and the pattern would fire on every match,                      regardless of key name. Set requires_entropy_check = true, or                      drop the hints.",
+                    p.name
+                ));
+            }
             patterns.push(Pattern {
                 name: p.name,
                 severity: p.severity,
@@ -615,6 +628,49 @@ mod tests {
         assert!(hits.iter().any(|h| h.pattern_name == "github_token"));
         assert!(!redacted.contains("ghp_123456789012345678901234567890123456"));
         assert!(redacted.contains("[REDACTED:github_token]"));
+    }
+
+    #[test]
+    fn hints_without_entropy_check_are_rejected() {
+        let raw = r#"
+[[pattern]]
+name = "loose_with_hints"
+regex = "[A-Za-z0-9]{8,}"
+severity = "high"
+requires_entropy_check = false
+key_name_hints = ["token"]
+"#;
+        let msg = match PatternSet::from_str(raw) {
+            Ok(_) => panic!("hints without requires_entropy_check must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("loose_with_hints"), "got: {msg}");
+        assert!(msg.contains("requires_entropy_check"), "got: {msg}");
+    }
+
+    #[test]
+    fn hints_with_entropy_check_are_accepted() {
+        let raw = r#"
+[[pattern]]
+name = "scoped"
+regex = "[A-Za-z0-9]{8,}"
+severity = "high"
+requires_entropy_check = true
+key_name_hints = ["token"]
+"#;
+        assert!(PatternSet::from_str(raw).is_ok());
+    }
+
+    #[test]
+    fn no_hints_without_entropy_check_is_fine() {
+        let raw = r#"
+[[pattern]]
+name = "exact_format"
+regex = "AKIA[0-9A-Z]{16}"
+severity = "high"
+requires_entropy_check = false
+"#;
+        assert!(PatternSet::from_str(raw).is_ok());
     }
 
     #[test]
