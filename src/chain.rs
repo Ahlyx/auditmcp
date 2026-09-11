@@ -321,6 +321,54 @@ mod tests {
         assert!(matches!(mode, ChainMode::Hmac { .. }));
     }
 
+    /// Deleting a cadence row must not pass the metadata HMAC. It used to:
+    /// verification recomputed over `unwrap_or(30)`/`unwrap_or(90)`, which
+    /// on a default install reproduces the genesis MAC exactly, after which
+    /// `verify` fell back to the config file's cadence -- the retroactive
+    /// widening the genesis-fixed cadence exists to prevent.
+    #[test]
+    fn deleting_a_cadence_row_is_caught_by_the_metadata_hmac() {
+        for key in ["heartbeat_cadence_max_secs", "heartbeat_cadence_min_secs"] {
+            let fx = Fixture::new(&format!("cadence_del_{key}"));
+            bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+
+            {
+                let conn = db::open_for_write(&fx.db_path).unwrap();
+                conn.execute("DELETE FROM chain_metadata WHERE key = ?1", [key])
+                    .unwrap();
+            }
+
+            let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+            assert!(
+                err.to_string().contains("chain_metadata"),
+                "deleting {key} must be refused, got: {err}"
+            );
+            remove_db_files(&fx.db_path);
+        }
+    }
+
+    /// Same lever, using a value the parser rejects rather than a deletion:
+    /// `read_chain_metadata` maps an unparseable cadence to `None`, which
+    /// defaulted the same way.
+    #[test]
+    fn an_unparseable_cadence_row_is_caught_by_the_metadata_hmac() {
+        let fx = Fixture::new("cadence_garbage");
+        bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap();
+
+        {
+            let conn = db::open_for_write(&fx.db_path).unwrap();
+            conn.execute(
+                "UPDATE chain_metadata SET value = 'x' WHERE key = 'heartbeat_cadence_max_secs'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let err = bootstrap(&fx.db_path, &fx.key_path, 30, 90).unwrap_err();
+        assert!(err.to_string().contains("chain_metadata"), "{err}");
+        remove_db_files(&fx.db_path);
+    }
+
     #[test]
     fn existing_hmac_db_with_missing_key_refuses_to_start() {
         let fx = Fixture::new("missing_key");

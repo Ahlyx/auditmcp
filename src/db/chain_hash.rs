@@ -151,12 +151,22 @@ const CURRENT_HMAC_VERSION: &str = "1";
 /// are `\0`-separated for the same reason `anchor.rs`'s `canonical_bytes`
 /// is: these are scalar values, not a struct being canonically serialized,
 /// so ambiguity has to be ruled out by hand.
+///
+/// Takes the cadences as the raw strings stored in the table, not parsed
+/// integers: verification must MAC the bytes actually on disk. Recomputing
+/// over a parsed-and-defaulted value meant a deleted or unparseable cadence
+/// row read back as the default, reproduced the genesis MAC on any default
+/// install, and passed -- after which `verify` fell back to the config
+/// file's cadence, which is exactly the retroactive widening this MAC
+/// exists to prevent. Genesis stores `u64::to_string()`, so MACing the
+/// stored string is byte-identical for an untampered chain and existing
+/// `metadata_hmac` values stay valid.
 fn compute_metadata_hmac(
     chain_key: &[u8; 32],
     db_uuid: &str,
     hmac_version: &str,
-    heartbeat_cadence_min_secs: u64,
-    heartbeat_cadence_max_secs: u64,
+    heartbeat_cadence_min_secs: &str,
+    heartbeat_cadence_max_secs: &str,
 ) -> anyhow::Result<String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(chain_key)
         .map_err(|e| anyhow::anyhow!("failed to initialize metadata HMAC: {e}"))?;
@@ -164,9 +174,9 @@ fn compute_metadata_hmac(
     mac.update(&[0]);
     mac.update(hmac_version.as_bytes());
     mac.update(&[0]);
-    mac.update(heartbeat_cadence_min_secs.to_string().as_bytes());
+    mac.update(heartbeat_cadence_min_secs.as_bytes());
     mac.update(&[0]);
-    mac.update(heartbeat_cadence_max_secs.to_string().as_bytes());
+    mac.update(heartbeat_cadence_max_secs.as_bytes());
     Ok(hex_encode(&mac.finalize().into_bytes()))
 }
 
@@ -186,13 +196,25 @@ pub fn verify_chain_metadata_hmac(
     let Some(stored) = chain_metadata_get(conn, "metadata_hmac")? else {
         return Ok(false);
     };
-    let hmac_version = metadata.hmac_version.as_deref().unwrap_or_default();
+    // Read the covered fields straight from the table rather than from the
+    // parsed `metadata`. A missing row is tamper, not a default: the whole
+    // point of MACing the cadence is that it cannot be removed or rewritten
+    // after genesis.
+    let (Some(min_raw), Some(max_raw)) = (
+        chain_metadata_get(conn, "heartbeat_cadence_min_secs")?,
+        chain_metadata_get(conn, "heartbeat_cadence_max_secs")?,
+    ) else {
+        return Ok(false);
+    };
+    let Some(hmac_version) = chain_metadata_get(conn, "hmac_version")? else {
+        return Ok(false);
+    };
     let expected = compute_metadata_hmac(
         chain_key,
         &metadata.db_uuid,
-        hmac_version,
-        metadata.heartbeat_cadence_min_secs.unwrap_or(30),
-        metadata.heartbeat_cadence_max_secs.unwrap_or(90),
+        &hmac_version,
+        &min_raw,
+        &max_raw,
     )?;
     Ok(expected == stored)
 }
@@ -220,24 +242,20 @@ pub fn write_chain_metadata_genesis(
     heartbeat_cadence_max_secs: u64,
 ) -> anyhow::Result<()> {
     let created_at = chrono::Utc::now().to_rfc3339();
+    let min_secs = heartbeat_cadence_min_secs.to_string();
+    let max_secs = heartbeat_cadence_max_secs.to_string();
     let metadata_hmac = compute_metadata_hmac(
         chain_key,
         db_uuid,
         CURRENT_HMAC_VERSION,
-        heartbeat_cadence_min_secs,
-        heartbeat_cadence_max_secs,
+        &min_secs,
+        &max_secs,
     )?;
     let entries: [(&str, String); 6] = [
         ("db_uuid", db_uuid.to_string()),
         ("hmac_version", CURRENT_HMAC_VERSION.to_string()),
-        (
-            "heartbeat_cadence_min_secs",
-            heartbeat_cadence_min_secs.to_string(),
-        ),
-        (
-            "heartbeat_cadence_max_secs",
-            heartbeat_cadence_max_secs.to_string(),
-        ),
+        ("heartbeat_cadence_min_secs", min_secs),
+        ("heartbeat_cadence_max_secs", max_secs),
         ("created_at", created_at),
         ("metadata_hmac", metadata_hmac),
     ];
