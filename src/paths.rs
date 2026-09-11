@@ -72,11 +72,9 @@ pub fn resolve_config_path(raw: &str, config_dir: &Path) -> anyhow::Result<PathB
 
 fn database_path_id(db_path: &Path) -> anyhow::Result<String> {
     let absolute = std::path::absolute(db_path)?;
-    let mut identity = absolute.to_string_lossy().into_owned();
+    let identity = absolute.to_string_lossy().into_owned();
     #[cfg(windows)]
-    {
-        identity.make_ascii_lowercase();
-    }
+    let identity = identity.to_ascii_lowercase();
     let digest = Sha256::digest(identity.as_bytes());
     Ok(crate::hex::hex_encode(&digest)[..16].to_string())
 }
