@@ -233,6 +233,26 @@ fn rows(db: &Path) -> Vec<(String, String, String)> {
         .collect()
 }
 
+fn payload_rows(
+    db: &Path,
+    tool_name: &str,
+) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT args_json, result_json, anomaly_reasons
+             FROM tool_calls WHERE tool_name = ?1 ORDER BY id",
+        )
+        .unwrap();
+    statement
+        .query_map([tool_name], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 async fn assert_verify(config: &Path) {
     let output = Command::new(BINARY)
         .arg("verify")
@@ -310,6 +330,80 @@ async fn client_eof_drains_pending_calls_before_one_clean_end() {
             .enumerate()
             .all(|(index, row)| row.0 != "__heartbeat" || index < end_index),
         "no heartbeat may appear after session end"
+    );
+    assert_verify(&harness.config).await;
+}
+
+#[tokio::test]
+async fn real_stdio_response_permit_scores_repeats_and_emits_valid_minimal_json() {
+    let harness = make_harness("response-permit-anomaly-json");
+    let mut running = spawn_proxy(&harness, None, false).await;
+    wait_for_row(&harness.db, "__session_start", Duration::from_secs(5)).await;
+
+    // A large Unicode argument and response force the minimal-tier JSON
+    // preview envelope. Reusing the exact arguments with distinct JSON-RPC
+    // ids should flag the fifth completed response as a retry loop. This
+    // exercises anomaly attachment while ResponsePermit fences shutdown.
+    let text = "MCP payload 🧭 café ".repeat(40);
+    let mut requests = String::new();
+    for id in 1..=5 {
+        requests.push_str(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": "echo", "arguments": { "text": text } }
+            })
+            .to_string(),
+        );
+        requests.push('\n');
+    }
+    running
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(requests.as_bytes())
+        .await
+        .unwrap();
+    drop(running.stdin.take());
+
+    let output = tokio::time::timeout(Duration::from_secs(8), running.child.wait_with_output())
+        .await
+        .expect("proxy did not finish after client EOF")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "proxy stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let echoes = payload_rows(&harness.db, "echo");
+    assert_eq!(echoes.len(), 5, "all completed responses must be logged");
+    for (args_json, result_json, _) in &echoes {
+        let args: serde_json::Value = serde_json::from_str(args_json.as_deref().unwrap())
+            .expect("real stdio args_json must parse");
+        let result: serde_json::Value = serde_json::from_str(result_json.as_deref().unwrap())
+            .expect("real stdio result_json must parse");
+        assert_eq!(args["__auditmcp_truncated"], true);
+        assert_eq!(result["__auditmcp_truncated"], true);
+    }
+    assert!(echoes[..4].iter().all(|row| row.2.is_none()));
+    let reasons: Vec<serde_json::Value> = serde_json::from_str(
+        echoes[4]
+            .2
+            .as_deref()
+            .expect("fifth identical call should carry anomaly reasons"),
+    )
+    .unwrap();
+    assert!(reasons
+        .iter()
+        .any(|reason| reason["rule"] == "rapid_repeats"));
+    assert_eq!(
+        rows(&harness.db)
+            .iter()
+            .filter(|row| row.0 == "__session_end")
+            .count(),
+        1
     );
     assert_verify(&harness.config).await;
 }

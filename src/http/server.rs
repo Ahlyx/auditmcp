@@ -668,7 +668,7 @@ pub(crate) fn log_entry(
     outcome: CallOutcome,
 ) {
     let tier = listener.config.tier_for_tool(&call.tool_name);
-    let (mut entry, dest) = audit::build_entry(
+    let (mut entry, dest, args_fingerprint) = audit::build_entry(
         call,
         outcome,
         session.id(),
@@ -677,7 +677,7 @@ pub(crate) fn log_entry(
         &listener.patterns,
         &listener.allowlist,
     );
-    session.attach_anomaly(&mut entry, dest.as_ref(), Instant::now());
+    session.attach_anomaly(&mut entry, dest.as_ref(), args_fingerprint, Instant::now());
     listener.db.log(entry);
 }
 

@@ -1243,7 +1243,7 @@ mod tests {
             started: std::time::Instant::now(),
         };
         let patterns = crate::secrets::PatternSet::bundled().unwrap();
-        let (entry, _dest) = crate::audit::build_entry(
+        let (entry, _dest, _fingerprint) = crate::audit::build_entry(
             call,
             crate::audit::CallOutcome::from_rpc(&msg, line.len() as i64),
             "sess-test",

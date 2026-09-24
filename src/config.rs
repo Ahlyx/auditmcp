@@ -109,12 +109,11 @@ pub struct TargetConfig {
     /// rely entirely on trailing args.
     #[serde(default)]
     pub command: Vec<String>,
-    /// Logged into every row's `server_name` column. Optional; falls back
-    /// to the target command's program name. Setting it explicitly matters
-    /// most when several servers share one db_path: most MCP servers launch
-    /// via the same interpreter (`npx`, `python`, `node`, ...), so the
-    /// program-name fallback would make rows from different servers
-    /// indistinguishable in a shared DB.
+    /// Logged into every stdio row's `server_name` column. Optional; falls
+    /// back to the target executable/program basename (case-folded on
+    /// Windows only). Setting
+    /// it explicitly matters when different servers share one db_path and
+    /// launch through the same interpreter or package shim.
     pub server_name: Option<String>,
 }
 
@@ -364,15 +363,26 @@ impl Config {
         ))
     }
 
-    /// The name logged into every row's `server_name` column: the config's
-    /// `[target].server_name` if set, else the target command's program
-    /// name — the pre-Phase-2 behavior, which configs written before the
-    /// field existed must keep getting unchanged.
+    /// The name logged into stdio rows: the config's explicit
+    /// `[target].server_name` if set, else the executable/program basename.
+    /// Path separators are normalized on every platform; basename case is
+    /// normalized only on Windows, where executable identity is
+    /// case-insensitive.
     pub fn server_name_for(&self, program: &str) -> String {
-        self.target
-            .server_name
-            .clone()
-            .unwrap_or_else(|| program.to_string())
+        self.target.server_name.clone().unwrap_or_else(|| {
+            let basename = program
+                .rsplit(['/', '\\'])
+                .find(|part| !part.is_empty())
+                .unwrap_or(program);
+            #[cfg(windows)]
+            {
+                basename.to_lowercase()
+            }
+            #[cfg(not(windows))]
+            {
+                basename.to_string()
+            }
+        })
     }
 }
 
@@ -436,13 +446,44 @@ db_path = "./test.db"
 
     /// Backward compatibility: a config written before `server_name`
     /// existed (the field absent entirely) must still parse, and must fall
-    /// back to the old behavior — server_name = the target command's
-    /// program name.
+    /// back to a platform-appropriate program basename.
     #[test]
     fn config_without_server_name_falls_back_to_program_name() {
         let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
         assert_eq!(config.target.server_name, None);
         assert_eq!(config.server_name_for("python"), "python");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_spellings_and_bare_executable_share_a_logical_name() {
+        let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        let backslash = config.server_name_for(r"C:\Users\Alice\Tools\Ghidra-MCP.EXE");
+        let forwardslash = config.server_name_for("c:/users/alice/tools/ghidra-mcp.exe");
+        let basename = config.server_name_for("ghidra-mcp.exe");
+        assert_eq!(backslash, "ghidra-mcp.exe");
+        assert_eq!(backslash, forwardslash);
+        assert_eq!(backslash, basename);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn case_sensitive_platforms_preserve_executable_basename_case() {
+        let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        let upper = config.server_name_for("/usr/local/bin/Ghidra-MCP");
+        let lower = config.server_name_for("/usr/local/bin/ghidra-mcp");
+        assert_eq!(upper, "Ghidra-MCP");
+        assert_eq!(lower, "ghidra-mcp");
+        assert_ne!(upper, lower);
+    }
+
+    #[test]
+    fn default_identity_comes_from_the_original_npx_program_not_cmd_wrapper() {
+        let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        // `run` computes identity before `maybe_wrap_windows_shim` turns
+        // this target into `cmd /c <npx.cmd> ...` on Windows.
+        assert_eq!(config.server_name_for("npx"), "npx");
+        assert_ne!(config.server_name_for("cmd"), "npx");
     }
 
     fn servers_toml(body: &str) -> Result<Config, String> {
@@ -668,12 +709,15 @@ db_path = "./test.db"
         let raw = r#"
 [target]
 command = ["python", "server.py"]
-server_name = "vault_reader"
+server_name = "Vault_Reader"
 
 [logging]
 db_path = "./test.db"
 "#;
         let config: Config = toml::from_str(raw).unwrap();
-        assert_eq!(config.server_name_for("python"), "vault_reader");
+        assert_eq!(
+            config.server_name_for(r"C:\path\python.EXE"),
+            "Vault_Reader"
+        );
     }
 }
