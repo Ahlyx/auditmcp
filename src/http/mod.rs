@@ -423,8 +423,161 @@ mod tests {
         assert_eq!(datas(p.feed(b"data: a\ndata: b\n\n")), ["a\nb"]);
     }
 
+    /// The client must receive every byte the upstream sent, oversized
+    /// events included. The parse cap is a limit on what is audited, never
+    /// on what is forwarded: this used to `buf.clear()` and skip the next
+    /// event, so a >1 MiB response was deleted from the stream and the
+    /// caller hung waiting for a reply the upstream had already sent.
+    #[test]
+    fn an_oversized_event_is_still_forwarded_byte_for_byte() {
+        let mut p = SseParser::default();
+        // Comfortably over the cap so the overflow fires at a chunk
+        // boundary, mid-event, rather than the event completing first.
+        let huge = "x".repeat(MAX_SSE_EVENT_BYTES + 20_000);
+        let wire = format!(
+            "data: {huge}
+
+data: after
+
+"
+        );
+
+        let mut forwarded: Vec<u8> = Vec::new();
+        for chunk in wire.as_bytes().chunks(8192) {
+            for ev in p.feed(chunk) {
+                forwarded.extend_from_slice(&ev.raw);
+            }
+        }
+        forwarded.extend_from_slice(&p.take_remainder());
+
+        assert_eq!(
+            forwarded.len(),
+            wire.len(),
+            "forwarded byte count must match the wire exactly"
+        );
+        assert_eq!(forwarded, wire.as_bytes(), "and match byte for byte");
+    }
+
+    /// The other half of the trade: the oversized event is not audited,
+    /// and parsing resumes cleanly on the one after it.
+    #[test]
+    fn an_oversized_event_is_not_audited_but_the_next_one_is() {
+        let mut p = SseParser::default();
+        let huge = "x".repeat(MAX_SSE_EVENT_BYTES + 20_000);
+        let wire = format!(
+            "data: {huge}
+
+data: small
+
+"
+        );
+
+        let mut audited: Vec<String> = Vec::new();
+        for chunk in wire.as_bytes().chunks(8192) {
+            audited.extend(datas(p.feed(chunk)));
+        }
+
+        assert_eq!(
+            audited,
+            ["small"],
+            "the oversized event must yield no audit record, and the next must parse"
+        );
+    }
+
+    /// Every split inside each accepted blank-line form must survive the
+    /// parser's oversized-event resynchronisation. The oversized bytes are
+    /// passed through exactly once and only the following event is parsed.
+    #[test]
+    fn oversized_sse_resynchronization_preserves_split_terminators() {
+        for terminator in [&b"\n\n"[..], &b"\n\r\n"[..], &b"\r\n\r\n"[..]] {
+            for split in 1..terminator.len() {
+                let mut parser = SseParser::default();
+                let mut oversized = b"data: ".to_vec();
+                oversized.resize(MAX_SSE_EVENT_BYTES + 32, b'x');
+                let mut oversized_wire = oversized;
+                oversized_wire.extend_from_slice(terminator);
+
+                let mut events =
+                    parser.feed(&oversized_wire[..oversized_wire.len() - terminator.len() + split]);
+                assert!(parser.buf.len() <= 3, "lookbehind must stay bounded");
+
+                let mut rest =
+                    oversized_wire[oversized_wire.len() - terminator.len() + split..].to_vec();
+                rest.extend_from_slice(b"data: recovered\n\n");
+                events.extend(parser.feed(&rest));
+
+                let forwarded: Vec<u8> = events
+                    .iter()
+                    .flat_map(|event| event.raw.iter().copied())
+                    .collect();
+                let mut expected = oversized_wire.clone();
+                expected.extend_from_slice(b"data: recovered\n\n");
+                assert_eq!(
+                    forwarded, expected,
+                    "terminator {terminator:?} split at {split} must be forwarded once"
+                );
+                assert_eq!(datas(events), ["recovered"]);
+            }
+        }
+    }
+
+    /// A split oversized-event boundary must not swallow the endpoint event
+    /// that follows it. That legacy event is what keeps later POST traffic
+    /// routed through this proxy, so it must still be parsed and rewritten.
+    #[test]
+    fn oversized_sse_then_split_endpoint_is_rewritten_and_following_event_parses() {
+        let mut parser = SseParser::default();
+        let mut oversized_wire = b"data: ".to_vec();
+        oversized_wire.resize(MAX_SSE_EVENT_BYTES + 32, b'x');
+        oversized_wire.extend_from_slice(b"\n\n");
+
+        let endpoint_prefix =
+            b"event: endpoint\ndata: http://upstream.test:3000/messages?sid=old\n";
+        let following = b"data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n\n";
+        let mut events = parser.feed(&oversized_wire[..oversized_wire.len() - 1]);
+        events.extend(parser.feed(&[&b"\n"[..], endpoint_prefix].concat()));
+        events.extend(parser.feed(&[&b"\n"[..], following].concat()));
+
+        let mut forwarded = Vec::new();
+        let mut parsed_names = Vec::new();
+        let mut endpoint_data = None;
+        for event in events {
+            if event.name.as_deref() == Some("endpoint") {
+                endpoint_data = event.data.clone();
+                parsed_names.push("endpoint");
+                let rewritten =
+                    rewrite_endpoint_uri(event.data.as_deref().unwrap(), &addr()).unwrap();
+                forwarded.extend_from_slice(&replace_event_data(&event.raw, &rewritten));
+            } else {
+                if event.data.is_some() {
+                    parsed_names.push("message");
+                }
+                forwarded.extend_from_slice(&event.raw);
+            }
+        }
+
+        let rewritten_endpoint =
+            b"event: endpoint\ndata: http://127.0.0.1:8787/messages?sid=old\n\n";
+        let mut expected = oversized_wire.clone();
+        expected.extend_from_slice(rewritten_endpoint);
+        expected.extend_from_slice(following);
+        assert_eq!(
+            &forwarded[..oversized_wire.len()],
+            oversized_wire,
+            "oversized event bytes must reach the client exactly once"
+        );
+        assert_eq!(forwarded, expected);
+        assert_eq!(
+            endpoint_data.as_deref(),
+            Some("http://upstream.test:3000/messages?sid=old")
+        );
+        assert_eq!(parsed_names, ["endpoint", "message"]);
+    }
+
     /// An event that never terminates must not grow the buffer without
-    /// bound; the parser drops it and picks up at the next boundary.
+    /// bound; the parser stops PARSING it and picks up at the next
+    /// boundary. Its bytes are still forwarded -- see
+    /// `an_oversized_event_is_still_forwarded_byte_for_byte`.
     #[test]
     fn sse_parser_resyncs_after_an_oversized_event() {
         let mut p = SseParser::default();
@@ -434,7 +587,7 @@ mod tests {
             p.buf.len() <= MAX_SSE_EVENT_BYTES,
             "buffer must stay bounded"
         );
-        // The remainder of the oversized event is discarded...
+        // The remainder of the oversized event yields no audit record...
         assert!(datas(p.feed(b"trailing junk\n\n")).is_empty());
         // ...and the next event parses normally.
         assert_eq!(datas(p.feed(b"data: recovered\n\n")), ["recovered"]);
