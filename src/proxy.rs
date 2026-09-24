@@ -29,8 +29,9 @@ use crate::db::{self, DbHandle};
 use crate::jsonrpc::RpcMessage;
 use crate::secrets::PatternSet;
 use crate::session::{PendingCall, Session};
-use crate::shutdown::{self, Stop, DRAIN_TIMEOUT, PUMP_SHUTDOWN_TIMEOUT};
+use crate::shutdown::{self, InboundExit, Stop, DRAIN_TIMEOUT, PUMP_SHUTDOWN_TIMEOUT};
 use std::collections::HashSet;
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -46,6 +47,17 @@ use tokio::process::{ChildStdin, ChildStdout, Command};
 /// protocol -- and buffering it whole would let a hostile or broken peer
 /// exhaust memory through a proxy that promised fail-open.
 const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+type SharedDbHandle = Arc<std::sync::Mutex<Option<DbHandle>>>;
+
+#[derive(Clone)]
+struct PumpContext {
+    session: Arc<Session>,
+    db: SharedDbHandle,
+    server_name: String,
+    config: Arc<Config>,
+    patterns: Arc<PatternSet>,
+    allowlist: Arc<HashSet<String>>,
+}
 
 pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> {
     // Windows: holds the console-close/shutdown teardown grace open while
@@ -89,15 +101,44 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // Refuses to start if the database can't be opened -- see
     // `db::spawn_writer` for why that is not a fail-open case.
     let (db, writer) = db::spawn_writer_with_key(db_path, chain_mode.hash_key())?;
+    let lease = match crate::lease::SessionLease::create(db_path) {
+        Ok(lease) => Some(lease),
+        Err(error) => {
+            tracing::warn!(
+                "could not create a session liveness lease; continuing without hard-kill recovery evidence for this session: {error}"
+            );
+            None
+        }
+    };
+    match crate::recovery::recover_abandoned(db_path, &db) {
+        Ok(count) if count > 0 => tracing::warn!(
+            count,
+            "appended session abandonment evidence for {count} previously terminated session(s)"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            "could not scan for abandoned sessions; sessions without reliable evidence remain unknown: {error}"
+        ),
+    }
 
     let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence();
     if config.heartbeat.enabled {
-        db.log(crate::heartbeat::session_start_entry(
-            session.id(),
-            &server_name,
-            heartbeat_min,
-            heartbeat_max,
-        ));
+        let start = match &lease {
+            Some(lease) => crate::heartbeat::session_start_entry_with_lease(
+                session.id(),
+                &server_name,
+                heartbeat_min,
+                heartbeat_max,
+                lease.id(),
+            ),
+            None => crate::heartbeat::session_start_entry(
+                session.id(),
+                &server_name,
+                heartbeat_min,
+                heartbeat_max,
+            ),
+        };
+        db.log(start);
     }
     let heartbeat_task = config.heartbeat.enabled.then(|| {
         tokio::spawn(crate::heartbeat::run(
@@ -180,6 +221,7 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         // traceback) should reach the developer's terminal untouched, and
         // MCP framing never runs over stderr.
         .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn target command '{program}': {e}"))?;
 
@@ -191,25 +233,34 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("child stdout was not piped"))?;
+    let client_lines = spawn_client_stdin_reader()?;
+    let client_output = spawn_client_stdout_writer()?;
+    let inbound_db: SharedDbHandle = Arc::new(std::sync::Mutex::new(Some(db.clone())));
+    let outbound_db: SharedDbHandle = Arc::new(std::sync::Mutex::new(Some(db.clone())));
+    let pump_context = PumpContext {
+        session: Arc::clone(&session),
+        db: Arc::clone(&inbound_db),
+        server_name: server_name.clone(),
+        config: Arc::clone(&config),
+        patterns: Arc::clone(&patterns),
+        allowlist: Arc::clone(&allowlist),
+    };
 
-    let inbound = tokio::spawn(pump_client_to_child(
+    let (inbound_stop_tx, inbound_stop_rx) = tokio::sync::oneshot::channel();
+    let mut inbound = tokio::spawn(pump_client_to_child(
         child_stdin,
-        Arc::clone(&session),
-        db.clone(),
-        server_name.clone(),
-        Arc::clone(&config),
-        Arc::clone(&patterns),
-        Arc::clone(&allowlist),
+        client_lines,
+        inbound_stop_rx,
+        pump_context.clone(),
     ));
 
-    let outbound = tokio::spawn(pump_child_to_client(
+    let mut outbound = tokio::spawn(pump_child_to_client(
         child_stdout,
-        Arc::clone(&session),
-        db.clone(),
-        server_name.clone(),
-        Arc::clone(&config),
-        Arc::clone(&patterns),
-        Arc::clone(&allowlist),
+        client_output,
+        PumpContext {
+            db: Arc::clone(&outbound_db),
+            ..pump_context
+        },
     ));
 
     // Either the target exits on its own, or we're told to stop. A stop
@@ -217,46 +268,149 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // the audit log would be discarded, which is the same silent gap the
     // writer join exists to prevent, just triggered by a service restart
     // instead of by process exit.
-    let stop = tokio::select! {
-        result = child.wait() => Stop::TargetExited(
-            result.map_err(|e| anyhow::anyhow!("failed waiting on child process: {e}"))?,
+    let (stop, inbound_completed) = tokio::select! {
+        result = child.wait() => (
+            match result {
+                Ok(status) => Stop::TargetExited(status),
+                Err(error) => Stop::TargetWaitFailure(error.to_string()),
+            },
+            false,
         ),
-        signal = shutdown::shutdown_signal() => Stop::Signal(signal),
+        result = &mut inbound => (
+            Stop::InboundEnded(match result {
+                Ok(exit) => exit,
+                Err(error) => InboundExit::PumpTaskFailure(error.to_string()),
+            }),
+            true,
+        ),
+        signal = shutdown::shutdown_signal() => (Stop::Signal(signal), false),
     };
 
-    if let Stop::Signal(name) = stop {
-        tracing::warn!("received {name}; stopping the target and flushing the audit log");
-        // Ends the target, which closes its stdout and lets the outbound
-        // pump finish on its own rather than being cut off mid-message.
-        let _ = child.start_kill();
+    session.stop_accepting();
+    if !inbound_completed {
+        // Close the registration gate before cancelling a possibly blocked
+        // stdin read. `begin_input` shares this lock, so any line already
+        // being registered/logged finishes its synchronous section first.
+        if matches!(&stop, Stop::Signal(_) | Stop::TargetWaitFailure(_)) {
+            let _ = child.start_kill();
+        }
+        let _ = inbound_stop_tx.send(());
+        match tokio::time::timeout(PUMP_SHUTDOWN_TIMEOUT, &mut inbound).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!("client input pump failed while stopping: {error}"),
+            Err(_) => {
+                tracing::warn!("client input pump did not stop within the shutdown window");
+                // The closed registration gate still protects the drain if
+                // a platform stdin read cannot be interrupted promptly.
+                inbound.abort();
+            }
+        }
     }
+    // The closed input gate prevents further registrations. Release the
+    // pump's writer handle even if a platform input read returns late.
+    inbound_db.lock().unwrap_or_else(|e| e.into_inner()).take();
 
-    // The inbound pump reads from *our* real stdin, which is driven by the
-    // external client, not by the child — it has no natural reason to end
-    // just because the child exited, and could otherwise block this
-    // function (and the whole proxy process) from returning indefinitely
-    // if the client keeps its stdin open without sending anything further.
-    // The outbound pump, in contrast, is bounded by the child's stdout
-    // closing, which just happened.
-    inbound.abort();
-    // Bounded even so: on the signal path the target was asked to die
-    // rather than having exited, and a target that ignores the request
-    // would otherwise hold shutdown open indefinitely. Anything still in
-    // flight when this expires is drained as a timeout below.
-    if tokio::time::timeout(PUMP_SHUTDOWN_TIMEOUT, outbound)
-        .await
-        .is_err()
+    let (target_status, target_wait_error) = match &stop {
+        Stop::TargetExited(status) => (Some(*status), None),
+        Stop::InboundEnded(exit) => {
+            match exit {
+                InboundExit::ClientEof => {
+                    tracing::info!("client closed stdin; stopping the target")
+                }
+                InboundExit::ClientReadFailure(error) => {
+                    tracing::warn!("client stdin failed; stopping the target: {error}");
+                }
+                InboundExit::TargetWriteFailure(error) => {
+                    tracing::warn!("target stdin failed; stopping the target: {error}");
+                }
+                InboundExit::TargetFlushFailure(error) => {
+                    tracing::warn!("target stdin flush failed; stopping the target: {error}");
+                }
+                InboundExit::ProtocolSizeRefusal(bytes) => {
+                    tracing::warn!(
+                        "refusing oversized client message ({bytes} bytes); stopping the target"
+                    );
+                }
+                InboundExit::PumpTaskFailure(error) => {
+                    tracing::warn!("client input pump failed; stopping the target: {error}");
+                }
+                InboundExit::ShutdownRequested => {}
+            }
+            // Returning from the inbound pump closed ChildStdin. Give a
+            // cooperative target time to observe EOF and exit cleanly.
+            match tokio::time::timeout(shutdown::TARGET_EXIT_GRACE, child.wait()).await {
+                Ok(Ok(status)) => (Some(status), None),
+                Ok(Err(error)) => (None, Some(error.to_string())),
+                Err(_) => {
+                    tracing::warn!(
+                        "target did not exit within {}s after client input closed; terminating it",
+                        shutdown::TARGET_EXIT_GRACE.as_secs()
+                    );
+                    let _ = child.start_kill();
+                    match tokio::time::timeout(PUMP_SHUTDOWN_TIMEOUT, child.wait()).await {
+                        Ok(Ok(status)) => (Some(status), None),
+                        Ok(Err(error)) => (None, Some(error.to_string())),
+                        Err(_) => (
+                            None,
+                            Some("target did not exit after termination".to_string()),
+                        ),
+                    }
+                }
+            }
+        }
+        Stop::Signal(name) => {
+            tracing::warn!("received {name}; stopping the target and flushing the audit log");
+            let _ = child.start_kill();
+            match tokio::time::timeout(PUMP_SHUTDOWN_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => (Some(status), None),
+                Ok(Err(error)) => (None, Some(error.to_string())),
+                Err(_) => (
+                    None,
+                    Some("target did not exit after termination".to_string()),
+                ),
+            }
+        }
+        Stop::TargetWaitFailure(error) => {
+            tracing::warn!("failed waiting for target process: {error}; terminating it");
+            let _ = child.start_kill();
+            match tokio::time::timeout(PUMP_SHUTDOWN_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => (Some(status), None),
+                Ok(Err(wait_error)) => (None, Some(wait_error.to_string())),
+                Err(_) => (
+                    None,
+                    Some("target did not exit after termination".to_string()),
+                ),
+            }
+        }
+    };
+
+    // Keep the existing bounded response window. Stdout writes can be
+    // backed by non-cancellable OS writes, so on timeout fence resolution,
+    // release its DB sender, and abort without awaiting that blocking write.
+    let outbound_timed_out = match tokio::time::timeout(PUMP_SHUTDOWN_TIMEOUT, &mut outbound).await
     {
-        tracing::warn!("target did not close its output within the shutdown window");
+        Ok(Ok(())) => false,
+        Ok(Err(error)) => {
+            tracing::warn!("target response pump failed: {error}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("target response pump did not finish within the shutdown window");
+            true
+        }
+    };
+    session.stop_responses();
+    outbound_db.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if outbound_timed_out {
+        outbound.abort();
     }
 
-    // Both pumps have now stopped, which is what makes this safe to do
-    // here and nowhere else. Nothing can still be registering a call
-    // (inbound is aborted) and nothing can still be resolving one
-    // (outbound has run to completion, and it processes each message to
-    // its `db.log` before reading the next). So the map holds exactly the
-    // calls that never got a response, with no window in which a landing
-    // response could be logged twice — once by `resolve` and again here.
+    // The input gate and its lock ensure no registration can occur after
+    // this point. The response gate similarly waits for any synchronous
+    // resolve-and-log section already underway, then prevents later
+    // responses from removing calls. Thus the map holds exactly the calls
+    // with no logged response, even if a client stdout OS write is still
+    // blocked after the bounded pump window.
     //
     // Draining inside the outbound pump at EOF would look more natural and
     // would be wrong: the inbound pump is still live at that moment and
@@ -283,19 +437,24 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         }
     }
 
-    if let Stop::TargetExited(status) = stop {
+    if let Some(status) = target_status {
         if !status.success() {
             tracing::warn!("target command exited with status {status}");
         }
+    }
+    if let Some(error) = target_wait_error {
+        tracing::warn!("could not confirm target process exit: {error}");
     }
 
     // Stop heartbeats before writing __session_end, so a heartbeat can
     // never land after the row that's supposed to close the session.
     if let Some(task) = heartbeat_task {
         task.abort();
+        let _ = task.await;
     }
     if let Some(task) = anchor_task {
         task.abort();
+        let _ = task.await;
     }
     if config.heartbeat.enabled {
         db.log(crate::heartbeat::session_end_entry(
@@ -337,6 +496,10 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
         }
     }
 
+    // Keep the lease through the durable writer drain so a concurrent
+    // recovery scan cannot mistake this session for a dead process.
+    drop(lease);
+
     Ok(())
 }
 
@@ -346,37 +509,25 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
 /// still passed through untouched, just not logged.
 async fn pump_client_to_child(
     mut child_in: ChildStdin,
-    session: Arc<Session>,
-    db: DbHandle,
-    server_name: String,
-    config: Arc<Config>,
-    patterns: Arc<PatternSet>,
-    allowlist: Arc<HashSet<String>>,
-) {
-    let mut reader = BufReader::new(tokio::io::stdin());
-    let mut buf: Vec<u8> = Vec::new();
-
+    mut client_lines: tokio::sync::mpsc::Receiver<ClientInput>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    context: PumpContext,
+) -> InboundExit {
     loop {
-        buf.clear();
-        let n = match reader.read_until(b'\n', &mut buf).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!("error reading from client stdin: {e}");
-                break;
+        let buf = match tokio::select! {
+            _ = &mut stop_rx => return InboundExit::ShutdownRequested,
+            input = client_lines.recv() => input,
+        } {
+            Some(ClientInput::Line(line)) => line,
+            Some(ClientInput::ReadFailure(error)) => {
+                tracing::warn!("error reading from client stdin: {error}");
+                return InboundExit::ClientReadFailure(error);
             }
+            Some(ClientInput::Oversized(bytes)) => {
+                return InboundExit::ProtocolSizeRefusal(bytes);
+            }
+            Some(ClientInput::Eof) | None => return InboundExit::ClientEof,
         };
-        if n == 0 {
-            break; // EOF: client closed stdin.
-        }
-        if buf.len() > MAX_LINE_BYTES && !buf.ends_with(b"\n") {
-            tracing::warn!(
-                "client sent {} bytes without a newline; refusing to buffer \
-                 further -- closing the session rather than growing memory \
-                 without bound",
-                buf.len()
-            );
-            break;
-        }
 
         // Register BEFORE forwarding, mirroring the HTTP transport (where
         // `register_if_tool_call` precedes `client.request`). Both writes
@@ -385,46 +536,147 @@ async fn pump_client_to_child(
         // inside them; registering first means that response always finds
         // its pending entry instead of vanishing ("nothing to close out")
         // and leaving an orphan to be mis-logged as a timeout at drain.
-        for msg in parse_rpc_messages(&buf) {
-            if !msg.is_tool_call_request() {
-                continue;
-            }
-            if let (Some(id_key), Some(tool_name)) = (msg.id_key(), msg.tool_name()) {
-                let displaced = session.register(
-                    id_key,
-                    PendingCall {
-                        tool_name,
-                        args: msg.arguments().cloned(),
-                        bytes_in: buf.len() as i64,
-                        started: Instant::now(),
-                    },
-                );
-                if let Some(stale) = displaced {
-                    tracing::warn!(
-                        "JSON-RPC id reused for tool '{}' before its previous response \
-                         arrived; logging the earlier call as a timeout rather than dropping it",
-                        stale.tool_name
+        {
+            let Some(mut input_permit) = context.session.begin_input() else {
+                return InboundExit::ShutdownRequested;
+            };
+            for msg in parse_rpc_messages(&buf) {
+                if !msg.is_tool_call_request() {
+                    continue;
+                }
+                if let (Some(id_key), Some(tool_name)) = (msg.id_key(), msg.tool_name()) {
+                    let displaced = input_permit.register(
+                        id_key,
+                        PendingCall {
+                            tool_name,
+                            args: msg.arguments().cloned(),
+                            bytes_in: buf.len() as i64,
+                            started: Instant::now(),
+                        },
                     );
-                    log_completed(
-                        &session,
-                        stale,
-                        CallOutcome::timed_out(),
-                        &server_name,
-                        &config,
-                        &patterns,
-                        &allowlist,
-                        &db,
-                    );
+                    if let Some(stale) = displaced {
+                        tracing::warn!(
+                            "JSON-RPC id reused for tool '{}' before its previous response \
+                             arrived; logging the earlier call as a timeout rather than dropping it",
+                            stale.tool_name
+                        );
+                        let db = context.db.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(db) = db.as_ref() {
+                            log_completed(
+                                &context.session,
+                                stale,
+                                CallOutcome::timed_out(),
+                                &context.server_name,
+                                &context.config,
+                                &context.patterns,
+                                &context.allowlist,
+                                db,
+                            );
+                        }
+                    }
                 }
             }
         }
 
         if let Err(e) = child_in.write_all(&buf).await {
             tracing::warn!("error writing to child stdin: {e}");
-            break;
+            return InboundExit::TargetWriteFailure(e.to_string());
         }
         if let Err(e) = child_in.flush().await {
             tracing::warn!("error flushing child stdin: {e}");
+            return InboundExit::TargetFlushFailure(e.to_string());
+        }
+    }
+}
+
+enum ClientInput {
+    Line(Vec<u8>),
+    Eof,
+    ReadFailure(String),
+    Oversized(usize),
+}
+
+struct OutputRequest {
+    bytes: Vec<u8>,
+    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+/// Keeps potentially blocking writes to the client's stdout off the Tokio
+/// runtime. The output thread holds no session or DB state, so the async
+/// response pump can honor its shutdown bound even if the client stopped
+/// reading.
+fn spawn_client_stdout_writer() -> anyhow::Result<tokio::sync::mpsc::Sender<OutputRequest>> {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<OutputRequest>(2);
+    std::thread::Builder::new()
+        .name("auditmcp-stdout-writer".to_string())
+        .spawn(move || {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            while let Some(request) = receiver.blocking_recv() {
+                let result = stdout
+                    .write_all(&request.bytes)
+                    .and_then(|_| stdout.flush())
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                let _ = request.reply.send(result);
+                if failed {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("failed to start client stdout writer: {e}"))?;
+    Ok(sender)
+}
+
+/// Reads stdin off the async runtime's worker threads. Tokio's stdin adapter
+/// uses a blocking read that cannot be interrupted on Windows; a dedicated
+/// reader thread sends bounded messages and owns no DB/session state, so a
+/// target exit can stop the async pump without waiting for client EOF.
+fn spawn_client_stdin_reader() -> anyhow::Result<tokio::sync::mpsc::Receiver<ClientInput>> {
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    std::thread::Builder::new()
+        .name("auditmcp-stdin-reader".to_string())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut reader = stdin.lock();
+            loop {
+                let input = match read_client_line(&mut reader, MAX_LINE_BYTES) {
+                    Ok(input) => input,
+                    Err(error) => ClientInput::ReadFailure(error.to_string()),
+                };
+                let done = matches!(
+                    &input,
+                    ClientInput::Eof | ClientInput::ReadFailure(_) | ClientInput::Oversized(_)
+                );
+                if sender.blocking_send(input).is_err() || done {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("failed to start client stdin reader: {e}"))?;
+    Ok(receiver)
+}
+
+fn read_client_line(reader: &mut impl BufRead, max_bytes: usize) -> std::io::Result<ClientInput> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if line.is_empty() {
+                ClientInput::Eof
+            } else {
+                ClientInput::Line(line)
+            });
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > max_bytes {
+            return Ok(ClientInput::Oversized(line.len().saturating_add(take)));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(ClientInput::Line(line));
         }
     }
 }
@@ -464,15 +716,10 @@ fn log_completed(
 /// `ToolCallEntry`. Same fail-open contract as `pump_client_to_child`.
 async fn pump_child_to_client(
     child_out: ChildStdout,
-    session: Arc<Session>,
-    db: DbHandle,
-    server_name: String,
-    config: Arc<Config>,
-    patterns: Arc<PatternSet>,
-    allowlist: Arc<HashSet<String>>,
+    client_output: tokio::sync::mpsc::Sender<OutputRequest>,
+    context: PumpContext,
 ) {
     let mut reader = BufReader::new(child_out);
-    let mut stdout = tokio::io::stdout();
     let mut buf: Vec<u8> = Vec::new();
 
     loop {
@@ -497,12 +744,28 @@ async fn pump_child_to_client(
             break;
         }
 
-        if let Err(e) = stdout.write_all(&buf).await {
-            tracing::warn!("error writing to client stdout: {e}");
+        let (reply, written) = tokio::sync::oneshot::channel();
+        if client_output
+            .send(OutputRequest {
+                bytes: buf.clone(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!("client stdout writer is unavailable");
             break;
         }
-        if let Err(e) = stdout.flush().await {
-            tracing::warn!("error flushing client stdout: {e}");
+        match written.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("error writing to client stdout: {error}");
+                break;
+            }
+            Err(_) => {
+                tracing::warn!("client stdout writer stopped before forwarding a line");
+                break;
+            }
         }
 
         let msgs = parse_rpc_messages(&buf);
@@ -513,20 +776,26 @@ async fn pump_child_to_client(
             let Some(id_key) = msg.id_key() else {
                 continue;
             };
-            let Some(call) = session.resolve(&id_key) else {
+            let Some(mut response_permit) = context.session.begin_response() else {
+                continue;
+            };
+            let Some(call) = response_permit.resolve(&id_key) else {
                 continue;
             };
 
-            log_completed(
-                &session,
-                call,
-                CallOutcome::from_rpc(&msg, buf.len() as i64),
-                &server_name,
-                &config,
-                &patterns,
-                &allowlist,
-                &db,
-            );
+            let db = context.db.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(db) = db.as_ref() {
+                log_completed(
+                    &context.session,
+                    call,
+                    CallOutcome::from_rpc(&msg, buf.len() as i64),
+                    &context.server_name,
+                    &context.config,
+                    &context.patterns,
+                    &context.allowlist,
+                    db,
+                );
+            }
         }
     }
 }

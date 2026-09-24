@@ -240,10 +240,44 @@ RUST_LOG=error auditmcp run -- npx -y @some/mcp-server    # quieter
 RUST_LOG=debug auditmcp run -- npx -y @some/mcp-server    # louder
 ```
 
-On shutdown, auditmcp stops the target, records any still-in-flight calls
-as `timeout`, and waits up to 10 seconds for the write queue to reach disk.
-If entries were lost anyway it says how many and exits nonzero, so a
-supervisor sees an incomplete session rather than a clean one.
+An MCP client normally starts auditmcp as soon as it opens its configured
+stdio server. `__session_start` therefore means the audit proxy instance
+started; it does not mean that a tool was called. When the client closes
+stdin, auditmcp closes the target's stdin, gives the target a short grace
+period to exit, and terminates it if needed. Any still-in-flight calls are
+recorded as `timeout` before the one `__session_end` marker is written. The
+writer then gets up to 10 seconds to flush. If entries were lost anyway,
+auditmcp says how many and exits nonzero.
+
+`__session_end` means auditmcp executed its clean shutdown path. A forcible
+process or process-tree kill cannot run cleanup code, so it must not be
+represented as a clean end. Each new session holds a unique OS file-lock
+lease outside SQLite. On a later startup, auditmcp can append a
+`__session_abandoned` row only after acquiring that exact session's released
+lease and rechecking that no clean end or earlier recovery marker exists.
+The lease files are small runtime artifacts; their age or mere existence
+does not prove that a process is dead. Concurrent sessions, including
+sessions with the same `server_name`, keep independent leases.
+
+Lease storage is auxiliary to the audit database. If auditmcp cannot create
+or lock a lease while the database remains usable, it warns and continues;
+that session start has no liveness evidence, so a later hard kill remains
+unknown and is never inferred from its heartbeat age or a later start. Lease
+files are retained after clean shutdown and recovery. Unlinking a locked file
+can separate an already-open handle from a replacement at the same path,
+giving concurrent processes independent locks for one recorded lease ID.
+The small UUID-named files may accumulate; this preserves the exclusivity
+needed for truthful recovery.
+
+An abandonment marker means a later auditmcp instance obtained reliable
+evidence that the session stopped without writing `__session_end`. It does
+not mean the exact process-death time is known. The marker records the
+session's last known activity and when abandonment was detected; the exact
+end time of a hard-killed process cannot be reconstructed. Sessions from
+older versions without lease metadata remain unknown rather than being
+guessed abandoned. Recovery markers are appended through the normal hash
+chain and remain hidden from ordinary `query` output; use
+`query --include-synthetic` to inspect them.
 
 Which stop mechanisms this covers, and how far each has actually been
 verified rather than merely compiled:
@@ -251,6 +285,7 @@ verified rather than merely compiled:
 | Mechanism | Platform | Status |
 |---|---|---|
 | Target process exits | all | Verified |
+| Client stdin EOF / disconnect | all | Verified — packaged process fixture |
 | `SIGTERM` | Unix | Verified — real signal, mid-session |
 | `SIGINT` / Ctrl-C | Unix | Verified — real signal, mid-session |
 | Ctrl-Break | Windows | Verified — real event, mid-session |

@@ -170,7 +170,7 @@ pub(crate) fn normalize_status_filter(status: Option<&str>) -> anyhow::Result<Op
 /// filter contract, not a comparison against zero.
 ///
 /// `include_synthetic` controls `__`-prefixed rows (`__heartbeat`,
-/// `__session_start`, `__session_end`, `__audit_gap`): `false` is `query`'s
+/// `__session_start`, `__session_end`, `__session_abandoned`, `__audit_gap`): `false` is `query`'s
 /// default, since those rows are audit plumbing rather than tool-call
 /// activity and would otherwise clutter every listing. `export` always passes `true` --
 /// an export is a complete record for downstream tooling, and hiding rows

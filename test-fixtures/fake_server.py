@@ -15,7 +15,9 @@ Exposes 5 tools:
     result, for exercising the `deferred` status
 """
 import json
+import os
 import sys
+import time
 
 TOOLS = [
     {
@@ -135,6 +137,8 @@ def handle_one(msg):
         return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
     if method == "tools/call":
         try:
+            if (msg.get("params") or {}).get("name") == "no_response":
+                return None
             result = handle_tool_call(msg.get("params") or {})
             return {"jsonrpc": "2.0", "id": msg_id, "result": result}
         except Exception as e:
@@ -151,6 +155,9 @@ def handle_one(msg):
 
 
 def main():
+    if os.environ.get("FAKE_SERVER_EXIT_IMMEDIATELY") == "1":
+        return
+
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
@@ -172,6 +179,12 @@ def main():
         response = handle_one(msg)
         if response is not None:
             send(response)
+
+    # Process-test mode: emulate a target that never exits after its input
+    # closes. auditmcp must terminate it after the bounded EOF grace period.
+    if os.environ.get("FAKE_SERVER_IGNORE_EOF") == "1":
+        while True:
+            time.sleep(60)
 
 
 if __name__ == "__main__":

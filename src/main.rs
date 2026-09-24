@@ -11,9 +11,11 @@ mod hex;
 mod http;
 mod jsonrpc;
 mod keys;
+mod lease;
 mod paths;
 mod proxy;
 mod query;
+mod recovery;
 mod reset;
 mod secrets;
 mod session;
@@ -97,7 +99,7 @@ enum Command {
         #[arg(long)]
         verbose: bool,
         /// Show synthetic chain rows (`__heartbeat`, `__session_start`,
-        /// `__session_end`, `__audit_gap`), hidden by default since they
+        /// `__session_end`, `__session_abandoned`, `__audit_gap`), hidden by default since they
         /// are audit plumbing rather than tool-call activity.
         #[arg(long)]
         include_synthetic: bool,

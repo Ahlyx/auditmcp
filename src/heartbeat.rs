@@ -17,7 +17,10 @@
 //! `query::filter_rows`'s `include_synthetic` parameter) and Phase 3's
 //! anomaly rules never see them at all, because they are built directly as
 //! `ToolCallEntry` values here rather than going through
-//! `audit::build_entry`/`Session::attach_anomaly`.
+//! `audit::build_entry`/`Session::attach_anomaly`. A recovered
+//! `__session_abandoned` row records OS-lease evidence that a previous
+//! session stopped without a clean end; it carries bounds, never a guessed
+//! process-death timestamp.
 
 use crate::db::{DbHandle, ToolCallEntry};
 use rand::Rng;
@@ -28,6 +31,7 @@ use std::time::Duration;
 pub const HEARTBEAT_TOOL_NAME: &str = "__heartbeat";
 pub const SESSION_START_TOOL_NAME: &str = "__session_start";
 pub const SESSION_END_TOOL_NAME: &str = "__session_end";
+pub const SESSION_ABANDONED_TOOL_NAME: &str = "__session_abandoned";
 
 /// Picks a uniformly random cadence in `[min_secs, max_secs]`. A fixed
 /// interval would let an attacker who can watch (but not tamper with) the
@@ -112,6 +116,14 @@ struct SessionStartArgs<'a> {
     started_at: String,
     heartbeat_cadence_min_secs: u64,
     heartbeat_cadence_max_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    liveness: Option<SessionLiveness<'a>>,
+}
+
+#[derive(Serialize)]
+struct SessionLiveness<'a> {
+    mechanism: &'a str,
+    lease_id: &'a str,
 }
 
 pub fn session_start_entry(
@@ -120,12 +132,50 @@ pub fn session_start_entry(
     cadence_min_secs: u64,
     cadence_max_secs: u64,
 ) -> ToolCallEntry {
+    session_start_entry_inner(
+        session_id,
+        server_name,
+        cadence_min_secs,
+        cadence_max_secs,
+        None,
+    )
+}
+
+/// Builds a session start with OS-lease evidence that a later process can
+/// use to distinguish a dead session from a live overlapping one.
+pub fn session_start_entry_with_lease(
+    session_id: &str,
+    server_name: &str,
+    cadence_min_secs: u64,
+    cadence_max_secs: u64,
+    lease_id: &str,
+) -> ToolCallEntry {
+    session_start_entry_inner(
+        session_id,
+        server_name,
+        cadence_min_secs,
+        cadence_max_secs,
+        Some(lease_id),
+    )
+}
+
+fn session_start_entry_inner(
+    session_id: &str,
+    server_name: &str,
+    cadence_min_secs: u64,
+    cadence_max_secs: u64,
+    lease_id: Option<&str>,
+) -> ToolCallEntry {
     let args = SessionStartArgs {
         kind: "session_start",
         session_id,
         started_at: chrono::Utc::now().to_rfc3339(),
         heartbeat_cadence_min_secs: cadence_min_secs,
         heartbeat_cadence_max_secs: cadence_max_secs,
+        liveness: lease_id.map(|lease_id| SessionLiveness {
+            mechanism: "exclusive_os_file_lock_v1",
+            lease_id,
+        }),
     };
     base_entry(
         session_id,
@@ -133,6 +183,52 @@ pub fn session_start_entry(
         SESSION_START_TOOL_NAME,
         serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
     )
+}
+
+#[derive(Serialize)]
+struct SessionAbandonedArgs<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    original_session_id: &'a str,
+    started_at: &'a str,
+    last_known_alive_at: &'a str,
+    detected_abandoned_at: String,
+    time_semantics: &'a str,
+    recovery_evidence: &'a str,
+    lease_id: &'a str,
+}
+
+/// Builds a recovery event with observed bounds, never an invented death
+/// timestamp. Its row timestamp and `detected_abandoned_at` name when this
+/// process detected the released lease.
+pub fn session_abandoned_entry(
+    session_id: &str,
+    server_name: Option<&str>,
+    started_at: &str,
+    last_known_alive_at: &str,
+    detected_at: chrono::DateTime<chrono::Utc>,
+    lease_id: &str,
+) -> ToolCallEntry {
+    let mut entry = base_entry(
+        session_id,
+        server_name.unwrap_or_default(),
+        SESSION_ABANDONED_TOOL_NAME,
+        serde_json::to_string(&SessionAbandonedArgs {
+            kind: "session_abandoned",
+            original_session_id: session_id,
+            started_at,
+            last_known_alive_at,
+            detected_abandoned_at: detected_at.to_rfc3339(),
+            time_semantics: "bounds_only; no exact process end time is known",
+            recovery_evidence: "exclusive OS lease was acquired",
+            lease_id,
+        })
+        .unwrap_or_else(|_| "{}".to_string()),
+    );
+    entry.server_name = server_name.map(str::to_string);
+    entry.timestamp = detected_at.to_rfc3339();
+    entry.status = "recovered".to_string();
+    entry
 }
 
 #[derive(Serialize)]
