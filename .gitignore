@@ -8,8 +8,3 @@ __pycache__/
 config.toml
 config.mcp-*.toml
 .mcp.json
-
-# Personal standing instructions (not project-specific)
-ENGINEERING-GUARDRAILS.md
-auditmcp-claude-code-prompt.md
-auditmcp-phase-3.5-chain-hardening.md

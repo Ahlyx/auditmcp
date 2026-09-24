@@ -443,7 +443,7 @@ a tool call is allowed.
   heartbeats with genesis-fixed cadence bounds, an external per-platform
   anchor file, three new `verify` exit codes, `auditmcp key`, and
   `auditmcp reset`. See the "Chain hardening" section below for the full
-  write-up. As of 0.1.2 a legacy Phase 1-3 database is no longer run or
+  write-up. As of 0.2.0 a legacy Phase 1-3 database is no longer run or
   verified in place -- see "Migrating a Phase 1-3 (legacy) chain".
 
 ### Deliberately not included
@@ -465,9 +465,8 @@ a tool call is allowed.
 This is the stopping point: the auditing, redaction, anomaly, verification,
 packaging, and maintenance paths are complete. Further work is maintenance
 (security fixes, dependency updates, protocol compatibility, and bugs found
-by real users), not another planned feature phase. See [RESULTS.md](RESULTS.md)
-for the closeout record and [SECURITY.md](SECURITY.md) for vulnerability
-reporting.
+by real users), not another planned feature phase. See [SECURITY.md](SECURITY.md)
+for vulnerability reporting.
 
 The non-JSON payload path — `truncate::truncate_raw_sampled` and
 `secrets::scan_and_redact_text` — handles HTTP response bodies that aren't
@@ -503,11 +502,9 @@ real-binary release scenarios also exercise stdio EOF, status and secret
 handling through query/export, HTTP non-JSON and oversized responses, and
 copying, verifying, appending to, and resetting a database.
 
-Release candidates also have packaged-binary, cross-platform CI, upgrade, and
-Windows Codex + Ghidra gates. Track those separately in
-[RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md). Candidate behavior and storage
-compatibility notes are in [RELEASE_NOTES.md](RELEASE_NOTES.md); local test
-success alone does not complete the manual release gates.
+Release builds also run packaged-binary smoke tests on supported platforms.
+Check the CI and release workflow results for each candidate; local test
+success alone does not cover every platform.
 
 Beyond unit tests, the proxy has been exercised end to end on **native
 Windows** (Git Bash + PowerShell) and on an **Ubuntu VM**. The Linux run
@@ -722,7 +719,7 @@ suffix rather than deleting; either way, a brand-new HMAC-protected chain
 retrofit would either need the user's blessing on some default key (bad UX)
 or produce a chain mixing hash schemes (bad design), and both are rejected.
 
-**Breaking change in 0.1.2:** a legacy chain is no longer *run* or
+**Breaking change in 0.2.0:** a legacy chain is no longer *run* or
 *verified* in place either. `run` refuses to start on a database whose
 `chain_metadata` cannot establish that it is HMAC-protected, and `verify`
 reports it as tamper (exit 1) rather than walking it unkeyed.
@@ -740,7 +737,7 @@ with HMAC, heartbeats, and the anchor all enabled. The archived file is
 untouched, so a genuine pre-3.5 chain can still be read with any SQLite
 client and verified with auditmcp 0.1.1 if you need its original checks.
 
-**Genesis-recorded intent (0.1.2).** Whether heartbeats and the anchor were
+**Genesis-recorded intent (0.2.0).** Whether heartbeats and the anchor were
 enabled is written into `chain_metadata` at genesis and covered by the
 metadata HMAC, alongside the cadence range. `verify` runs a check if
 *either* the live config or the chain's genesis says it was on. The config
