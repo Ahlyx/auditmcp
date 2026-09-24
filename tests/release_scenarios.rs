@@ -1,9 +1,15 @@
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -75,13 +81,12 @@ fn write_http_config(
     config
 }
 
-fn free_ports() -> (u16, u16) {
-    let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    (
-        upstream.local_addr().unwrap().port(),
-        proxy.local_addr().unwrap().port(),
-    )
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 async fn wait_for_tcp(address: &str) {
@@ -97,54 +102,100 @@ async fn wait_for_tcp(address: &str) {
     .unwrap_or_else(|_| panic!("listener did not become ready at {address}"));
 }
 
-async fn wait_for_fake_http_server(address: &str) -> Result<(), String> {
-    let mut last_attempt = "no connection attempt completed".to_string();
-    match tokio::time::timeout(Duration::from_secs(8), async {
-        loop {
-            let body = serde_json::to_vec(&json!({
-                "jsonrpc": "2.0", "id": 0, "method": "tools/list"
+fn fake_http_reply(request: Value) -> (http::StatusCode, &'static str, Vec<u8>) {
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    if method == "tools/list" {
+        return (
+            http::StatusCode::OK,
+            "application/json",
+            serde_json::to_vec(&json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "resultType": "complete", "tools": [] }
             }))
-            .unwrap();
-            match tokio::net::TcpStream::connect(address).await {
-                Ok(mut stream) => {
-                    let request = format!(
-                        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    if stream.write_all(request.as_bytes()).await.is_ok()
-                        && stream.write_all(&body).await.is_ok()
-                    {
-                        let mut response = Vec::new();
-                        match stream.read_to_end(&mut response).await {
-                            Ok(_) => {
-                                let response = String::from_utf8_lossy(&response);
-                                if response.contains("\"tools\"") {
-                                    return;
-                                }
-                                last_attempt = format!(
-                                    "upstream replied without tools/list: {}",
-                                    response.lines().next().unwrap_or("empty response")
-                                );
-                            }
-                            Err(error) => last_attempt = format!("upstream read failed: {error}"),
-                        }
-                    } else {
-                        last_attempt = "upstream connection closed before request was sent".into();
-                    }
-                }
-                Err(error) => last_attempt = format!("upstream connect failed: {error}"),
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(_) => Err(format!(
-            "fake HTTP server did not answer tools/list at {address}: {last_attempt}"
-        )),
+            .unwrap(),
+        );
     }
+
+    let name = request
+        .pointer("/params/name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if method == "tools/call" && name == "return_non_json" {
+        return (
+            http::StatusCode::BAD_GATEWAY,
+            "text/html",
+            b"<html><body>502 Bad Gateway from fixture</body></html>".to_vec(),
+        );
+    }
+    if method == "tools/call" && name == "large_response" {
+        return (
+            http::StatusCode::OK,
+            "application/json",
+            serde_json::to_vec(&json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
+                    "resultType": "complete",
+                    "content": [{ "type": "text", "text": "z".repeat(1_100_000) }],
+                    "isError": false
+                }
+            }))
+            .unwrap(),
+        );
+    }
+
+    (
+        http::StatusCode::NOT_FOUND,
+        "application/json",
+        serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32601, "message": "unknown fixture request" }
+        }))
+        .unwrap(),
+    )
+}
+
+async fn spawn_fake_http_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    |request: Request<hyper::body::Incoming>| async move {
+                        let (status, content_type, body) = match request.into_body().collect().await
+                        {
+                            Ok(body) => match serde_json::from_slice(&body.to_bytes()) {
+                                Ok(message) => fake_http_reply(message),
+                                Err(_) => (
+                                    http::StatusCode::BAD_REQUEST,
+                                    "application/json",
+                                    b"{}".to_vec(),
+                                ),
+                            },
+                            Err(_) => (
+                                http::StatusCode::BAD_GATEWAY,
+                                "text/plain",
+                                b"body read failed".to_vec(),
+                            ),
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header(hyper::header::CONTENT_TYPE, content_type)
+                                .header(hyper::header::CONTENT_LENGTH, body.len())
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{address}/mcp"), task)
 }
 
 async fn post_http_rpc(address: &str, message: Value) -> Vec<u8> {
@@ -507,33 +558,10 @@ async fn real_http_binary_logs_non_json_and_capture_truncation_for_query_export_
     let dir = TestDir::new("http-status-paths");
     let db = dir.0.join("http-audit.db");
     let key = dir.0.join("http-chain.key");
-    let (upstream_port, listen_port) = free_ports();
-    let upstream = format!("http://127.0.0.1:{upstream_port}/mcp");
-    let upstream_address = format!("127.0.0.1:{upstream_port}");
+    let (upstream, upstream_task) = spawn_fake_http_server().await;
+    let listen_port = free_port();
     let listen_address = format!("127.0.0.1:{listen_port}");
     let config = write_http_config(&dir.0, &db, &key, &upstream, &listen_address);
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("test-fixtures")
-        .join("fake_http_server.py");
-
-    let mut upstream_process = Command::new(python())
-        .arg(fixture)
-        .arg(upstream_port.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    if let Err(readiness_error) = wait_for_fake_http_server(&upstream_address).await {
-        let process_status = upstream_process.try_wait().unwrap();
-        let mut stderr = String::new();
-        if let Some(mut output) = upstream_process.stderr.take() {
-            let _ = output.read_to_string(&mut stderr).await;
-        }
-        panic!("{readiness_error}; upstream exit={process_status:?}; stderr={stderr}");
-    }
-
     let mut proxy = Command::new(BINARY)
         .arg("serve")
         .arg("--config")
@@ -632,8 +660,8 @@ async fn real_http_binary_logs_non_json_and_capture_truncation_for_query_export_
     assert!(String::from_utf8_lossy(&query.stdout).contains("return_non_json"));
     proxy.start_kill().unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(5), proxy.wait()).await;
-    upstream_process.start_kill().unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(5), upstream_process.wait()).await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
     verify(&config).await;
 }
 
