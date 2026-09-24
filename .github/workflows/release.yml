@@ -82,7 +82,7 @@ jobs:
           mkdir "$ARCHIVE_NAME"
           cp "target/$TARGET/release/auditmcp" "$ARCHIVE_NAME/"
           cp README.md LICENSE config.example.toml "$ARCHIVE_NAME/"
-          cp RESULTS.md SECURITY.md "$ARCHIVE_NAME/"
+          cp SECURITY.md "$ARCHIVE_NAME/"
           tar -czf "$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME"
 
       - name: Package archive (Windows)
@@ -92,7 +92,7 @@ jobs:
           New-Item -ItemType Directory -Path $env:ARCHIVE_NAME | Out-Null
           Copy-Item "target\$env:TARGET\release\auditmcp.exe" $env:ARCHIVE_NAME
           Copy-Item README.md, LICENSE, config.example.toml $env:ARCHIVE_NAME
-          Copy-Item RESULTS.md, SECURITY.md $env:ARCHIVE_NAME
+          Copy-Item SECURITY.md $env:ARCHIVE_NAME
           Compress-Archive -Path $env:ARCHIVE_NAME -DestinationPath "$env:ARCHIVE_NAME.zip"
 
       - name: Smoke-test packaged archive (Unix)
@@ -102,6 +102,15 @@ jobs:
           set -euo pipefail
           mkdir smoke
           tar -xzf "$ARCHIVE_NAME.tar.gz" -C smoke
+          printf '%s\n' \
+            "$ARCHIVE_NAME/LICENSE" \
+            "$ARCHIVE_NAME/README.md" \
+            "$ARCHIVE_NAME/SECURITY.md" \
+            "$ARCHIVE_NAME/auditmcp" \
+            "$ARCHIVE_NAME/config.example.toml" \
+            | sort > expected-files.txt
+          tar -tzf "$ARCHIVE_NAME.tar.gz" | grep -v '/$' | sort > actual-files.txt
+          diff -u expected-files.txt actual-files.txt
           binary="$PWD/smoke/$ARCHIVE_NAME/auditmcp"
           export HOME="$PWD/smoke-home"
           export XDG_STATE_HOME="$PWD/smoke-state"
@@ -118,7 +127,31 @@ jobs:
         shell: pwsh
         run: |
           Expand-Archive "$env:ARCHIVE_NAME.zip" -DestinationPath smoke
-          $binary = "$PWD\smoke\$env:ARCHIVE_NAME\auditmcp.exe"
+          $expandedEntries = @(Get-ChildItem -LiteralPath smoke -Force)
+          if ($expandedEntries.Count -ne 1) {
+            throw "Expected one archive root directory, got: $($expandedEntries.Name -join ', ')"
+          }
+          if ($expandedEntries[0].Name -ne $env:ARCHIVE_NAME -or -not $expandedEntries[0].PSIsContainer) {
+            throw "Unexpected archive root entry: $($expandedEntries[0].Name)"
+          }
+          $archiveRoot = Join-Path (Join-Path $PWD "smoke") $env:ARCHIVE_NAME
+          $expectedFiles = @(
+            "auditmcp.exe",
+            "README.md",
+            "SECURITY.md",
+            "LICENSE",
+            "config.example.toml"
+          ) | Sort-Object
+          $actualFiles = @(
+            Get-ChildItem -LiteralPath $archiveRoot -Force | ForEach-Object {
+              if ($_.PSIsContainer) { "DIR:$($_.Name)" } else { $_.Name }
+            } | Sort-Object
+          )
+          $contentsDiff = Compare-Object $expectedFiles $actualFiles
+          if ($contentsDiff) {
+            throw "Unexpected archive contents. Expected: $($expectedFiles -join ', '); actual: $($actualFiles -join ', ')"
+          }
+          $binary = Join-Path $archiveRoot "auditmcp.exe"
           $env:LOCALAPPDATA = "$PWD\smoke-state"
           @(
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',

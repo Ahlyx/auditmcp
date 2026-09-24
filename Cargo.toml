@@ -13,7 +13,6 @@ include = [
     "/Cargo.toml",
     "/Cargo.lock",
     "/README.md",
-    "/RESULTS.md",
     "/SECURITY.md",
     "/LICENSE",
     "/config.example.toml",
