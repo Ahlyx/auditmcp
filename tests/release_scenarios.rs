@@ -97,35 +97,54 @@ async fn wait_for_tcp(address: &str) {
     .unwrap_or_else(|_| panic!("listener did not become ready at {address}"));
 }
 
-async fn wait_for_fake_http_server(address: &str) {
-    tokio::time::timeout(Duration::from_secs(8), async {
+async fn wait_for_fake_http_server(address: &str) -> Result<(), String> {
+    let mut last_attempt = "no connection attempt completed".to_string();
+    match tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let body = serde_json::to_vec(&json!({
                 "jsonrpc": "2.0", "id": 0, "method": "tools/list"
             }))
             .unwrap();
-            if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
-                let request = format!(
-                    "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                if stream.write_all(request.as_bytes()).await.is_ok()
-                    && stream.write_all(&body).await.is_ok()
-                {
-                    let mut response = Vec::new();
-                    if stream.read_to_end(&mut response).await.is_ok()
-                        && String::from_utf8_lossy(&response).contains("\"tools\"")
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(mut stream) => {
+                    let request = format!(
+                        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(request.as_bytes()).await.is_ok()
+                        && stream.write_all(&body).await.is_ok()
                     {
-                        return;
+                        let mut response = Vec::new();
+                        match stream.read_to_end(&mut response).await {
+                            Ok(_) => {
+                                let response = String::from_utf8_lossy(&response);
+                                if response.contains("\"tools\"") {
+                                    return;
+                                }
+                                last_attempt = format!(
+                                    "upstream replied without tools/list: {}",
+                                    response.lines().next().unwrap_or("empty response")
+                                );
+                            }
+                            Err(error) => last_attempt = format!("upstream read failed: {error}"),
+                        }
+                    } else {
+                        last_attempt = "upstream connection closed before request was sent".into();
                     }
                 }
+                Err(error) => last_attempt = format!("upstream connect failed: {error}"),
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("fake HTTP server did not answer tools/list at {address}"));
+    {
+        Ok(()) => Ok(()),
+        Err(_) => Err(format!(
+            "fake HTTP server did not answer tools/list at {address}: {last_attempt}"
+        )),
+    }
 }
 
 async fn post_http_rpc(address: &str, message: Value) -> Vec<u8> {
@@ -502,11 +521,18 @@ async fn real_http_binary_logs_non_json_and_capture_truncation_for_query_export_
         .arg(upstream_port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    wait_for_fake_http_server(&upstream_address).await;
+    if let Err(readiness_error) = wait_for_fake_http_server(&upstream_address).await {
+        let process_status = upstream_process.try_wait().unwrap();
+        let mut stderr = String::new();
+        if let Some(mut output) = upstream_process.stderr.take() {
+            let _ = output.read_to_string(&mut stderr).await;
+        }
+        panic!("{readiness_error}; upstream exit={process_status:?}; stderr={stderr}");
+    }
 
     let mut proxy = Command::new(BINARY)
         .arg("serve")
