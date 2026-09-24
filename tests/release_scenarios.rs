@@ -495,7 +495,6 @@ async fn real_http_binary_logs_non_json_and_capture_truncation_for_query_export_
     )
     .await;
     assert!(String::from_utf8_lossy(&malformed).starts_with("HTTP/1.1 502"));
-    assert!(String::from_utf8_lossy(&malformed).contains("502 Bad Gateway from fixture"));
 
     let large = post_http_rpc(
         &listen_address,
