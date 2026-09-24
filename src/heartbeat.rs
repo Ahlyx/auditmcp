@@ -5,10 +5,11 @@
 //! nothing about whether rows were removed from the *end* of the chain --
 //! a truncated chain still verifies cleanly, because every remaining row's
 //! hash and prev_hash still check out. A heartbeat written at a random,
-//! genesis-fixed cadence closes that gap: if the last N real rows plus
-//! some heartbeats are deleted, the session either ends without a
-//! `__session_end` row or has a gap between heartbeats wider than the
-//! declared cadence allows, and `verify` reports it (exit code 3).
+//! genesis-fixed cadence makes removed heartbeat rows visible as an
+//! over-wide gap (exit code 3). A gap can also follow system suspend,
+//! process suspension, or scheduler delays; `verify` reports the gap but
+//! does not classify it as tampering. Missing `__session_end` alone is not
+//! a verify failure because a session may still be running.
 //!
 //! `tool_name` values here all use the reserved `__` prefix (see the
 //! `tool_name` doc on `db::ToolCallEntry` -- real tool calls must never
@@ -302,8 +303,9 @@ pub struct HeartbeatGap {
 /// Scans every session's `__heartbeat` rows (in row-id order, which is
 /// insertion order) and reports each consecutive gap wider than
 /// `cadence_max_secs * 1.5` -- the fudge factor the spec calls for, to
-/// absorb scheduler jitter and system load rather than false-positiving on
-/// a heartbeat that landed a few seconds late.
+/// absorb ordinary scheduler jitter and system load. This check cannot
+/// distinguish a long suspend from removed heartbeat rows; callers should
+/// report the cadence violation without claiming it proves tampering.
 pub fn find_heartbeat_gaps(
     rows: &[crate::db::StoredRow],
     cadence_max_secs: u64,

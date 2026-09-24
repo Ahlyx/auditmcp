@@ -46,7 +46,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"jsonrpc": "2.0", "id": msg_id,
                              "result": {"resultType": "complete", "tools": TOOLS}})
         elif method == "tools/call":
-            result = handle_tool_call(msg.get("params") or {})
+            params = msg.get("params") or {}
+            name = params.get("name")
+            if name == "return_non_json":
+                self._send(
+                    502,
+                    b"<html><body>502 Bad Gateway from fixture</body></html>",
+                    "text/html",
+                )
+                return
+            if name == "large_response":
+                result = {
+                    "content": [{"type": "text", "text": "z" * 1_100_000}],
+                    "isError": False,
+                }
+            else:
+                result = handle_tool_call(params)
             result.setdefault("resultType", "complete")
             self._send(200, {"jsonrpc": "2.0", "id": msg_id, "result": result})
         elif method == "break_the_response":

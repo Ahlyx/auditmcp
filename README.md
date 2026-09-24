@@ -475,9 +475,14 @@ JSON (an upstream 502 HTML page, a stack trace, an unexpected content
 type). Stdio MCP is JSON-RPC end to end so it never exercises this path;
 `serve` does, whenever the upstream returns non-JSON.
 
+If an HTTP response exceeds the audit capture limit, auditmcp still forwards
+the complete response. The stored `result_json` is a valid JSON envelope with
+`__auditmcp_truncated: true` and `original_bytes`, so it cannot be mistaken
+for the full result.
+
 ### How it has been verified
 
-`cargo test` runs 285 tests covering the hash chain (including concurrent
+`cargo test --locked` covers the hash chain (including concurrent
 writers against a shared DB and interleaved multi-server chains), secrets
 detection and its false-positive cases, truncation UTF-8 boundary safety,
 export fidelity, unmask hash resolution, `verify` exit codes and
@@ -493,7 +498,16 @@ one flag, with a second burst after the window firing again) — and Phase
 decision table (fresh/existing/wrong-key/refused), heartbeat gap detection
 within and across sessions, the anchor's own internal chain plus its
 cross-check against the database, torn-tail recovery and lock-file
-serialization for the anchor, and `reset`'s archive-vs-delete behavior.
+serialization for the anchor, and `reset`'s archive-vs-delete behavior. The
+real-binary release scenarios also exercise stdio EOF, status and secret
+handling through query/export, HTTP non-JSON and oversized responses, and
+copying, verifying, appending to, and resetting a database.
+
+Release candidates also have packaged-binary, cross-platform CI, upgrade, and
+Windows Codex + Ghidra gates. Track those separately in
+[RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md). Candidate behavior and storage
+compatibility notes are in [RELEASE_NOTES.md](RELEASE_NOTES.md); local test
+success alone does not complete the manual release gates.
 
 Beyond unit tests, the proxy has been exercised end to end on **native
 Windows** (Git Bash + PowerShell) and on an **Ubuntu VM**. The Linux run
@@ -647,8 +661,13 @@ cadence range is fixed once, at the chain's genesis, in `chain_metadata`; an
 attacker with DB write access can't lower it retroactively to hide a gap,
 because doing so would itself break the HMAC of those genesis rows.
 `verify` flags any gap between two heartbeats in the same session that
-exceeds `cadence_max_secs × 1.5` (fudge factor for scheduler jitter). These
-rows are chain-integrity plumbing, not tool-call activity: `query` hides
+exceeds `cadence_max_secs × 1.5` (fudge factor for ordinary scheduler
+jitter). A laptop suspend/resume, process suspension, or unusually long
+scheduling delay can also create this gap. `verify` reports the cadence
+violation as exit code 3 and names these possibilities; it does not label
+the gap as hash-chain tampering. The threshold remains in place so a real
+removed-heartbeat gap is still detectable. These rows are chain-integrity
+plumbing, not tool-call activity: `query` hides
 them by default (`--include-synthetic` shows them), `export` always
 includes them, and Phase 3's anomaly rules never see them.
 
