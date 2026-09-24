@@ -17,11 +17,11 @@ not replace OS CI, packaged binary checks, or the Windows client dogfood run.
   smoke test.
 
 The repository integration suite includes real-binary stdio EOF coverage,
+query with `--include-synthetic` and export of clean lifecycle markers,
 status/query/export scenarios, HTTP malformed-body and response-capture paths,
 and copy-then-append/reset compatibility checks. Unit tests cover deterministic
 heartbeat gaps and the lifecycle, recovery, JSON, identity, and anomaly
-regressions in their respective pull requests. Local Rust build artifacts used
-an isolated target directory; command behavior is otherwise unchanged.
+regressions from the integrated implementation.
 
 ## Windows process and shared-database checks
 

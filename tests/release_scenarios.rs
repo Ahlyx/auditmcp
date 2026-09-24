@@ -48,11 +48,21 @@ fn toml_string(value: &str) -> String {
 }
 
 fn write_config(dir: &Path, db_path: &Path, key_path: &Path) -> PathBuf {
+    write_config_with_heartbeat(dir, db_path, key_path, false)
+}
+
+fn write_config_with_heartbeat(
+    dir: &Path,
+    db_path: &Path,
+    key_path: &Path,
+    heartbeat_enabled: bool,
+) -> PathBuf {
     let config = dir.join("config.toml");
     let content = format!(
-        "[target]\nserver_name = \"release_fixture\"\n\n[logging]\ndb_path = {}\ndefault_tier = \"minimal\"\n\n[chain]\nkey_path = {}\n\n[heartbeat]\nenabled = false\n\n[anchor]\nenabled = false\n",
+        "[target]\nserver_name = \"release_fixture\"\n\n[logging]\ndb_path = {}\ndefault_tier = \"minimal\"\n\n[chain]\nkey_path = {}\n\n[heartbeat]\nenabled = {}\n\n[anchor]\nenabled = false\n",
         toml_string(&db_path.to_string_lossy()),
         toml_string(&key_path.to_string_lossy()),
+        heartbeat_enabled,
     );
     std::fs::write(&config, content).unwrap();
     config
@@ -317,7 +327,7 @@ async fn real_binary_status_paths_are_visible_in_query_export_and_verify() {
     let dir = TestDir::new("status-paths");
     let db = dir.0.join("audit.db");
     let key = dir.0.join("chain.key");
-    let config = write_config(&dir.0, &db, &key);
+    let config = write_config_with_heartbeat(&dir.0, &db, &key, true);
     let calls = [
         rpc_call(1, "jsonrpc_error", json!({})),
         rpc_call(2, "simulate_tool_failure", json!({})),
@@ -360,6 +370,18 @@ async fn real_binary_status_paths_are_visible_in_query_export_and_verify() {
     assert!(all_text.contains("timeout"));
     assert!(all_text.contains("deferred"));
 
+    let synthetic_query = command_ok(
+        Command::new(BINARY)
+            .arg("query")
+            .arg("--config")
+            .arg(&config)
+            .arg("--include-synthetic"),
+    )
+    .await;
+    let synthetic_text = String::from_utf8_lossy(&synthetic_query.stdout);
+    assert!(synthetic_text.contains("__session_start"));
+    assert!(synthetic_text.contains("__session_end"));
+
     for (status, expected_tool) in [
         ("error", "jsonrpc_error"),
         ("timeout", "no_response"),
@@ -394,6 +416,12 @@ async fn real_binary_status_paths_are_visible_in_query_export_and_verify() {
 
     let export_path = dir.0.join("export.jsonl");
     let exported = export_file(&config, &export_path).await;
+    assert!(exported
+        .iter()
+        .any(|row| row["tool_name"] == "__session_start"));
+    assert!(exported
+        .iter()
+        .any(|row| row["tool_name"] == "__session_end"));
     let jsonrpc_error = exported
         .iter()
         .find(|row| row["tool_name"] == "jsonrpc_error")

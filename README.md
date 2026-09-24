@@ -327,7 +327,7 @@ apart without parsing output:
 | 0 | Chain intact, redactions index consistent, every enabled check passed |
 | 1 | Hash-chain / HMAC verification failed — a row was altered, deleted, or reordered |
 | 2 | Chain intact, but EITHER the redactions index drifted (fix with `--repair-index [--yes]`), OR this is an HMAC-protected chain and the chain key is missing/unloadable/unrecognized |
-| 3 | A heartbeat gap within a session exceeded the expected cadence — likely tail truncation |
+| 3 | A heartbeat gap within a session exceeded the expected cadence. Tail truncation is one possible cause; system suspend/resume, process suspension, and scheduling delays can also cause a gap. It is not proof of tampering. |
 | 4 | The anchor file's own internal HMAC chain is broken |
 | 5 | The anchor references chain rows that are missing or have a different hash than it recorded |
 | 6 | The chain is intact, but durable `__audit_gap` markers prove one or more calls were dropped |
