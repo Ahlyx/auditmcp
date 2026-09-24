@@ -1,6 +1,6 @@
 [package]
 name = "auditmcp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Local-first audit logging proxy for MCP tool calls"
 license = "MIT"
