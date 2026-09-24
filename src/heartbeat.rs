@@ -126,7 +126,6 @@ struct SessionLiveness<'a> {
     lease_id: &'a str,
 }
 
-#[cfg(test)]
 pub fn session_start_entry(
     session_id: &str,
     server_name: &str,

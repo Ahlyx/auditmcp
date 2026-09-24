@@ -101,7 +101,15 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // Refuses to start if the database can't be opened -- see
     // `db::spawn_writer` for why that is not a fail-open case.
     let (db, writer) = db::spawn_writer_with_key(db_path, chain_mode.hash_key())?;
-    let lease = crate::lease::SessionLease::create(db_path)?;
+    let lease = match crate::lease::SessionLease::create(db_path) {
+        Ok(lease) => Some(lease),
+        Err(error) => {
+            tracing::warn!(
+                "could not create a session liveness lease; continuing without hard-kill recovery evidence for this session: {error}"
+            );
+            None
+        }
+    };
     match crate::recovery::recover_abandoned(db_path, &db) {
         Ok(count) if count > 0 => tracing::warn!(
             count,
@@ -115,13 +123,22 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
 
     let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence();
     if config.heartbeat.enabled {
-        db.log(crate::heartbeat::session_start_entry_with_lease(
-            session.id(),
-            &server_name,
-            heartbeat_min,
-            heartbeat_max,
-            lease.id(),
-        ));
+        let start = match &lease {
+            Some(lease) => crate::heartbeat::session_start_entry_with_lease(
+                session.id(),
+                &server_name,
+                heartbeat_min,
+                heartbeat_max,
+                lease.id(),
+            ),
+            None => crate::heartbeat::session_start_entry(
+                session.id(),
+                &server_name,
+                heartbeat_min,
+                heartbeat_max,
+            ),
+        };
+        db.log(start);
     }
     let heartbeat_task = config.heartbeat.enabled.then(|| {
         tokio::spawn(crate::heartbeat::run(

@@ -2,12 +2,11 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-#[cfg(unix)]
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-#[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::BufReader;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use uuid::Uuid;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_auditmcp");
@@ -31,8 +30,8 @@ impl Drop for TestDir {
 struct RunningProxy {
     child: Child,
     stdin: Option<ChildStdin>,
-    #[cfg_attr(not(unix), allow(dead_code))]
     stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
 }
 
 struct Harness {
@@ -82,6 +81,19 @@ async fn spawn_proxy(
     extra_env: Option<(&str, &str)>,
     capture_stdout: bool,
 ) -> RunningProxy {
+    spawn_proxy_inner(harness, extra_env, capture_stdout, false).await
+}
+
+async fn spawn_proxy_with_stderr(harness: &Harness, capture_stdout: bool) -> RunningProxy {
+    spawn_proxy_inner(harness, None, capture_stdout, true).await
+}
+
+async fn spawn_proxy_inner(
+    harness: &Harness,
+    extra_env: Option<(&str, &str)>,
+    capture_stdout: bool,
+    capture_stderr: bool,
+) -> RunningProxy {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("test-fixtures")
         .join("fake_server.py");
@@ -100,7 +112,11 @@ async fn spawn_proxy(
         } else {
             Stdio::null()
         })
-        .stderr(Stdio::null())
+        .stderr(if capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .kill_on_drop(true);
     if let Some((name, value)) = extra_env {
         command.env(name, value);
@@ -108,11 +124,34 @@ async fn spawn_proxy(
     let mut child = command.spawn().unwrap();
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     RunningProxy {
         child,
         stdin,
         stdout,
+        stderr,
     }
+}
+
+fn block_lease_storage(db: &Path) {
+    let mut lease_dir = db.as_os_str().to_os_string();
+    lease_dir.push(".leases");
+    std::fs::write(PathBuf::from(lease_dir), b"not a directory").unwrap();
+}
+
+fn session_start_liveness(db: &Path) -> Option<serde_json::Value> {
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let args_json: String = conn
+        .query_row(
+            "SELECT args_json FROM tool_calls WHERE tool_name = '__session_start' ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str::<serde_json::Value>(&args_json).unwrap()["liveness"]
+        .as_object()
+        .cloned()
+        .map(serde_json::Value::Object)
 }
 
 async fn wait_for_row(db: &Path, tool_name: &str, timeout: Duration) {
@@ -272,6 +311,91 @@ async fn client_eof_drains_pending_calls_before_one_clean_end() {
             .all(|(index, row)| row.0 != "__heartbeat" || index < end_index),
         "no heartbeat may appear after session end"
     );
+    assert_verify(&harness.config).await;
+}
+
+#[tokio::test]
+async fn unavailable_lease_storage_warns_but_stdio_proxy_still_logs_and_ends_cleanly() {
+    let harness = make_harness("lease-unavailable-clean");
+    block_lease_storage(&harness.db);
+    let mut running = spawn_proxy_with_stderr(&harness, true).await;
+    wait_for_row(&harness.db, "__session_start", Duration::from_secs(5)).await;
+    assert_eq!(session_start_liveness(&harness.db), None);
+
+    let mut stderr = running.stderr.take().unwrap();
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+
+    running
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"lease fallback\"}}}\n",
+        )
+        .await
+        .unwrap();
+    let mut stdout = BufReader::new(running.stdout.take().unwrap());
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut response))
+        .await
+        .expect("proxy did not forward the echo response")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response).unwrap()["id"],
+        77
+    );
+    drop(stdout);
+    drop(running.stdin.take());
+    let status = tokio::time::timeout(Duration::from_secs(8), running.child.wait())
+        .await
+        .expect("proxy did not cleanly shut down without lease storage")
+        .unwrap();
+    assert!(status.success());
+
+    let logs = stderr_task.await.unwrap();
+    assert!(
+        logs.contains("continuing without hard-kill recovery evidence"),
+        "lease failure warning should explain the degraded recovery behavior: {logs}"
+    );
+    let rows = rows(&harness.db);
+    assert!(rows.iter().any(|row| row.0 == "echo" && row.1 == "success"));
+    assert_eq!(
+        rows.iter().filter(|row| row.0 == "__session_end").count(),
+        1,
+        "graceful EOF still records a clean end"
+    );
+    assert!(session_start_liveness(&harness.db).is_none());
+    assert_verify(&harness.config).await;
+}
+
+#[tokio::test]
+async fn hard_killed_lease_less_session_remains_unknown_on_later_startup() {
+    let harness = make_harness("lease-unavailable-killed");
+    block_lease_storage(&harness.db);
+    let mut killed = spawn_proxy(&harness, None, false).await;
+    wait_for_row(&harness.db, "__session_start", Duration::from_secs(5)).await;
+    let killed_session = session_ids(&harness.db, "__session_start")[0].clone();
+
+    killed.child.start_kill().unwrap();
+    let _ = killed.child.wait().await.unwrap();
+    drop(killed.stdin.take());
+    assert!(!rows(&harness.db)
+        .iter()
+        .any(|row| row.0 == "__session_end" && row.2 == killed_session));
+
+    let successor = spawn_proxy(&harness, None, false).await;
+    wait_for_start_count(&harness.db, 2, Duration::from_secs(5)).await;
+    assert!(
+        session_ids(&harness.db, "__session_abandoned").is_empty(),
+        "a missing lease must leave the forcibly killed session unknown"
+    );
+    assert!(session_start_liveness(&harness.db).is_none());
+    close_cleanly(successor).await;
+    assert!(session_ids(&harness.db, "__session_abandoned").is_empty());
     assert_verify(&harness.config).await;
 }
 

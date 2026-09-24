@@ -79,7 +79,15 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     // is independent of the per-connection sessions the listeners manage.
     let serve_session_id = format!("serve:{}", uuid::Uuid::new_v4());
     const SERVE_HEARTBEAT_SERVER_NAME: &str = "auditmcp-serve";
-    let lease = crate::lease::SessionLease::create(db_path)?;
+    let lease = match crate::lease::SessionLease::create(db_path) {
+        Ok(lease) => Some(lease),
+        Err(error) => {
+            tracing::warn!(
+                "could not create a session liveness lease; continuing without hard-kill recovery evidence for this serve process: {error}"
+            );
+            None
+        }
+    };
     match crate::recovery::recover_abandoned(db_path, &db) {
         Ok(count) if count > 0 => tracing::warn!(
             count,
@@ -93,13 +101,22 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
 
     let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence();
     if config.heartbeat.enabled {
-        db.log(crate::heartbeat::session_start_entry_with_lease(
-            &serve_session_id,
-            SERVE_HEARTBEAT_SERVER_NAME,
-            heartbeat_min,
-            heartbeat_max,
-            lease.id(),
-        ));
+        let start = match &lease {
+            Some(lease) => crate::heartbeat::session_start_entry_with_lease(
+                &serve_session_id,
+                SERVE_HEARTBEAT_SERVER_NAME,
+                heartbeat_min,
+                heartbeat_max,
+                lease.id(),
+            ),
+            None => crate::heartbeat::session_start_entry(
+                &serve_session_id,
+                SERVE_HEARTBEAT_SERVER_NAME,
+                heartbeat_min,
+                heartbeat_max,
+            ),
+        };
+        db.log(start);
     }
     let heartbeat_task = config.heartbeat.enabled.then(|| {
         tokio::spawn(crate::heartbeat::run(

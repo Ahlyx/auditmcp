@@ -17,9 +17,11 @@ pub(crate) struct SessionLease {
 
 impl SessionLease {
     /// Creates and locks a unique lease for a new session. The file remains
-    /// after clean shutdown: deleting it after releasing its lock could race
-    /// a recovery process that already opened the old file and allow a new
-    /// file at the same path to be locked independently.
+    /// after clean shutdown: unlinking a lock file while another process may
+    /// already hold an open handle can split the path from the locked file
+    /// object. A process opening a replacement path could then hold a second,
+    /// independent lock for the same recorded lease ID. Retaining the tiny
+    /// UUID-named files avoids that cross-platform race.
     pub(crate) fn create(db_path: &Path) -> anyhow::Result<Self> {
         let id = Uuid::new_v4().to_string();
         let dir = lease_dir(db_path);
@@ -107,14 +109,20 @@ mod tests {
     }
 
     #[test]
-    fn a_live_lease_cannot_be_recovered_and_releases_after_drop() {
+    fn lease_file_is_retained_after_unlock_for_later_recovery() {
         let db = db_path("live");
         let lease = SessionLease::create(&db).unwrap();
         assert!(SessionLease::try_recover(&db, lease.id())
             .unwrap()
             .is_none());
         let id = lease.id().to_string();
+        let path = lease_path(&db, &id);
+        assert!(path.exists());
         drop(lease);
+        assert!(
+            path.exists(),
+            "unlocking must not replace the lock identity"
+        );
         assert!(SessionLease::try_recover(&db, &id).unwrap().is_some());
         let _ = std::fs::remove_dir_all(lease_dir(&db));
     }

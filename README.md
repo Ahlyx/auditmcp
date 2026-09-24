@@ -259,6 +259,16 @@ The lease files are small runtime artifacts; their age or mere existence
 does not prove that a process is dead. Concurrent sessions, including
 sessions with the same `server_name`, keep independent leases.
 
+Lease storage is auxiliary to the audit database. If auditmcp cannot create
+or lock a lease while the database remains usable, it warns and continues;
+that session start has no liveness evidence, so a later hard kill remains
+unknown and is never inferred from its heartbeat age or a later start. Lease
+files are retained after clean shutdown and recovery. Unlinking a locked file
+can separate an already-open handle from a replacement at the same path,
+giving concurrent processes independent locks for one recorded lease ID.
+The small UUID-named files may accumulate; this preserves the exclusivity
+needed for truthful recovery.
+
 An abandonment marker means a later auditmcp instance obtained reliable
 evidence that the session stopped without writing `__session_end`. It does
 not mean the exact process-death time is known. The marker records the
