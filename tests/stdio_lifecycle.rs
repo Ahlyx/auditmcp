@@ -424,7 +424,9 @@ async fn operating_system_signal_still_uses_the_clean_shutdown_path() {
         .await
         .expect("proxy did not forward initialize response")
         .unwrap();
-    assert!(response.contains("\"id\":1"));
+    let response: serde_json::Value =
+        serde_json::from_str(&response).expect("forwarded response must remain valid JSON");
+    assert_eq!(response["id"], 1);
 
     let pid = running.child.id().unwrap().to_string();
     let signal = Command::new("kill")
