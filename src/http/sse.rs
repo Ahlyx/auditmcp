@@ -22,6 +22,9 @@
 /// base64 screenshot -- simply vanished and the caller waited forever for
 /// a response the upstream had already sent.
 pub(crate) const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+/// Longest supported event terminator minus one byte, retained while
+/// resynchronising so a boundary split between chunks remains visible.
+const SSE_TERMINATOR_LOOKBEHIND: usize = 3;
 
 /// Incremental Server-Sent Events parser.
 ///
@@ -75,41 +78,86 @@ impl SseParser {
     /// unparsed bytes that must still be forwarded (see
     /// `SseEvent::passthrough`).
     pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
-        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
+        let mut offset = 0;
 
-        while let Some((body_len, term_len)) = find_event_end(&self.buf) {
-            let raw: Vec<u8> = self.buf.drain(..body_len + term_len).collect();
+        loop {
             if self.resyncing {
-                // The tail of an event that outgrew the cap. Its prefix has
-                // already gone out verbatim; this completes it, so it is
-                // forwarded too and parsing resumes at the next boundary.
-                self.resyncing = false;
-                out.push(SseEvent::passthrough(raw));
+                // `buf` contains only bytes not yet forwarded. Keep enough
+                // suffix to recognize any supported terminator across the
+                // next input slice, then pass the preceding bytes through.
+                // Appending in bounded slices keeps parser memory bounded
+                // even when a transport frame itself is very large.
+                let room = MAX_SSE_EVENT_BYTES + 1 - self.buf.len();
+                let take = room.min(chunk.len() - offset);
+                self.buf.extend_from_slice(&chunk[offset..offset + take]);
+                offset += take;
+
+                if let Some((body_len, term_len)) = find_event_end(&self.buf) {
+                    let raw: Vec<u8> = self.buf.drain(..body_len + term_len).collect();
+                    self.resyncing = false;
+                    // This completes the oversized event. Its prefix was
+                    // forwarded as passthrough bytes in earlier iterations.
+                    out.push(SseEvent::passthrough(raw));
+                    continue;
+                }
+
+                let emit_len = self.buf.len().saturating_sub(SSE_TERMINATOR_LOOKBEHIND);
+                if emit_len > 0 {
+                    let raw: Vec<u8> = self.buf.drain(..emit_len).collect();
+                    out.push(SseEvent::passthrough(raw));
+                }
+                if offset == chunk.len() {
+                    return out;
+                }
                 continue;
             }
-            let body = &raw[..body_len];
-            out.push(SseEvent {
-                name: field(body, "event:"),
-                data: data_payload(body),
-                raw,
-            });
-        }
 
-        if self.buf.len() > MAX_SSE_EVENT_BYTES {
-            // Hand the buffered prefix back for forwarding instead of
-            // dropping it, and stop parsing this event. The client still
-            // receives every byte in order; only the audit record is lost,
-            // which is the trade this cap is allowed to make.
-            let raw = std::mem::take(&mut self.buf);
-            tracing::warn!(
-                bytes = raw.len(),
-                "SSE event exceeded the {MAX_SSE_EVENT_BYTES}-byte parse cap; forwarding it                  to the client unexamined and skipping its audit record"
-            );
-            out.push(SseEvent::passthrough(raw));
-            self.resyncing = true;
+            while let Some((body_len, term_len)) = find_event_end(&self.buf) {
+                let raw: Vec<u8> = self.buf.drain(..body_len + term_len).collect();
+                if raw.len() > MAX_SSE_EVENT_BYTES {
+                    // A complete oversized event may arrive in one frame,
+                    // so apply the cap before interpreting it as well as
+                    // to incomplete events below.
+                    out.push(SseEvent::passthrough(raw));
+                    continue;
+                }
+                let body = &raw[..body_len];
+                out.push(SseEvent {
+                    name: field(body, "event:"),
+                    data: data_payload(body),
+                    raw,
+                });
+            }
+
+            if self.buf.len() > MAX_SSE_EVENT_BYTES {
+                // Forward all but the short lookbehind suffix, then stop
+                // parsing this event. Keeping the suffix unforwarded means
+                // it can participate in boundary matching without
+                // duplicating bytes at the client.
+                let emit_len = self.buf.len() - SSE_TERMINATOR_LOOKBEHIND;
+                let raw: Vec<u8> = self.buf.drain(..emit_len).collect();
+                tracing::warn!(
+                    bytes = raw.len(),
+                    "SSE event exceeded the {MAX_SSE_EVENT_BYTES}-byte parse cap; forwarding it to the client unexamined and skipping its audit record"
+                );
+                out.push(SseEvent::passthrough(raw));
+                self.resyncing = true;
+                continue;
+            }
+
+            if offset == chunk.len() {
+                return out;
+            }
+
+            // Fill no further than one byte over the parse cap. If there is
+            // no event boundary by then, the next iteration switches to
+            // bounded resynchronisation and preserves terminator lookbehind.
+            let room = MAX_SSE_EVENT_BYTES + 1 - self.buf.len();
+            let take = room.min(chunk.len() - offset);
+            self.buf.extend_from_slice(&chunk[offset..offset + take]);
+            offset += take;
         }
-        out
     }
 
     /// Bytes received that have not yet formed a complete event, taken so
