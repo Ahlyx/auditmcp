@@ -9,7 +9,7 @@ not replace OS CI, packaged binary checks, or the Windows client dogfood run.
 - [x] Local Windows: `cargo fmt --all --check`
 - [x] Local Windows: `cargo clippy --all-targets --locked -- -D warnings`
 - [x] Local Windows: `cargo test --locked`
-- [ ] Windows, Linux, and macOS CI is green for the integrated changes.
+- [x] Windows, Linux, and macOS CI is green for the integrated changes.
 - [x] `cargo audit` is clean, or each reported advisory has a recorded
   assessment and disposition.
 - [ ] Packaged release binaries pass the stdio EOF, bounded target shutdown,
