@@ -127,6 +127,13 @@ jobs:
         shell: pwsh
         run: |
           Expand-Archive "$env:ARCHIVE_NAME.zip" -DestinationPath smoke
+          $expandedEntries = @(Get-ChildItem -LiteralPath smoke -Force)
+          if ($expandedEntries.Count -ne 1) {
+            throw "Expected one archive root directory, got: $($expandedEntries.Name -join ', ')"
+          }
+          if ($expandedEntries[0].Name -ne $env:ARCHIVE_NAME -or -not $expandedEntries[0].PSIsContainer) {
+            throw "Unexpected archive root entry: $($expandedEntries[0].Name)"
+          }
           $archiveRoot = Join-Path (Join-Path $PWD "smoke") $env:ARCHIVE_NAME
           $expectedFiles = @(
             "auditmcp.exe",
