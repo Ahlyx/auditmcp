@@ -32,7 +32,7 @@ use crate::db::ToolCallEntry;
 use crate::extract::Destination;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 /// A `tools/call` request seen on the wire, held until its response
@@ -59,7 +59,7 @@ pub(crate) struct PendingCall {
 /// different rows is worse than one that says which it is.
 pub(crate) struct Session {
     id: String,
-    pending: Mutex<HashMap<String, PendingCall>>,
+    pending: Mutex<PendingState>,
     /// Per-session anomaly baseline. Lives here rather than in a
     /// process-wide registry for the same reason `pending` does — see the
     /// module doc: state that is per-session must be owned by its session,
@@ -68,11 +68,49 @@ pub(crate) struct Session {
     stats: Mutex<SessionStats>,
 }
 
+struct PendingState {
+    accepting: bool,
+    accepting_responses: bool,
+    calls: HashMap<String, PendingCall>,
+}
+
+/// A short synchronous permit held while one inbound line is parsed,
+/// registered, and any displaced calls are logged. Shutdown takes the same
+/// lock to close registration, so it cannot drain between registration and
+/// the corresponding audit write.
+pub(crate) struct InputPermit<'a> {
+    state: MutexGuard<'a, PendingState>,
+}
+
+/// A synchronous response-processing guard. It stays held from correlation
+/// through audit logging, so shutdown can close response registration and
+/// know no resolved call is between removal from the pending map and its
+/// database enqueue.
+pub(crate) struct ResponsePermit<'a> {
+    state: MutexGuard<'a, PendingState>,
+}
+
+impl ResponsePermit<'_> {
+    pub(crate) fn resolve(&mut self, id_key: &str) -> Option<PendingCall> {
+        self.state.calls.remove(id_key)
+    }
+}
+
+impl InputPermit<'_> {
+    pub(crate) fn register(&mut self, id_key: String, call: PendingCall) -> Option<PendingCall> {
+        self.state.calls.insert(id_key, call)
+    }
+}
+
 impl Session {
     pub(crate) fn new(id: String) -> Self {
         Session {
             id,
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingState {
+                accepting: true,
+                accepting_responses: true,
+                calls: HashMap::new(),
+            }),
             stats: Mutex::new(SessionStats::new()),
         }
     }
@@ -120,7 +158,41 @@ impl Session {
     /// log it as best-effort (see call sites in `proxy.rs` / `http.rs`)
     /// rather than dropping it.
     pub(crate) fn register(&self, id_key: String, call: PendingCall) -> Option<PendingCall> {
-        self.lock().insert(id_key, call)
+        let mut state = self.lock();
+        if !state.accepting {
+            return None;
+        }
+        state.calls.insert(id_key, call)
+    }
+
+    /// Begins processing one input line if the centralized shutdown path
+    /// has not closed registration. The returned guard synchronizes the
+    /// entire line's registration/logging section with `stop_accepting`.
+    pub(crate) fn begin_input(&self) -> Option<InputPermit<'_>> {
+        let state = self.lock();
+        state.accepting.then_some(InputPermit { state })
+    }
+
+    /// Closes the registration gate before pumps stop and before pending
+    /// calls are drained. A concurrent `begin_input` either owns the lock
+    /// first and completes its synchronous section, or sees the closed gate.
+    pub(crate) fn stop_accepting(&self) {
+        self.lock().accepting = false;
+    }
+
+    /// Stops response resolution after the bounded outbound-pump window.
+    /// Any response already being processed completes its synchronous audit
+    /// enqueue before this returns; later responses cannot remove calls from
+    /// the timeout drain.
+    pub(crate) fn stop_responses(&self) {
+        self.lock().accepting_responses = false;
+    }
+
+    pub(crate) fn begin_response(&self) -> Option<ResponsePermit<'_>> {
+        let state = self.lock();
+        state
+            .accepting_responses
+            .then_some(ResponsePermit { state })
     }
 
     /// Takes the pending call for `id_key`, if this session has one.
@@ -132,7 +204,11 @@ impl Session {
     /// ignored. Duplicate rows in a hash-chained audit log have no
     /// representation here rather than being deduplicated after the fact.
     pub(crate) fn resolve(&self, id_key: &str) -> Option<PendingCall> {
-        self.lock().remove(id_key)
+        let mut state = self.lock();
+        state
+            .accepting_responses
+            .then(|| state.calls.remove(id_key))
+            .flatten()
     }
 
     /// Takes every call still awaiting a response, leaving the session
@@ -150,7 +226,7 @@ impl Session {
     /// response arriving mid-drain and being logged twice, once by
     /// `resolve` and once here.
     pub(crate) fn drain_abandoned(&self) -> Vec<PendingCall> {
-        self.lock().drain().map(|(_, c)| c).collect()
+        self.lock().calls.drain().map(|(_, c)| c).collect()
     }
 
     /// Recovers from a poisoned lock rather than propagating the panic.
@@ -158,7 +234,7 @@ impl Session {
     /// leave the map inconsistent, and refusing to correlate calls because
     /// an unrelated thread panicked would turn one failure into a silent
     /// audit gap.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingCall>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingState> {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

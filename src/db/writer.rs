@@ -170,8 +170,13 @@ pub(crate) fn insert_row_with_key(
 /// sender plus a shared drop counter.
 #[derive(Clone)]
 pub struct DbHandle {
-    sender: SyncSender<ToolCallEntry>,
+    sender: SyncSender<DbCommand>,
     dropped: DropTally,
+}
+
+enum DbCommand {
+    Entry(ToolCallEntry),
+    Durable(ToolCallEntry, SyncSender<Result<(), String>>),
 }
 
 impl DbHandle {
@@ -181,7 +186,7 @@ impl DbHandle {
     /// blocking the caller until space frees up. It never panics or
     /// propagates an error that could interrupt the proxied session.
     pub fn log(&self, entry: ToolCallEntry) {
-        match self.sender.try_send(entry) {
+        match self.sender.try_send(DbCommand::Entry(entry)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 let prev = self.dropped.record();
@@ -210,6 +215,49 @@ impl DbHandle {
                     tracing::warn!("writer unavailable; {} entries dropped so far", prev + 1);
                 }
             }
+        }
+    }
+
+    /// Queues a recovery marker and waits until its transaction commits.
+    /// This is used only while holding the abandoned session's OS lease,
+    /// so another process cannot race the lifecycle check and append a
+    /// duplicate marker. Normal proxy writes stay non-blocking.
+    pub(crate) fn log_durable(
+        &self,
+        entry: ToolCallEntry,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let (reply_tx, reply_rx) = sync_channel(1);
+        let mut command = DbCommand::Durable(entry, reply_tx);
+        loop {
+            match self.sender.try_send(command) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    command = returned;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(anyhow::anyhow!(
+                            "timed out waiting for space in the audit writer queue"
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(anyhow::anyhow!("audit writer is unavailable"));
+                }
+            }
+        }
+        // Once accepted, keep the caller-held idempotency lock until commit
+        // is confirmed. A timeout here could let another process race the
+        // still-queued recovery command and append a duplicate.
+        match reply_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(anyhow::anyhow!(
+                "failed to persist recovery marker: {error}"
+            )),
+            Err(std::sync::mpsc::RecvError) => Err(anyhow::anyhow!(
+                "audit writer stopped before recovery marker commit"
+            )),
         }
     }
 }
@@ -359,7 +407,7 @@ pub fn spawn_writer_with_key(
     hash_key: HashKey,
 ) -> anyhow::Result<(DbHandle, DbWriter)> {
     let conn = open_db(db_path)?;
-    let (tx, rx) = sync_channel::<ToolCallEntry>(CHANNEL_CAPACITY);
+    let (tx, rx) = sync_channel::<DbCommand>(CHANNEL_CAPACITY);
     let (done_tx, done_rx) = sync_channel::<()>(1);
     let tally = DropTally::default();
 
@@ -390,7 +438,7 @@ pub fn spawn_writer_with_key(
 /// fail-open logging must not do.
 fn writer_loop(
     mut conn: Connection,
-    rx: Receiver<ToolCallEntry>,
+    rx: Receiver<DbCommand>,
     dropped: DropTally,
     hash_key: HashKey,
     writer_session_id: String,
@@ -407,7 +455,7 @@ fn writer_loop(
     // lock. The cost is one indexed point query per insert, noise next to
     // the SHA-256 and the disk write.
     let mut recorded_drops = 0;
-    for entry in rx.iter() {
+    for command in rx.iter() {
         persist_audit_gap(
             &mut conn,
             &hash_key,
@@ -415,16 +463,29 @@ fn writer_loop(
             &mut recorded_drops,
             &writer_session_id,
         );
-        let tool_name = entry.tool_name.clone();
-        if let Err(e) = insert_row_with_key(&mut conn, &entry, &hash_key) {
-            // Counted, not just warned. This is a genuine loss -- the
-            // transaction rolled back, so the chain is intact but shorter
-            // than the calls that happened -- and it is the loss path most
-            // likely under the deployment this project recommends, where
-            // several processes share one database and contend for the
-            // write lock.
-            dropped.record();
-            tracing::warn!("failed to write audit log entry for tool '{tool_name}': {e}");
+        match command {
+            DbCommand::Entry(entry) => {
+                let tool_name = entry.tool_name.clone();
+                if let Err(e) = insert_row_with_key(&mut conn, &entry, &hash_key) {
+                    // Counted, not just warned. This is a genuine loss -- the
+                    // transaction rolled back, so the chain is intact but shorter
+                    // than the calls that happened -- and this is likely under
+                    // the deployment where several processes share one db_path.
+                    dropped.record();
+                    tracing::warn!("failed to write audit log entry for tool '{tool_name}': {e}");
+                }
+            }
+            DbCommand::Durable(entry, reply) => {
+                let result = insert_row_with_key(&mut conn, &entry, &hash_key).map(|_| ());
+                if let Err(error) = &result {
+                    dropped.record();
+                    tracing::warn!(
+                        "failed to write durable audit entry for tool '{}': {error}",
+                        entry.tool_name
+                    );
+                }
+                let _ = reply.send(result.map_err(|e| e.to_string()));
+            }
         }
     }
     // An INSERT failure on the last queued entry has no later iteration to
@@ -511,7 +572,8 @@ mod tests {
         let tally = DropTally::default();
         tally.record();
         tally.record();
-        tx.send(crate::db::test_support::sample_entry()).unwrap();
+        tx.send(DbCommand::Entry(crate::db::test_support::sample_entry()))
+            .unwrap();
         drop(tx);
 
         writer_loop(conn, rx, tally, HashKey::Legacy, "writer:test".to_string());

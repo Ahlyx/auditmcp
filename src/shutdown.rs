@@ -36,6 +36,11 @@ pub(crate) const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// still in flight then is logged as a timeout, not lost.
 pub(crate) const PUMP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// After client stdin closes, give the target a brief chance to finish its
+/// own shutdown before terminating it. Its stdin is closed when the inbound
+/// pump returns, so well-behaved servers can observe EOF during this window.
+pub(crate) const TARGET_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long the blocking close/shutdown handler may hold the OS teardown
 /// grace open. Windows grants roughly 5 seconds from delivering
 /// `CTRL_CLOSE`/`CTRL_SHUTDOWN` to forcibly terminating the process;
@@ -94,10 +99,26 @@ unsafe extern "system" fn blocking_close_handler(ctrl_type: u32) -> i32 {
     }
 }
 
+/// Why client-to-target input stopped. Keeping these causes distinct makes
+/// disconnect handling explicit without making input-pump failures skip
+/// the centralized audit drain.
+#[derive(Debug)]
+pub(crate) enum InboundExit {
+    ClientEof,
+    ClientReadFailure(String),
+    TargetWriteFailure(String),
+    TargetFlushFailure(String),
+    ProtocolSizeRefusal(usize),
+    PumpTaskFailure(String),
+    ShutdownRequested,
+}
+
 /// Why the proxy is shutting down.
 pub(crate) enum Stop {
     TargetExited(std::process::ExitStatus),
+    TargetWaitFailure(String),
     Signal(&'static str),
+    InboundEnded(InboundExit),
 }
 
 /// Resolves when the process is asked to stop, naming the mechanism.

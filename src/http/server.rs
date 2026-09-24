@@ -79,14 +79,26 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     // is independent of the per-connection sessions the listeners manage.
     let serve_session_id = format!("serve:{}", uuid::Uuid::new_v4());
     const SERVE_HEARTBEAT_SERVER_NAME: &str = "auditmcp-serve";
+    let lease = crate::lease::SessionLease::create(db_path)?;
+    match crate::recovery::recover_abandoned(db_path, &db) {
+        Ok(count) if count > 0 => tracing::warn!(
+            count,
+            "appended session abandonment evidence for {count} previously terminated session(s)"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            "could not scan for abandoned sessions; sessions without reliable evidence remain unknown: {error}"
+        ),
+    }
 
     let (heartbeat_min, heartbeat_max) = chain_mode.heartbeat_cadence();
     if config.heartbeat.enabled {
-        db.log(crate::heartbeat::session_start_entry(
+        db.log(crate::heartbeat::session_start_entry_with_lease(
             &serve_session_id,
             SERVE_HEARTBEAT_SERVER_NAME,
             heartbeat_min,
             heartbeat_max,
+            lease.id(),
         ));
     }
     let heartbeat_task = config.heartbeat.enabled.then(|| {
@@ -196,9 +208,11 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     // same ordering `run` uses.
     if let Some(task) = heartbeat_task {
         task.abort();
+        let _ = task.await;
     }
     if let Some(task) = anchor_task {
         task.abort();
+        let _ = task.await;
     }
     if config.heartbeat.enabled {
         db.log(crate::heartbeat::session_end_entry(
@@ -233,7 +247,10 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
                 String::new()
             }
         )),
-    }
+    }?;
+
+    drop(lease);
+    Ok(())
 }
 
 pub(crate) fn build_listener(
