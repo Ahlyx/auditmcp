@@ -504,7 +504,12 @@ async fn real_http_binary_logs_non_json_and_capture_truncation_for_query_export_
         }),
     )
     .await;
-    assert!(String::from_utf8_lossy(&large).starts_with("HTTP/1.1 200"));
+    let large_response = String::from_utf8_lossy(&large);
+    assert!(
+        large_response.starts_with("HTTP/1.1 200"),
+        "expected a forwarded HTTP 200 large response, got: {}",
+        large_response.lines().next().unwrap_or("empty response")
+    );
     assert!(
         large.len() > 1_100_000,
         "proxy did not forward the complete body"
