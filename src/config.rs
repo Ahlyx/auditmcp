@@ -110,7 +110,8 @@ pub struct TargetConfig {
     #[serde(default)]
     pub command: Vec<String>,
     /// Logged into every stdio row's `server_name` column. Optional; falls
-    /// back to the normalized target executable/program basename. Setting
+    /// back to the target executable/program basename (case-folded on
+    /// Windows only). Setting
     /// it explicitly matters when different servers share one db_path and
     /// launch through the same interpreter or package shim.
     pub server_name: Option<String>,
@@ -363,16 +364,24 @@ impl Config {
     }
 
     /// The name logged into stdio rows: the config's explicit
-    /// `[target].server_name` if set, else a normalized executable/program
-    /// basename. Path separators and case are normalized so equivalent
-    /// Windows path spellings do not create distinct server identities.
+    /// `[target].server_name` if set, else the executable/program basename.
+    /// Path separators are normalized on every platform; basename case is
+    /// normalized only on Windows, where executable identity is
+    /// case-insensitive.
     pub fn server_name_for(&self, program: &str) -> String {
         self.target.server_name.clone().unwrap_or_else(|| {
-            program
+            let basename = program
                 .rsplit(['/', '\\'])
                 .find(|part| !part.is_empty())
-                .unwrap_or(program)
-                .to_ascii_lowercase()
+                .unwrap_or(program);
+            #[cfg(windows)]
+            {
+                basename.to_lowercase()
+            }
+            #[cfg(not(windows))]
+            {
+                basename.to_string()
+            }
         })
     }
 }
@@ -437,7 +446,7 @@ db_path = "./test.db"
 
     /// Backward compatibility: a config written before `server_name`
     /// existed (the field absent entirely) must still parse, and must fall
-    /// back to a normalized program basename.
+    /// back to a platform-appropriate program basename.
     #[test]
     fn config_without_server_name_falls_back_to_program_name() {
         let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
@@ -445,15 +454,27 @@ db_path = "./test.db"
         assert_eq!(config.server_name_for("python"), "python");
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_path_spellings_and_bare_executable_share_a_logical_name() {
         let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
         let backslash = config.server_name_for(r"C:\Users\Alice\Tools\Ghidra-MCP.EXE");
-        let forwardslash = config.server_name_for("C:/Users/Alice/Tools/Ghidra-MCP.EXE");
-        let basename = config.server_name_for("Ghidra-MCP.EXE");
+        let forwardslash = config.server_name_for("c:/users/alice/tools/ghidra-mcp.exe");
+        let basename = config.server_name_for("ghidra-mcp.exe");
         assert_eq!(backslash, "ghidra-mcp.exe");
         assert_eq!(backslash, forwardslash);
         assert_eq!(backslash, basename);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn case_sensitive_platforms_preserve_executable_basename_case() {
+        let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        let upper = config.server_name_for("/usr/local/bin/Ghidra-MCP");
+        let lower = config.server_name_for("/usr/local/bin/ghidra-mcp");
+        assert_eq!(upper, "Ghidra-MCP");
+        assert_eq!(lower, "ghidra-mcp");
+        assert_ne!(upper, lower);
     }
 
     #[test]
@@ -688,7 +709,7 @@ db_path = "./test.db"
         let raw = r#"
 [target]
 command = ["python", "server.py"]
-server_name = "vault_reader"
+server_name = "Vault_Reader"
 
 [logging]
 db_path = "./test.db"
@@ -696,7 +717,7 @@ db_path = "./test.db"
         let config: Config = toml::from_str(raw).unwrap();
         assert_eq!(
             config.server_name_for(r"C:\path\python.EXE"),
-            "vault_reader"
+            "Vault_Reader"
         );
     }
 }

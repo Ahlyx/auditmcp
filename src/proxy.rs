@@ -941,16 +941,14 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn server_identity_is_taken_from_the_target_before_cmd_shim_wrapping() {
+    fn npm_style_shim_identity_is_taken_before_cmd_wrapping() {
         let config = Config::load(Path::new("")).unwrap();
-        let original = vec![
-            "npx.cmd".to_string(),
-            "-y".to_string(),
-            "some-mcp".to_string(),
-        ];
-        let server_name = config.server_name_for(&original[0]);
-        let wrapped = maybe_wrap_windows_shim(original);
-        assert_eq!(wrapped[0], "cmd");
-        assert_eq!(server_name, "npx.cmd");
+        for shim in ["npx.cmd", "npm.cmd"] {
+            let original = vec![shim.to_string(), "-y".to_string(), "some-mcp".to_string()];
+            let server_name = config.server_name_for(&original[0]);
+            let wrapped = maybe_wrap_windows_shim(original);
+            assert_eq!(wrapped[0], "cmd");
+            assert_eq!(server_name, shim);
+        }
     }
 }
