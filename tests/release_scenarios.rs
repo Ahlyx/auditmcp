@@ -97,6 +97,37 @@ async fn wait_for_tcp(address: &str) {
     .unwrap_or_else(|_| panic!("listener did not become ready at {address}"));
 }
 
+async fn wait_for_fake_http_server(address: &str) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let body = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0", "id": 0, "method": "tools/list"
+            }))
+            .unwrap();
+            if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
+                let request = format!(
+                    "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(request.as_bytes()).await.is_ok()
+                    && stream.write_all(&body).await.is_ok()
+                {
+                    let mut response = Vec::new();
+                    if stream.read_to_end(&mut response).await.is_ok()
+                        && String::from_utf8_lossy(&response).contains("\"tools\"")
+                    {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("fake HTTP server did not answer tools/list at {address}"));
+}
+
 async fn post_http_rpc(address: &str, message: Value) -> Vec<u8> {
     let body = serde_json::to_vec(&message).unwrap();
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -459,6 +490,7 @@ async fn real_http_binary_logs_non_json_and_capture_truncation_for_query_export_
     let key = dir.0.join("http-chain.key");
     let (upstream_port, listen_port) = free_ports();
     let upstream = format!("http://127.0.0.1:{upstream_port}/mcp");
+    let upstream_address = format!("127.0.0.1:{upstream_port}");
     let listen_address = format!("127.0.0.1:{listen_port}");
     let config = write_http_config(&dir.0, &db, &key, &upstream, &listen_address);
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -474,6 +506,8 @@ async fn real_http_binary_logs_non_json_and_capture_truncation_for_query_export_
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    wait_for_fake_http_server(&upstream_address).await;
+
     let mut proxy = Command::new(BINARY)
         .arg("serve")
         .arg("--config")
