@@ -32,6 +32,8 @@ use crate::config::Config;
 use crate::db::{self, HashKey};
 use std::path::Path;
 
+const HEARTBEAT_GAP_EXPLANATION: &str = "A gap can follow system suspend/resume or scheduling delays as well as removed rows; it is not proof of tampering";
+
 /// What `verify` concluded. Returned rather than turned into a
 /// `std::process::exit` here so the exit-code policy is testable in-process:
 /// `main` is the only place that ends the process, and these variants are
@@ -327,7 +329,7 @@ fn finish_clean(
         let gaps = crate::heartbeat::find_heartbeat_gaps(&rows, cadence_max);
         if !gaps.is_empty() {
             eprintln!(
-                "FAILED: {} heartbeat gap(s) exceeded the expected cadence (max allowed {}s):",
+                "FAILED: {} heartbeat gap(s) exceeded the expected cadence (max allowed {}s). {HEARTBEAT_GAP_EXPLANATION}:",
                 gaps.len(),
                 (cadence_max as f64 * 1.5) as i64
             );
@@ -421,6 +423,12 @@ fn print_plan(plan: &db::RepairPlan, add_verb: &str, remove_verb: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_gap_diagnostic_explains_suspend_and_does_not_claim_tampering() {
+        assert!(HEARTBEAT_GAP_EXPLANATION.contains("suspend/resume"));
+        assert!(HEARTBEAT_GAP_EXPLANATION.contains("not proof of tampering"));
+    }
     use crate::db::test_support::{
         remove_db_files, seed_chain_with_key, seed_redacted_row_with_key, temp_db_path,
     };
@@ -847,10 +855,10 @@ mod tests {
         assert_eq!(fx.run().unwrap(), VerifyOutcome::Tampered);
     }
 
-    /// A too-wide gap between two heartbeats in the same session is
-    /// detected even though the chain itself hash-verifies cleanly --
-    /// exactly the "tail truncation is invisible to hashing alone" gap
-    /// heartbeats exist to close.
+    /// A deterministic, long scheduling/suspend gap has the same
+    /// conservative outcome as removed heartbeat rows: the chain hashes
+    /// cleanly, `verify` reports HeartbeatGap (not Tampered), and the output
+    /// names suspend/scheduling as possible explanations.
     #[test]
     fn wide_heartbeat_gap_returns_heartbeat_gap_outcome() {
         let fx = HmacFixture::new("hmac_hb_gap", 1, false); // max cadence 1s -> 1.5s allowed

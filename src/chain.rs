@@ -655,7 +655,30 @@ mod tests {
     #[test]
     fn a_version_1_chain_still_bootstraps() {
         let fx = Fixture::new("v1_compat");
-        bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
+        let mode = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default()).unwrap();
+        let old_row = {
+            let mut conn = db::open_for_write(&fx.db_path).unwrap();
+            db::insert_row_with_key(
+                &mut conn,
+                &db::test_support::sample_entry(),
+                &mode.hash_key(),
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT id, hash, prev_hash, timestamp, tool_name FROM tool_calls ORDER BY id LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
 
         // Rewrite this chain as a v1 one: drop the v2-only rows and
         // recompute the MAC the way 0.1.1 would have.
@@ -690,7 +713,37 @@ mod tests {
 
         let mode = bootstrap(&fx.db_path, &fx.key_path, GenesisSettings::default())
             .expect("a v1 chain must still be usable");
-        assert!(matches!(mode, ChainMode::Hmac { .. }));
+        assert!(matches!(&mode, ChainMode::Hmac { .. }));
+        {
+            let mut conn = db::open_for_write(&fx.db_path).unwrap();
+            let unchanged = conn
+                .query_row(
+                    "SELECT id, hash, prev_hash, timestamp, tool_name FROM tool_calls ORDER BY id LIMIT 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(unchanged, old_row, "bootstrap rewrote a legacy row");
+            db::insert_row_with_key(
+                &mut conn,
+                &db::test_support::sample_entry(),
+                &mode.hash_key(),
+            )
+            .unwrap();
+            assert_eq!(
+                db::verify_chain_with_key(&conn, &mode.hash_key()).unwrap(),
+                Ok(2),
+                "the old chain must remain verifiable after a safe append"
+            );
+        }
         remove_db_files(&fx.db_path);
         let _ = std::fs::remove_file(&fx.key_path);
     }

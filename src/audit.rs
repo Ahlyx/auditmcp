@@ -242,9 +242,10 @@ impl CallOutcome {
     /// The status reflects what actually happened to the call — the client
     /// received a complete response — because claiming an error for a call
     /// that succeeded would be its own kind of wrong record. What is
-    /// incomplete is our copy, and the stored payload says so in words
-    /// rather than leaving a truncated fragment that reads like the whole
-    /// thing. Forwarding is never sacrificed to capture: the alternative,
+    /// incomplete is our copy, and the stored JSON envelope says so with
+    /// `__auditmcp_truncated` and `original_bytes` rather than leaving a
+    /// truncated fragment that reads like the whole thing. Forwarding is
+    /// never sacrificed to capture: the alternative,
     /// buffering until we had it all, would make the proxy a blocking
     /// dependency of the agent it audits.
     pub(crate) fn capture_truncated(succeeded: bool, bytes_out: i64) -> Self {
@@ -254,11 +255,11 @@ impl CallOutcome {
             } else {
                 CallStatus::Error
             },
-            result: Some(Payload::Raw(format!(
-                "[auditmcp: response was {bytes_out} bytes and exceeded the audit \
-                 capture limit; it was forwarded to the client in full but is not \
-                 recorded here]"
-            ))),
+            result: Some(Payload::Json(serde_json::json!({
+                "__auditmcp_truncated": true,
+                "original_bytes": bytes_out,
+                "message": "Response exceeded the audit capture limit; the full response was forwarded to the client but is not recorded here."
+            }))),
             error: None,
             bytes_out: Some(bytes_out),
         }
@@ -790,6 +791,26 @@ mod tests {
         // Args were captured at request time and are still recorded.
         assert!(e.args_json.is_some());
         assert_eq!(e.bytes_in, Some(42));
+    }
+
+    #[test]
+    fn response_capture_truncation_is_explicit_and_keeps_call_status() {
+        let success = CallOutcome::capture_truncated(true, 1_100_000);
+        assert_eq!(success.status, CallStatus::Success);
+        let success_notice = match success.result.unwrap() {
+            Payload::Json(value) => value,
+            Payload::Raw(_) => panic!("capture notice should be structured JSON"),
+        };
+        assert_eq!(success_notice["__auditmcp_truncated"], true);
+        assert_eq!(success_notice["original_bytes"], 1_100_000);
+        assert!(success_notice["message"]
+            .as_str()
+            .unwrap()
+            .contains("forwarded to the client"));
+
+        let failure = CallOutcome::capture_truncated(false, 1_100_000);
+        assert_eq!(failure.status, CallStatus::Error);
+        assert_eq!(failure.bytes_out, Some(1_100_000));
     }
 
     /// Wiring test, distinct from `extract::tests`: the extractor is unit-
