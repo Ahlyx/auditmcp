@@ -1,13 +1,11 @@
 //! Session-scoped anomaly detection.
 //!
-//! Three rules, all rule-based and explainable (no ML), matching the
-//! phased spec exactly:
+//! Four rules, all rule-based and explainable (no ML):
 //!
-//! 1. **Size spike** — `bytes_out` for a tool exceeds
-//!    `SIZE_SPIKE_MULTIPLIER × running_mean` for the same tool in the same
-//!    session. Immune to a tool's first `MIN_SAMPLES_FOR_SIZE_RULE` calls
-//!    (the rule arms once that many prior samples exist), so a session's
-//!    opening samples don't flag each other.
+//! 1. **Size spike** — `bytes_out` exceeds a multiplier of the bounded
+//!    median of prior ordinary outputs for that tool. Extreme first
+//!    outputs can trip a separate warmup threshold. Outliers do not enter
+//!    the baseline, and already-reported nearby size regimes are suppressed.
 //! 2. **Novel destination** — a **network-shaped** destination
 //!    (`url`, `host`, `uri`, `target`) was never seen in this session
 //!    before. Filesystem destinations are deliberately excluded: writing
@@ -19,9 +17,10 @@
 //!    local vault. Also requires a non-empty prior baseline, so the very
 //!    first network destination in a session establishes the set rather
 //!    than firing this rule against nothing.
-//! 3. **Rapid repeats** — `RAPID_REPEAT_COUNT` calls to the same tool
-//!    landed within `RAPID_REPEAT_WINDOW`. Ordinary bursts of a few calls
-//!    stay quiet; a chunked exfiltration or an injection loop trips it.
+//! 3. **Rapid repeats** — `RAPID_REPEAT_COUNT` identical argument
+//!    fingerprints for the same tool landed within `RAPID_REPEAT_WINDOW`.
+//!    A high-cardinality burst has its own `rapid_fanout` rule with a
+//!    higher threshold so ordinary agent exploration stays quiet.
 //!    **Fires at most once per burst.** Once the rule fires for a tool,
 //!    subsequent calls to that tool inside `RAPID_REPEAT_WINDOW` are
 //!    suppressed — a 24-call burst issued in one batch should surface
@@ -42,21 +41,23 @@
 
 use crate::extract::{Destination, DestinationKind};
 use serde::Serialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-/// Number of prior samples per tool before rule 1 (size spike) is armed.
-/// Below this, the running mean is too noisy to anchor a multiplier —
-/// samples 2 and 3 of a series are frequently 5× sample 1 for perfectly
-/// ordinary reasons, and firing on those is pure noise.
-const MIN_SAMPLES_FOR_SIZE_RULE: u64 = 5;
+/// Number of prior ordinary samples per tool before the median baseline is
+/// used. An independent absolute threshold catches extreme warmup outputs.
+const MIN_SAMPLES_FOR_SIZE_RULE: usize = 5;
 
-/// How many times larger than the running mean a `bytes_out` value has to
-/// be before it flags. Not a stddev-based rule on purpose: bytes_out
-/// distributions for real MCP tools are heavy-tailed enough that a
-/// 3-sigma threshold either fires constantly (small-mean tools) or never
-/// (large-mean tools). A simple multiplier is coarser but more predictable.
-const SIZE_SPIKE_MULTIPLIER: f64 = 5.0;
+/// How many times larger than the median baseline a `bytes_out` value has
+/// to be before it flags.
+const SIZE_SPIKE_MULTIPLIER: i64 = 5;
+const SIZE_BOOTSTRAP_SPIKE_BYTES: i64 = 1_000_000;
+const SIZE_BASELINE_CAPACITY: usize = 31;
+const SIZE_BASELINE_FLOOR_BYTES: i64 = 1_024;
+const SIZE_BAND_NUMERATOR: i64 = 5;
+const SIZE_BAND_DENOMINATOR: i64 = 4;
 
 /// How many calls to the same tool must land within
 /// `RAPID_REPEAT_WINDOW` before rule 3 fires. Set at 5 rather than 3 so
@@ -68,6 +69,8 @@ const RAPID_REPEAT_COUNT: usize = 5;
 /// tool sequence never fills it and long enough that an automated loop
 /// running at any interactive rate does.
 const RAPID_REPEAT_WINDOW: Duration = Duration::from_secs(10);
+const RAPID_FANOUT_COUNT: usize = 25;
+const RAPID_EVENT_CAPACITY: usize = 256;
 
 /// One rule firing. Stored as a JSON array in the row's `anomaly_reasons`
 /// column so `query --anomalous` can show *why* a row was flagged, not
@@ -88,20 +91,62 @@ pub struct AnomalyReport {
     pub reasons: Vec<Reason>,
 }
 
-/// Welford's running mean. Only `count` and `mean` are read today (rule 1
-/// compares against the mean); the M2 sum-of-squares that full Welford
-/// tracks was removed until a rule actually consumes it.
 #[derive(Default)]
 struct ToolStats {
-    count: u64,
-    mean: f64,
+    baseline: VecDeque<i64>,
+    known_spike_bands: Vec<(i64, i64)>,
 }
 
 impl ToolStats {
-    fn observe(&mut self, x: f64) {
-        self.count += 1;
-        let delta = x - self.mean;
-        self.mean += delta / self.count as f64;
+    fn median(&self) -> Option<i64> {
+        if self.baseline.len() < MIN_SAMPLES_FOR_SIZE_RULE {
+            return None;
+        }
+        let mut values: Vec<_> = self.baseline.iter().copied().collect();
+        values.sort_unstable();
+        Some(values[values.len() / 2])
+    }
+
+    fn observe(&mut self, bytes: i64) -> Option<Reason> {
+        if bytes < 0 {
+            return None;
+        }
+        if self
+            .known_spike_bands
+            .iter()
+            .any(|(low, high)| (*low..=*high).contains(&bytes))
+        {
+            return None;
+        }
+
+        let median = self.median();
+        let bootstrap_spike = median.is_none() && bytes >= SIZE_BOOTSTRAP_SPIKE_BYTES;
+        let baseline_spike = median.is_some_and(|median| {
+            bytes > median.saturating_mul(SIZE_SPIKE_MULTIPLIER)
+                && bytes > SIZE_BASELINE_FLOOR_BYTES
+        });
+        if bootstrap_spike || baseline_spike {
+            let low = bytes.saturating_mul(SIZE_BAND_DENOMINATOR) / SIZE_BAND_NUMERATOR;
+            let high = bytes.saturating_mul(SIZE_BAND_NUMERATOR) / SIZE_BAND_DENOMINATOR;
+            self.known_spike_bands.push((low, high));
+            return Some(Reason {
+                rule: "size_spike",
+                detail: match median {
+                    Some(median) => format!(
+                        "bytes_out={bytes} exceeds {SIZE_SPIKE_MULTIPLIER}× median baseline ({median} bytes) for this tool; known size band recorded"
+                    ),
+                    None => format!(
+                        "bytes_out={bytes} exceeds the {SIZE_BOOTSTRAP_SPIKE_BYTES}-byte warmup threshold; known size band recorded"
+                    ),
+                },
+            });
+        }
+
+        self.baseline.push_back(bytes);
+        while self.baseline.len() > SIZE_BASELINE_CAPACITY {
+            self.baseline.pop_front();
+        }
+        None
     }
 }
 
@@ -109,12 +154,11 @@ impl ToolStats {
 /// `session_id` for the lifetime of the session.
 #[derive(Default)]
 pub struct SessionStats {
-    /// Running (count, mean) per tool. Rule 1 reads both.
+    /// Bounded robust baseline and already-reported size regimes per tool.
     tool_stats: HashMap<String, ToolStats>,
-    /// The last few call timestamps per tool. Rule 3 checks whether the
-    /// oldest of the last `RAPID_REPEAT_COUNT` sits inside
-    /// `RAPID_REPEAT_WINDOW`.
-    tool_timestamps: HashMap<String, VecDeque<Instant>>,
+    /// Recent argument fingerprints and timestamps per tool. Repeats count
+    /// identical payloads; fan-out counts distinct payloads.
+    tool_events: HashMap<String, VecDeque<(Instant, [u8; 32])>>,
     /// Every **network-shaped** destination this session has seen. Rule 2
     /// flags a network destination not in this set (once the set is
     /// non-empty). Filesystem destinations are never inserted or checked
@@ -126,6 +170,8 @@ pub struct SessionStats {
     /// updated on suppressed events, so a still-hot burst can't extend
     /// its own cooldown indefinitely.
     last_rapid_fire: HashMap<String, Instant>,
+    /// Separate cooldown for the high-cardinality fan-out rule.
+    last_fanout_fire: HashMap<String, Instant>,
 }
 
 impl SessionStats {
@@ -133,50 +179,30 @@ impl SessionStats {
         Self::default()
     }
 
-    /// Records one completed tool call and reports which rules it tripped.
-    ///
-    /// `now` is threaded through rather than read from `Instant::now()`
-    /// inside so tests can drive time deterministically and so callers
-    /// that already have a timestamp (the audit path has one) don't
-    /// double-source it. `destination` is what the audit path pulled from
-    /// `extract::destination_from_args`, kind and all; `None` means the
-    /// tool had no destination to record, not that it had a destination
-    /// equal to empty-string.
-    pub fn observe(
+    /// Records a call with the stable fingerprint of its full arguments.
+    /// The compatibility wrapper below treats calls without a supplied
+    /// fingerprint as identical, which keeps direct rule tests concise.
+    pub fn observe_with_fingerprint(
         &mut self,
         tool_name: &str,
         bytes_out: Option<i64>,
         destination: Option<&Destination>,
+        fingerprint: [u8; 32],
         now: Instant,
     ) -> Option<AnomalyReport> {
         let mut reasons = Vec::new();
 
-        // Rule 1: size spike. Check BEFORE updating stats so the current
-        // sample is compared against the baseline that predates it — else
-        // the sample partly cancels its own outlier-ness.
         if let Some(bytes) = bytes_out {
-            if let Some(stats) = self.tool_stats.get(tool_name) {
-                if stats.count >= MIN_SAMPLES_FOR_SIZE_RULE
-                    && (bytes as f64) > SIZE_SPIKE_MULTIPLIER * stats.mean
-                {
-                    reasons.push(Reason {
-                        rule: "size_spike",
-                        detail: format!(
-                            "bytes_out={} exceeds {}× running mean ({:.0}) over {} prior calls to {}",
-                            bytes, SIZE_SPIKE_MULTIPLIER as u64, stats.mean, stats.count, tool_name
-                        ),
-                    });
-                }
+            if let Some(reason) = self
+                .tool_stats
+                .entry(tool_name.to_string())
+                .or_default()
+                .observe(bytes)
+            {
+                reasons.push(reason);
             }
         }
 
-        // Rule 2: novel network destination. Filesystem destinations
-        // never reach the baseline set and never fire (see the module
-        // doc); network destinations do. Checked BEFORE the insert below,
-        // so we can tell "this destination is new" from "this destination
-        // is the one we just recorded." Skipped on the empty-baseline
-        // case: the first network destination in a session establishes
-        // the set rather than flagging against nothing.
         if let Some(dest) = destination {
             if dest.kind == DestinationKind::Network
                 && !self.seen_network_destinations.is_empty()
@@ -193,54 +219,64 @@ impl SessionStats {
             }
         }
 
-        // Rule 3: rapid repeats. Push, trim to the last N, then check
-        // whether the whole ring fits in the window and the tool isn't
-        // still cooling down from a previous fire.
-        let ring = self
-            .tool_timestamps
-            .entry(tool_name.to_string())
-            .or_default();
-        ring.push_back(now);
-        while ring.len() > RAPID_REPEAT_COUNT {
-            ring.pop_front();
+        let events = self.tool_events.entry(tool_name.to_string()).or_default();
+        while events
+            .front()
+            .is_some_and(|(when, _)| now.saturating_duration_since(*when) > RAPID_REPEAT_WINDOW)
+        {
+            events.pop_front();
         }
-        if ring.len() == RAPID_REPEAT_COUNT {
-            let span = now.saturating_duration_since(*ring.front().unwrap());
-            if span <= RAPID_REPEAT_WINDOW {
-                // Suppress if we already fired for this tool inside the
-                // cooldown window. `last_rapid_fire` is only updated on
-                // an actual fire, so a hot burst can't extend its own
-                // cooldown by triggering the check repeatedly.
-                let cooling_down = self
-                    .last_rapid_fire
-                    .get(tool_name)
-                    .is_some_and(|last| now.saturating_duration_since(*last) < RAPID_REPEAT_WINDOW);
-                if !cooling_down {
-                    reasons.push(Reason {
-                        rule: "rapid_repeats",
-                        detail: format!(
-                            "{} calls to {} within {:.1}s (window: {}s)",
-                            RAPID_REPEAT_COUNT,
-                            tool_name,
-                            span.as_secs_f64(),
-                            RAPID_REPEAT_WINDOW.as_secs()
-                        ),
-                    });
-                    self.last_rapid_fire.insert(tool_name.to_string(), now);
-                }
+        events.push_back((now, fingerprint));
+        while events.len() > RAPID_EVENT_CAPACITY {
+            events.pop_front();
+        }
+
+        let matching: Vec<_> = events
+            .iter()
+            .filter(|(_, seen)| *seen == fingerprint)
+            .map(|(when, _)| *when)
+            .collect();
+        if matching.len() >= RAPID_REPEAT_COUNT {
+            let span = now.saturating_duration_since(matching[matching.len() - RAPID_REPEAT_COUNT]);
+            let cooling_down = self
+                .last_rapid_fire
+                .get(tool_name)
+                .is_some_and(|last| now.saturating_duration_since(*last) < RAPID_REPEAT_WINDOW);
+            if !cooling_down {
+                reasons.push(Reason {
+                    rule: "rapid_repeats",
+                    detail: format!(
+                        "{} identical argument payloads for {} within {:.1}s (window: {}s)",
+                        RAPID_REPEAT_COUNT,
+                        tool_name,
+                        span.as_secs_f64(),
+                        RAPID_REPEAT_WINDOW.as_secs()
+                    ),
+                });
+                self.last_rapid_fire.insert(tool_name.to_string(), now);
             }
         }
 
-        // Now update the rest of the state: size baseline gets this
-        // sample, destination set gets this destination. Ring buffer was
-        // already updated above (rule 3 needs to include the current
-        // call).
-        if let Some(bytes) = bytes_out {
-            self.tool_stats
-                .entry(tool_name.to_string())
-                .or_default()
-                .observe(bytes as f64);
+        let distinct_count = events
+            .iter()
+            .map(|(_, seen)| *seen)
+            .collect::<HashSet<_>>()
+            .len();
+        let fanout_cooling = self
+            .last_fanout_fire
+            .get(tool_name)
+            .is_some_and(|last| now.saturating_duration_since(*last) < RAPID_REPEAT_WINDOW);
+        if distinct_count >= RAPID_FANOUT_COUNT && !fanout_cooling {
+            reasons.push(Reason {
+                rule: "rapid_fanout",
+                detail: format!(
+                    "{distinct_count} distinct argument payloads for {tool_name} within {}s",
+                    RAPID_REPEAT_WINDOW.as_secs()
+                ),
+            });
+            self.last_fanout_fire.insert(tool_name.to_string(), now);
         }
+
         if let Some(dest) = destination {
             if dest.kind == DestinationKind::Network {
                 self.seen_network_destinations.insert(dest.value.clone());
@@ -256,8 +292,47 @@ impl SessionStats {
             })
         }
     }
+
+    #[cfg(test)]
+    pub fn observe(
+        &mut self,
+        tool_name: &str,
+        bytes_out: Option<i64>,
+        destination: Option<&Destination>,
+        now: Instant,
+    ) -> Option<AnomalyReport> {
+        self.observe_with_fingerprint(
+            tool_name,
+            bytes_out,
+            destination,
+            no_args_fingerprint(),
+            now,
+        )
+    }
 }
 
+/// In-memory-only stable fingerprint. The raw payload never enters
+/// anomaly state, and the domain prefix separates these digests from the
+/// hashes used by the audit chain.
+pub(crate) fn fingerprint_args(args: Option<&Value>) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"auditmcp-argument-fingerprint-v1\0");
+    match args {
+        Some(value) => {
+            hasher.update([1]);
+            if let Ok(encoded) = serde_json::to_vec(value) {
+                hasher.update(encoded);
+            }
+        }
+        None => hasher.update([0]),
+    }
+    hasher.finalize().into()
+}
+
+#[cfg(test)]
+fn no_args_fingerprint() -> [u8; 32] {
+    fingerprint_args(None)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,13 +373,85 @@ mod tests {
         let mut s = SessionStats::new();
         let t = t0();
         for i in 0..5 {
-            s.observe("echo", Some(100), None, t + Duration::from_secs(i * 60));
+            s.observe("echo", Some(1_000), None, t + Duration::from_secs(i * 60));
         }
         let r = s
-            .observe("echo", Some(1000), None, t + Duration::from_secs(600))
+            .observe("echo", Some(10_000), None, t + Duration::from_secs(600))
             .expect("expected an anomaly on the spike");
         assert_eq!(r.reasons.len(), 1);
         assert_eq!(r.reasons[0].rule, "size_spike");
+    }
+
+    #[test]
+    fn early_extreme_response_is_detected_without_a_mature_baseline() {
+        let mut stats = SessionStats::new();
+        let t = t0();
+        let first = stats
+            .observe("search_strings", Some(1_720_000), None, t)
+            .expect("extreme first response should trip the warmup threshold");
+        assert_eq!(first.reasons[0].rule, "size_spike");
+        let repeated = stats.observe(
+            "search_strings",
+            Some(1_730_000),
+            None,
+            t + Duration::from_secs(60),
+        );
+        assert!(repeated.is_none(), "same large regime should be suppressed");
+    }
+
+    #[test]
+    fn stable_large_decompile_regime_alerts_once_and_new_magnitude_alerts_again() {
+        let mut stats = SessionStats::new();
+        let t = t0();
+        for i in 0..5 {
+            assert!(stats
+                .observe(
+                    "decompile_function",
+                    Some(1_000),
+                    None,
+                    t + Duration::from_secs(i * 60)
+                )
+                .is_none());
+        }
+
+        let first = stats
+            .observe(
+                "decompile_function",
+                Some(206_000),
+                None,
+                t + Duration::from_secs(600),
+            )
+            .expect("new large regime should be reported once");
+        assert!(first
+            .reasons
+            .iter()
+            .any(|reason| reason.rule == "size_spike"));
+
+        for (i, bytes) in [210_000, 214_000, 208_000].into_iter().enumerate() {
+            let report = stats.observe(
+                "decompile_function",
+                Some(bytes),
+                None,
+                t + Duration::from_secs(660 + i as u64 * 60),
+            );
+            assert!(
+                report.is_none(),
+                "stable large response fired again: {bytes}"
+            );
+        }
+
+        let new_regime = stats
+            .observe(
+                "decompile_function",
+                Some(2_000_000),
+                None,
+                t + Duration::from_secs(900),
+            )
+            .expect("a genuinely new magnitude must remain visible");
+        assert!(new_regime
+            .reasons
+            .iter()
+            .any(|reason| reason.rule == "size_spike"));
     }
 
     /// The pre-armed calls are immune even if each one looks wildly
@@ -343,7 +490,7 @@ mod tests {
         // Now `write_note` sees its first-ever call at a huge size.
         let r = s.observe(
             "write_note",
-            Some(1_000_000),
+            Some(999_999),
             None,
             t + Duration::from_secs(600),
         );
@@ -486,6 +633,84 @@ mod tests {
             .expect("expected rapid_repeats on the fifth call");
         assert_eq!(r.reasons.len(), 1);
         assert_eq!(r.reasons[0].rule, "rapid_repeats");
+    }
+
+    #[test]
+    fn five_distinct_function_addresses_are_not_a_retry_loop() {
+        let mut stats = SessionStats::new();
+        let t = t0();
+        for i in 0..5 {
+            let args = serde_json::json!({ "address": format!("0x{:x}", 0x1000 + i) });
+            let report = stats.observe_with_fingerprint(
+                "decompile_function",
+                None,
+                None,
+                fingerprint_args(Some(&args)),
+                t + Duration::from_secs(i),
+            );
+            assert!(report.is_none(), "distinct address {i} was flagged");
+        }
+    }
+
+    #[test]
+    fn five_identical_requests_are_flagged_as_a_retry_loop() {
+        let mut stats = SessionStats::new();
+        let args = serde_json::json!({ "address": "0x401000" });
+        let fingerprint = fingerprint_args(Some(&args));
+        let t = t0();
+        for i in 0..4 {
+            assert!(stats
+                .observe_with_fingerprint(
+                    "decompile_function",
+                    None,
+                    None,
+                    fingerprint,
+                    t + Duration::from_secs(i),
+                )
+                .is_none());
+        }
+        let report = stats
+            .observe_with_fingerprint(
+                "decompile_function",
+                None,
+                None,
+                fingerprint,
+                t + Duration::from_secs(4),
+            )
+            .expect("identical retry loop should fire");
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| reason.rule == "rapid_repeats"));
+    }
+
+    #[test]
+    fn large_distinct_argument_burst_uses_rapid_fanout_rule() {
+        let mut stats = SessionStats::new();
+        let t = t0();
+        let mut fanout_fires = 0;
+        for i in 0..30 {
+            let args = serde_json::json!({ "address": format!("0x{:x}", 0x1000 + i) });
+            let report = stats.observe_with_fingerprint(
+                "decompile_function",
+                None,
+                None,
+                fingerprint_args(Some(&args)),
+                t + Duration::from_millis(i * 100),
+            );
+            if let Some(report) = report {
+                assert!(report
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.rule == "rapid_fanout"));
+                assert!(!report
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.rule == "rapid_repeats"));
+                fanout_fires += 1;
+            }
+        }
+        assert_eq!(fanout_fires, 1);
     }
 
     /// The dogfood-driven cooldown: a single 24-call burst produces
@@ -636,7 +861,7 @@ mod tests {
             );
         }
         // The trigger — 5th quick call, all three rules qualify:
-        //   - size spike (10_000 vs mean ~100),
+        //   - size spike (10_000 vs median ~100),
         //   - novel network destination (distinct from baseline),
         //   - rapid_repeats (5 calls in ~4s, cooldown clear).
         let r = s
@@ -662,12 +887,12 @@ mod tests {
     fn reasons_serialize_to_documented_json_shape() {
         let r = Reason {
             rule: "size_spike",
-            detail: "bytes_out=1000 exceeds 5× mean".to_string(),
+            detail: "bytes_out=1000 exceeds 5× median baseline (100 bytes)".to_string(),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(
             json,
-            r#"{"rule":"size_spike","detail":"bytes_out=1000 exceeds 5× mean"}"#
+            r#"{"rule":"size_spike","detail":"bytes_out=1000 exceeds 5× median baseline (100 bytes)"}"#
         );
     }
 }

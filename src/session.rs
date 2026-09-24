@@ -134,10 +134,17 @@ impl Session {
         &self,
         entry: &mut ToolCallEntry,
         destination: Option<&Destination>,
+        args_fingerprint: [u8; 32],
         now: Instant,
     ) {
         let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(report) = stats.observe(&entry.tool_name, entry.bytes_out, destination, now) {
+        if let Some(report) = stats.observe_with_fingerprint(
+            &entry.tool_name,
+            entry.bytes_out,
+            destination,
+            args_fingerprint,
+            now,
+        ) {
             entry.anomaly_score = Some(report.score);
             entry.anomaly_reasons = serde_json::to_string(&report.reasons).ok();
         }

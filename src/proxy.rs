@@ -66,6 +66,12 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
 
     let config = Arc::new(Config::load(config_path)?);
     let target = config.resolve_target(target)?;
+    let original_program = target
+        .first()
+        .expect("resolve_target rejects an empty command");
+    // Derive identity before Windows `.cmd` wrapping changes argv[0] to
+    // `cmd`; the explicit configured name remains authoritative.
+    let server_name = config.server_name_for(original_program);
     // Windows: the majority of real MCP servers launch through `.cmd`
     // shims (`npx`, `npm`, `uvx`), which `CreateProcess` will not resolve
     // or execute directly -- only `.exe` (or extensionless names that
@@ -80,7 +86,6 @@ pub async fn run(config_path: &Path, target: Vec<String>) -> anyhow::Result<()> 
     // JSON-RPC ids on this pipe come from that one caller and are
     // unambiguous. See `session.rs` for why the scope has to exist anyway.
     let session = Arc::new(Session::new(uuid::Uuid::new_v4().to_string()));
-    let server_name = config.server_name_for(program);
 
     let db_path = Path::new(&config.logging.db_path);
     // Phase 3.5: decides fresh-HMAC vs. existing-HMAC vs. legacy, and
@@ -698,7 +703,7 @@ fn log_completed(
     db: &DbHandle,
 ) {
     let configured_tier = config.tier_for_tool(&call.tool_name);
-    let (mut entry, dest) = audit::build_entry(
+    let (mut entry, dest, args_fingerprint) = audit::build_entry(
         call,
         outcome,
         session.id(),
@@ -707,7 +712,7 @@ fn log_completed(
         patterns,
         allowlist,
     );
-    session.attach_anomaly(&mut entry, dest.as_ref(), Instant::now());
+    session.attach_anomaly(&mut entry, dest.as_ref(), args_fingerprint, Instant::now());
     db.log(entry);
 }
 
@@ -932,5 +937,20 @@ mod tests {
             "exactly one element is a tools/call"
         );
         assert_eq!(msgs[0].tool_name().as_deref(), Some("a"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn server_identity_is_taken_from_the_target_before_cmd_shim_wrapping() {
+        let config = Config::load(Path::new("")).unwrap();
+        let original = vec![
+            "npx.cmd".to_string(),
+            "-y".to_string(),
+            "some-mcp".to_string(),
+        ];
+        let server_name = config.server_name_for(&original[0]);
+        let wrapped = maybe_wrap_windows_shim(original);
+        assert_eq!(wrapped[0], "cmd");
+        assert_eq!(server_name, "npx.cmd");
     }
 }

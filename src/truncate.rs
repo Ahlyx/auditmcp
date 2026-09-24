@@ -11,7 +11,7 @@
 //! truncation never slices a secret in half before it's caught, and never
 //! re-exposes something already redacted by cutting around it.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Byte cap for a single string leaf under the `standard` tier. Chosen to
 /// comfortably show a representative preview of typical tool args/results
@@ -42,6 +42,36 @@ pub fn truncate_json_semantic(value: &Value) -> Value {
             Value::Object(out)
         }
         other => other.clone(),
+    }
+}
+
+/// Compact, valid-JSON preview for the minimal tier. The source is the
+/// serialized, already-redacted value. When it exceeds the byte budget,
+/// the stored value becomes a small envelope whose preview is explicitly
+/// a string fragment and whose byte count describes the complete source.
+pub fn truncate_json_preview(value: &Value, max_bytes: usize) -> String {
+    let serialized = value.to_string();
+    if serialized.len() <= max_bytes {
+        return serialized;
+    }
+
+    let original_bytes = serialized.len();
+    let mut end = snap_boundary(&serialized, max_bytes.min(serialized.len()));
+    loop {
+        let envelope = json!({
+            "__auditmcp_truncated": true,
+            "original_bytes": original_bytes,
+            "preview": &serialized[..end],
+        })
+        .to_string();
+        if envelope.len() <= max_bytes || end == 0 {
+            return envelope;
+        }
+        end = serialized[..end]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
     }
 }
 

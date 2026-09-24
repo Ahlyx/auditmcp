@@ -36,9 +36,8 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 /// Byte cap applied when rendering a value under the `minimal` tier.
-/// Unrelated to `standard` tier's semantic truncation (see `truncate.rs`)
-/// — this is a blunt, cheap preview for the tier that wants the smallest
-/// possible footprint, not a structure-preserving cap.
+/// Oversized JSON uses a valid compact envelope; raw HTTP text still uses
+/// a bounded text preview.
 const PREVIEW_BYTES: usize = 200;
 
 /// A captured payload, in the two shapes a transport can hand over.
@@ -77,7 +76,7 @@ impl Payload {
     fn render(&self, tier: Tier) -> String {
         match self {
             Payload::Json(v) => match tier {
-                Tier::Minimal => truncate_preview(&v.to_string()),
+                Tier::Minimal => truncate::truncate_json_preview(v, PREVIEW_BYTES),
                 Tier::Standard => truncate::truncate_json_semantic(v).to_string(),
                 Tier::Full => v.to_string(),
             },
@@ -302,8 +301,12 @@ pub(crate) fn build_entry(
     configured_tier: Tier,
     patterns: &PatternSet,
     allowlist: &HashSet<String>,
-) -> (ToolCallEntry, Option<extract::Destination>) {
+) -> (ToolCallEntry, Option<extract::Destination>, [u8; 32]) {
     let duration_ms = call.started.elapsed().as_millis() as i64;
+    // This digest lets anomaly scoring distinguish retry loops from a
+    // burst of different arguments without retaining raw arguments in
+    // session statistics or persisting a new field in the database.
+    let args_fingerprint = crate::anomaly::fingerprint_args(call.args.as_ref());
 
     // Step 1: detect and redact, on the full untruncated values. Args are
     // always JSON — a request has to parse as JSON-RPC to be recognized as
@@ -410,7 +413,7 @@ pub(crate) fn build_entry(
         anomaly_score: None,
         anomaly_reasons: None,
     };
-    (entry, destination)
+    (entry, destination, args_fingerprint)
 }
 
 /// Truncates to at most `PREVIEW_BYTES` bytes, snapping back to the
@@ -463,7 +466,7 @@ mod tests {
         result: Value,
     ) -> ToolCallEntry {
         let patterns = PatternSet::bundled().unwrap();
-        let (entry, _dest) = build_entry(
+        let (entry, _dest, _fingerprint) = build_entry(
             pending(args),
             outcome(status, result),
             "sess-1",
@@ -473,6 +476,63 @@ mod tests {
             &HashSet::new(),
         );
         entry
+    }
+
+    fn complex_json_fixture() -> Value {
+        json!({
+            "escaped": "quote: \" slash: \\ line\n".repeat(30),
+            "unicode": "🧬é✓".repeat(80),
+            "nested": { "a": { "b": { "c": { "d": { "e": [1, 2, { "f": "deep" }] } } } } },
+            "items": (0..40).map(|n| json!({ "index": n, "value": format!("item-{n}") })).collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn json_payloads_parse_in_all_tiers_and_minimal_marks_omitted_content() {
+        let original = complex_json_fixture();
+        let original_size = original.to_string().len();
+        for tier in [Tier::Minimal, Tier::Standard, Tier::Full] {
+            let entry = entry_for(
+                CallStatus::Success,
+                tier,
+                original.clone(),
+                original.clone(),
+            );
+            let args: Value = serde_json::from_str(entry.args_json.as_deref().unwrap())
+                .unwrap_or_else(|e| panic!("args_json did not parse for {tier:?}: {e}"));
+            let result: Value = serde_json::from_str(entry.result_json.as_deref().unwrap())
+                .unwrap_or_else(|e| panic!("result_json did not parse for {tier:?}: {e}"));
+            if tier == Tier::Minimal {
+                for value in [args, result] {
+                    assert_eq!(value["__auditmcp_truncated"], true);
+                    assert_eq!(value["original_bytes"], original_size);
+                    assert!(!value["preview"].as_str().unwrap().is_empty());
+                }
+                assert!(
+                    entry.args_json.as_deref().unwrap().len() <= PREVIEW_BYTES,
+                    "minimal args envelope must remain within its byte budget"
+                );
+                assert!(
+                    entry.result_json.as_deref().unwrap().len() <= PREVIEW_BYTES,
+                    "minimal result envelope must remain within its byte budget"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn secret_detection_scans_full_json_before_minimal_preview() {
+        let secret = FAKE_KEY;
+        let args = json!({ "large": "x".repeat(800), "api_key": secret });
+        let result = json!({ "large": "y".repeat(800), "api_key": secret });
+        let entry = entry_for(CallStatus::Success, Tier::Minimal, args, result);
+        let stored_args: Value = serde_json::from_str(entry.args_json.as_deref().unwrap()).unwrap();
+        let stored_result: Value =
+            serde_json::from_str(entry.result_json.as_deref().unwrap()).unwrap();
+        assert!(!entry.args_json.as_deref().unwrap().contains(secret));
+        assert!(!entry.result_json.as_deref().unwrap().contains(secret));
+        assert!(stored_args.to_string().contains("[REDACTED:"));
+        assert!(stored_result.to_string().contains("[REDACTED:"));
     }
 
     #[test]
@@ -502,17 +562,17 @@ mod tests {
         // Configured `minimal` would cap args at 200 bytes; anything that
         // escalates stores the full 2000-byte value instead.
         let success = entry_for(CallStatus::Success, Tier::Minimal, long_args(), json!({}));
-        let args = success.args_json.unwrap();
-        assert!(
-            args.contains("[truncated"),
+        let args: Value = serde_json::from_str(success.args_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            args["__auditmcp_truncated"], true,
             "success must keep the configured minimal tier"
         );
 
         for status in [CallStatus::Error, CallStatus::Timeout, CallStatus::Deferred] {
             let e = entry_for(status, Tier::Minimal, long_args(), json!({}));
-            let args = e.args_json.unwrap();
+            let args: Value = serde_json::from_str(e.args_json.as_deref().unwrap()).unwrap();
             assert!(
-                !args.contains("[truncated"),
+                !args["__auditmcp_truncated"].as_bool().unwrap_or(false),
                 "{} must escalate to full and store untruncated args",
                 status.as_str()
             );
@@ -528,8 +588,9 @@ mod tests {
             long_args(),
             json!({ "api_key": FAKE_KEY }),
         );
+        let args: Value = serde_json::from_str(e.args_json.as_deref().unwrap()).unwrap();
         assert!(
-            !e.args_json.unwrap().contains("[truncated"),
+            !args["__auditmcp_truncated"].as_bool().unwrap_or(false),
             "a secret anywhere in the call must force full capture"
         );
         assert_eq!(e.redaction_count, 1);
@@ -687,7 +748,7 @@ mod tests {
                  "status":"working","ttlMs":600000,"pollIntervalMs":1000}}"#,
         )
         .unwrap();
-        let (e, _dest) = build_entry(
+        let (e, _dest, _fingerprint) = build_entry(
             pending(long_args()),
             CallOutcome::from_rpc(&msg, 120),
             "sess-1",
@@ -708,7 +769,7 @@ mod tests {
     #[test]
     fn timeout_outcome_records_no_response_bytes() {
         let patterns = PatternSet::bundled().unwrap();
-        let (e, _dest) = build_entry(
+        let (e, _dest, _fingerprint) = build_entry(
             pending(json!({"a": 1})),
             CallOutcome {
                 status: CallStatus::Timeout,

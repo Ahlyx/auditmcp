@@ -375,12 +375,18 @@ a tool call is allowed.
 - **Hash-chained SQLite log** (WAL mode) — `hash = SHA256(prev_hash +
   canonical_json(entry))`, written from a dedicated writer thread behind a
   channel so interception never blocks on disk I/O.
-- **Logging tiers** — `minimal` (200-byte preview), `standard` (structure
+- **Logging tiers** — `minimal` (200-byte valid-JSON preview envelope when needed), `standard` (structure
   preserving: full keys, string values capped at 500 bytes, long arrays kept
   as first 3 + last 3 with an omitted count), `full` (untruncated).
   Per-tool overrides via `[logging.tool_overrides]`. Tier is **force-escalated
   to `full`** whenever secrets detection fires or the call errored, so
-  anomalies can never be hidden by truncation.
+  anomalies can never be hidden by truncation. Oversized minimal JSON is
+  stored as a compact JSON object with `__auditmcp_truncated`,
+  `original_bytes`, and a string preview; existing untruncated values keep
+  their original JSON shape. This changes the parsed shape only for
+  oversized values at the minimal tier; standard/full and existing database
+  rows are unchanged. It requires no schema migration: new tool-call rows
+  still use the existing `args_json` and `result_json` columns.
 - **Secrets detection** — runs before anything is persisted. Ten bundled
   patterns (AWS access key, OpenAI, GitHub, Slack, Google, Stripe, JWT,
   bearer token, PEM private key, plus a generic high-entropy-near-keyword
@@ -403,20 +409,23 @@ a tool call is allowed.
   touches the derived index, never `tool_calls` or any hash. Refuses to run
   at all if chain verification failed.
 - **Multi-server support** — see below.
-- **Anomaly detection (Phase 3)** — three session-scoped rules, all
+- **Anomaly detection (Phase 3)** — session-scoped rules, all
   rule-based and explainable, tuned against real vault dogfood.
-  `size_spike` fires when `bytes_out` for a tool exceeds 5× its running
-  mean once at least five prior samples have armed the baseline
-  (Welford's for the mean). `novel_destination` fires when a
+  `size_spike` fires when `bytes_out` exceeds 5× a bounded median after
+  five ordinary samples; an extreme first result also fires above the
+  1,000,000-byte warmup threshold. Outliers do not enter the baseline, and
+  similar already-reported size ranges are suppressed for the session.
+  `novel_destination` fires when a
   **network-shaped** destination (`url`, `host`, `uri`, `target`) not
   seen in this session appears after a non-empty baseline — filesystem
   destinations (`path`, `file`) are deliberately excluded because
   writing a new note is the primary use case of a note-taking tool, and
   firing on every new file path produced a 100% false-positive rate in
-  dogfood. `rapid_repeats` fires when the last five calls to the same
-  tool land inside a 10-second window, and then **cools down** for that
-  tool for the same window — one burst produces one flag, not one per
-  call from the fifth onward. Anomaly state is per session, held on the
+  dogfood. `rapid_repeats` fires when five calls with identical argument
+  fingerprints land inside a 10-second window, and then **cools down** for
+  that tool for the same window. Five distinct arguments are not treated
+  as retries; `rapid_fanout` separately flags 25 distinct argument
+  fingerprints in that window. Anomaly state is per session, held on the
   `Session` itself; scoring runs at write time so `query --anomalous`
   reduces to a `WHERE anomaly_score IS NOT NULL` filter — same filter
   available on `export --anomalous`. Populates the `anomaly_score` and
@@ -525,9 +534,14 @@ Sharing one DB is not just a convenience: cross-server activity is the point.
 An exfiltration chain that reads sensitive data via one server and sends it
 out via another is only visible to `query` when both servers' rows land in
 the same log. Rows are told apart by the `server_name` column — set
-`[target].server_name` in each config, since the fallback (the target
-command's program name, e.g. `npx` or `python`) is usually shared across
-servers and won't distinguish them.
+`[target].server_name` in each config when the target executable is shared
+across servers. The default is the original target's normalized basename
+(for example, `bridge-mcp-ghidra.exe`); equivalent slash spellings share an
+identity, and a Windows `cmd` shim wrapper does not become the server name.
+The full user path is not stored as the default identity. This changes only
+`server_name` on future rows; old rows are not rewritten and no DB schema
+migration is needed, so queries can show old raw-path names alongside new
+normalized basenames after upgrading.
 
 Per-server DB isolation still works if you want independent audit trails:
 give each config its own `db_path` and each file carries its own complete
